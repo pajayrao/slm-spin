@@ -1,12 +1,9 @@
-import math
 import os
-import time
 import logging
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainerCallback
-from spin_config import SPINConfig
-from torch.profiler import ProfilerActivity, tensorboard_trace_handler
+import psutil
 
 from utils import *
 
@@ -39,12 +36,8 @@ class MemoryProbeCallback(TrainerCallback):
         log_memory(tag)
         if self.writer is None or not torch.cuda.is_available():
             return
-        try:
-            import psutil
-            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
-            self.writer.add_scalar("system/cpu_rss_mb", rss_mb, step)
-        except ImportError:
-            pass
+        rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+        self.writer.add_scalar("system/cpu_rss_mb", rss_mb, step)
         self.writer.add_scalar("system/gpu_alloc_mb",    torch.cuda.memory_allocated() / 1024 ** 2, step)
         self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
 

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -181,7 +181,7 @@ class SPINConfig:
     # How many prompts (rows) to generate synthetic responses for each iteration.
     # 0 = use the entire dataset. Reduce to limit GPU time spent on generation.
     # Range: 0 (all) or any positive integer ≤ dataset size.
-    synthetic_examples_per_iteration: int = 1024
+    synthetic_examples_per_iteration: int = 128
 
     # If True, synthetic rows from all previous iterations are included in the current
     # training set (growing curriculum). If False, only the current iteration's synthetic
@@ -334,7 +334,7 @@ class SPINConfig:
     # small trainable rank-r matrices alongside frozen weight matrices. This reduces the
     # number of trainable parameters from billions to millions, cutting GPU memory for
     # gradients and optimizer states by 10–100x. Highly recommended for small GPUs.
-    use_lora: bool = False
+    use_lora: bool = True
 
     # LoRA rank: the inner dimension of the two low-rank matrices A (d×r) and B (r×k).
     # Higher rank = more expressive adapters = more parameters and memory.

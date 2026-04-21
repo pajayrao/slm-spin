@@ -1,7 +1,5 @@
 import logging
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional
-import torch.nn.functional as F
+from typing import List, Dict
 from torch.utils.data import Dataset
 from spin_config import *
 from utils import *

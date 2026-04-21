@@ -5,7 +5,9 @@ import argparse
 import logging
 import glob
 from typing import List, Dict, Any
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
+import psutil
 
 
 import torch
@@ -46,11 +48,9 @@ def ensure_dir(path: str):
 
 
 def log_memory(tag: str):
-    try:
-        import psutil
-        rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
-    except ImportError:
-        rss_mb = float("nan")
+        
+    rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
     if torch.cuda.is_available():
         alloc_mb = torch.cuda.memory_allocated() / 1024 ** 2
         reserved_mb = torch.cuda.memory_reserved() / 1024 ** 2
@@ -183,6 +183,7 @@ def load_tokenizer(cfg: SPINConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = cfg.truncation_side
+    tokenizer.padding_side = "left"
     return tokenizer
 
 def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
@@ -398,12 +399,6 @@ def make_trainable(model, cfg: SPINConfig):
     the memory needed for gradients and optimizer states compared to full fine-tuning.
     """
     if cfg.use_lora:
-        try:
-            from peft import LoraConfig, get_peft_model, TaskType
-        except ImportError:
-            raise ImportError(
-                "peft is required when use_lora=True.  Install it with: pip install peft"
-            )
         # Base weights must be frozen before PEFT wraps them; PEFT then enables
         # only the adapter parameters it inserts.
         for p in model.parameters():
@@ -448,7 +443,6 @@ def merge_lora_and_get_base(model, cfg: SPINConfig):
     if not cfg.use_lora:
         return model
     try:
-        from peft import PeftModel
         if isinstance(model, PeftModel):
             model = model.merge_and_unload()
             logger.info("LoRA adapters merged into base model weights.")

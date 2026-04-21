@@ -6,9 +6,10 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainerCallback
 from spin_config import SPINConfig
-from torch.profiler import ProfilerActivity, tensorboard_trace_handler
 
 from utils import *
+import pynvml
+import psutil
 
 logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
@@ -98,12 +99,9 @@ class TensorBoardCallbackExtended(TrainerCallback):
 
         # pynvml handle for GPU utilization % (None if pynvml unavailable)
         self._nvml_handle = None
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        except Exception:
-            pass
+        pynvml.nvmlInit()
+        self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -119,8 +117,8 @@ class TensorBoardCallbackExtended(TrainerCallback):
         cfg_text = "\n".join(f"    {k}: {v}" for k, v in vars(self.cfg).items())
         self.writer.add_text("config/spin_config", f"```\n{cfg_text}\n```", 0)
 
-        # GRAPHS tab: trace the model with a tiny dummy input.
-        self._log_model_graph(model)
+        # # GRAPHS tab: trace the model with a tiny dummy input.
+        # self._log_model_graph(model)
 
         # PROJECTOR tab: log token embeddings at iteration start
         self._log_token_embeddings(model, step=0, tag="embeddings/tokens_iter_start")
@@ -211,21 +209,14 @@ class TensorBoardCallbackExtended(TrainerCallback):
         if torch.cuda.is_available():
             self.writer.add_scalar("system/gpu_alloc_mb",    torch.cuda.memory_allocated() / 1024 ** 2, step)
             self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
-        try:
-            import psutil
             self.writer.add_scalar("system/cpu_rss_mb", psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2, step)
-        except ImportError:
-            pass
+
 
         # ── GPU utilization % ────────────────────────────────────────────────
         # Try pynvml first (more accurate); fall back to torch.cuda.utilization()
         gpu_util = None
         if self._nvml_handle is not None:
-            try:
-                import pynvml
-                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle).gpu
-            except Exception:
-                pass
+            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle).gpu
         if gpu_util is None and torch.cuda.is_available():
             try:
                 gpu_util = torch.cuda.utilization()
@@ -420,29 +411,29 @@ class TensorBoardCallbackExtended(TrainerCallback):
         self.writer.flush()
         self.writer.close()
 
-    def _log_model_graph(self, model):
-        """Write the architecture graph to the per-iteration GRAPHS tab.
+    # def _log_model_graph(self, model):
+    #     """Write the architecture graph to the per-iteration GRAPHS tab.
 
-        Uses a traceable graph module built from model.config to avoid trace
-        failures from flash-attn / SDPA backends and HuggingFace control flow.
-        The authoritative copy (written to tb_global) comes from
-        SPINIterationSummaryCallback._write_graph_to_global on iteration 0.
-        """
-        if not self.cfg.log_model_graph or model is None:
-            return
-        try:
-            from trainer_callback.spin_iteration_summary_callback import SPINIterationSummaryCallback
-            graph_model = SPINIterationSummaryCallback._build_causal_lm_graph(model)
-            graph_model.eval()
-            dummy_ids  = torch.zeros(1, 8, dtype=torch.long)
-            dummy_mask = torch.ones(1, 8, dtype=torch.long)
-            with torch.no_grad():
-                self.writer.add_graph(graph_model, (dummy_ids, dummy_mask), use_strict_trace=True)
-            self.writer.flush()
-            logger.info("[GRAPHS] Architecture graph written to per-iteration TensorBoard run.")
-        except Exception as e:
-            logger.error(f"[GRAPHS] Graph trace failed in per-iteration writer: "
-                         f"{type(e).__name__}: {e}")
+    #     Uses a traceable graph module built from model.config to avoid trace
+    #     failures from flash-attn / SDPA backends and HuggingFace control flow.
+    #     The authoritative copy (written to tb_global) comes from
+    #     SPINIterationSummaryCallback._write_graph_to_global on iteration 0.
+    #     """
+    #     if not self.cfg.log_model_graph or model is None:
+    #         return
+    #     try:
+    #         from trainer_callback.spin_iteration_summary_callback import SPINIterationSummaryCallback
+    #         graph_model = SPINIterationSummaryCallback._build_causal_lm_graph(model)
+    #         graph_model.eval()
+    #         dummy_ids  = torch.zeros(1, 8, dtype=torch.long)
+    #         dummy_mask = torch.ones(1, 8, dtype=torch.long)
+    #         with torch.no_grad():
+    #             self.writer.add_graph(graph_model, (dummy_ids, dummy_mask), use_strict_trace=True)
+    #         self.writer.flush()
+    #         logger.info("[GRAPHS] Architecture graph written to per-iteration TensorBoard run.")
+    #     except Exception as e:
+    #         logger.error(f"[GRAPHS] Graph trace failed in per-iteration writer: "
+    #                      f"{type(e).__name__}: {e}")
 
     def _log_token_embeddings(self, model, step: int, tag: str):
         """Extract and log the token embedding matrix (PROJECTOR tab)."""

@@ -1,12 +1,8 @@
-import math
 import os
-import time
 import logging
-import torch
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainerCallback
 from spin_config import SPINConfig
-from torch.profiler import ProfilerActivity, tensorboard_trace_handler
 
 from utils import *
 
@@ -67,7 +63,9 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         self.writer.flush()
 
     def _should_log(self, step: int) -> bool:
-        return step == 0 or step % self.cfg.parameter_log_interval == 0
+        # HuggingFace Trainer increments global_step before on_step_end fires,
+        # so step is always >= 1 here; check step == 1 to catch the very first optimizer step.
+        return step == 1 or step % self.cfg.parameter_log_interval == 0
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if self.writer is None or model is None:
@@ -111,9 +109,35 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
 
         self.writer.flush()
 
-    def on_train_end(self, args, state, control, **kwargs):
-        if self.writer is not None:
-            self.writer.flush()
-            self.writer.close()
-            self.writer = None
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if self.writer is None:
+            return
+
+        # Log a final snapshot so every run has at least 2 histogram time steps
+        # (step 0 from on_train_begin + final step here).  TensorBoard Distributions
+        # requires ≥ 2 points to draw the percentile band chart; with only the
+        # baseline snapshot it renders nothing even though Histograms shows that point.
+        if model is not None and state.global_step > 0:
+            logged = 0
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if logged >= self.cfg.parameter_log_max_tensors:
+                    break
+
+                w = param.detach().float().cpu()
+                tag = name.replace(".", "/")
+
+                if self.cfg.log_parameter_histograms:
+                    self.writer.add_histogram(f"parameters/{tag}", w, state.global_step)
+                if self.cfg.log_parameter_scalars:
+                    self.writer.add_scalar(f"parameters/mean/{tag}",   w.mean().item(),      state.global_step)
+                    self.writer.add_scalar(f"parameters/std/{tag}",    w.std().item(),       state.global_step)
+                    self.writer.add_scalar(f"parameters/norm/{tag}",   w.norm().item(),      state.global_step)
+                    self.writer.add_scalar(f"parameters/absmax/{tag}", w.abs().max().item(), state.global_step)
+                logged += 1
+
+        self.writer.flush()
+        self.writer.close()
+        self.writer = None
 

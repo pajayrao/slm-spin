@@ -127,7 +127,7 @@ def main():
             logger.info("============================ 4 (cached) ==================================")
         else:
             rows_for_generation = base_rows[:limit]
-            logger.info("============================ 2.6 Length of dataset ", len(rows_for_generation))
+            logger.info(f"============================ 2.6 Length of dataset {len(rows_for_generation)}")
             logger.info("============================ 3 ==================================")
             synthetic_rows = generate_synthetic_responses(prev_model, tokenizer, rows_for_generation, cfg)
             del rows_for_generation
@@ -150,7 +150,6 @@ def main():
 
         # Pre-tokenizes all rows in __init__; raw text no longer needed after this
         dataset = SPINDataset(train_rows, tokenizer, cfg, ref_logprobs=ref_logprobs)
-        del train_rows, ref_logprobs
         if not cfg.accumulate_previous_synthetic:
             pass  # accumulated_rows not used; nothing to clear
         gc.collect()
@@ -162,6 +161,9 @@ def main():
 
         trainer_cls = RMSPropSPINTrainer if cfg.optimizer.lower() == "rmsprop" else SPINTrainer
         summary_cb.set_iteration(iteration, spin_lambda=spin_lambda, dataset_size=len(train_rows))
+        
+        del train_rows, ref_logprobs
+
         callbacks = (
             [TorchProfilerCallback(cfg, spin_iteration=iteration, tb_writer=summary_cb.writer)]
             if cfg.enable_profiler else []
@@ -219,6 +221,7 @@ def main():
         # This produces a plain AutoModelForCausalLM checkpoint with no PEFT
         # dependency so the next iteration's load_causal_lm() just works.
         train_model = merge_lora_and_get_base(train_model, cfg)
+        trainer.model = train_model  # ensure trainer saves the unwrapped base model, not the PEFT wrapper
         trainer.save_model(iter_dir)
         logger.info("============================ 10 ==================================")
 
