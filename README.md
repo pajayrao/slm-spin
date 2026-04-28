@@ -21,6 +21,7 @@ After _N_ iterations the final checkpoint is written to `checkpoints_dir/iter_{N
 - **TensorBoard integration** — per-iteration and global cross-iteration logs, PR curves, embedding projector, parameter histograms, and optional profiler traces.
 - **Multiple loss functions** — logistic (default), hinge, correlation, exponential.
 - **RMSProp and AdamW** — RMSProp uses ~2 GB less GPU memory per ~1 B-parameter model.
+- **Benchmark evaluation** — six standard LLM benchmarks evaluated directly from checkpoints, with iteration-over-iteration comparison and TensorBoard logging.
 
 ## Installation
 
@@ -102,25 +103,134 @@ A positive margin means the model has improved more on the human response than o
 | `correlation` | `1 − margin` | Constant gradient, easiest to tune |
 | `exponential` | `exp(−margin)` | Aggressive on negative margins; can be unstable |
 
+## Evaluation
+
+[evaluate.py](evaluate.py) evaluates every trained checkpoint against six standard LLM benchmarks and logs iteration-over-iteration comparisons to TensorBoard. It requires no `lm_eval` dependency — scoring is implemented directly with HuggingFace `transformers`.
+
+### Benchmarks
+
+| Benchmark | Metric | Shots | Scoring method |
+|-----------|--------|------:|----------------|
+| ARC-Challenge | acc_norm | 25 | Length-normalised log-likelihood over 4 choices |
+| TruthfulQA MC2 | mc2 | 0 | Softmax probability mass on all correct choices |
+| Winogrande | acc | 5 | Log-likelihood of each fill option in context |
+| GSM8k | acc | 5 | Greedy generation + exact numeric string match |
+| HellaSwag | acc_norm | 10 | Length-normalised log-likelihood over 4 endings |
+| MMLU | acc | 5 | Log-likelihood of single letter (A/B/C/D) continuation |
+
+Shot counts match the Open LLM Leaderboard v1 defaults so results are directly comparable to published numbers.
+
+**acc_norm** divides each choice's log-likelihood by its character length before picking the winner — this prevents the model from trivially preferring shorter answers.
+
+**mc2** (TruthfulQA) applies softmax across all choices and sums the probability mass landing on the subset of correct answers. A score of 1.0 means the model assigned all probability to true statements.
+
+### Running evaluation
+
+```bash
+# Evaluate all iter_* checkpoints found in the default directory
+python evaluate.py
+
+# Evaluate a specific subset of iterations
+python evaluate.py --iters iter_0 iter_2 iter_4
+
+# Smoke test with 50 examples per task (do not use for real benchmarks)
+python evaluate.py --limit 50
+
+# Override shot counts for specific tasks
+python evaluate.py --n-shots arc_challenge=10 gsm8k=3
+
+# Custom checkpoint and output directories
+python evaluate.py \
+  --checkpoints-dir ./runs/my_run/checkpoints \
+  --output-dir      ./runs/my_run/eval_results \
+  --tensorboard-dir ./runs/my_run/tensorboard/eval
+```
+
+### Evaluation output
+
+For each iteration the evaluator prints a live progress line per task (n_shot, example count, elapsed seconds), followed by an iteration summary with ▲/▼ direction indicators:
+
+```
+============================================================
+ iter_1  →  /path/to/checkpoints/iter_1
+============================================================
+  [Arc] arc_challenge | 25-shot | full ...
+    Arc: 42.15%  (183s)
+  [TruthfulQA] truthfulqa_mc2 | 0-shot | full ...
+    TruthfulQA: 51.30%  (97s)
+  ...
+
+  [iter_1]  avg=46.72%  Δprev_avg=▲+1.40  best_so_far=46.72%  ★ NEW BEST  (712s total)
+  ▲ improved: Arc, TruthfulQA, HellaSwag
+  ▼ declined: Winogrande
+```
+
+After all iterations a formatted comparison table is printed:
+
+```
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+| Iteration | Arc  | TruthfulQA | Winogrande | GSM8k | HellaSwag | MMLU  | Avg%  | ΔAvg  | Status |
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+| iter_0   | 40.80 | 50.10      | 62.30     | 18.50 | 71.20     | 46.00 | 48.15 |   NA  |        |
+| iter_1   | 42.15 | 51.30      | 61.90     | 19.20 | 72.40     | 47.30 | 49.04 | ▲+0.89| ★ BEST |
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+```
+
+Written files:
+
+```
+eval_results/
+├── iter_0.parsed.json          # Raw scores for iteration 0
+├── iter_1.parsed.json
+├── comparative_summary.txt     # TSV table + per-iteration narrative (paste into spreadsheet)
+└── comparative_summary.json    # Machine-readable version of the full results list
+```
+
+### Evaluation TensorBoard panels
+
+```bash
+tensorboard --logdir ./spin_outputs/tensorboard
+```
+
+The evaluation run writes to `tensorboard/eval_compare/` and adds the following panels:
+
+| Panel | Tags | Description |
+|-------|------|-------------|
+| **Custom Scalars → Evaluation** | `eval/average`, `eval/best_so_far_average` | Average score and running best across iterations |
+| **Custom Scalars → Evaluation** | `eval/tasks/<name>` | Per-task score for each iteration |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/<name>` | Per-task score change from preceding iteration |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improvement_rate` | Fraction of tasks that improved (0–1) |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improved_task_count`, `…/declined_task_count` | Count of tasks that improved / declined |
+| **Text → eval/scorecard** | — | Markdown table of scores + deltas, one card per iteration |
+| **Text → eval/best_iteration** | — | Note written each time a new best average is reached |
+| **Text → eval/run_config** | — | Shot counts, device, directories — written once at step 0 |
+
 ## Output Structure
 
 ```
 spin_outputs/
-├── config.json                    # Snapshot of SPINConfig used for this run
-├── tb_global/                     # Cross-iteration TensorBoard run
-├── tb_profile/                    # PyTorch profiler traces (if enabled)
+├── config.json                      # Snapshot of SPINConfig used for this run
+├── tb_global/                       # Cross-iteration TensorBoard run (training metrics)
+├── tb_profile/                      # PyTorch profiler traces (if enabled)
 ├── synthetic/
-│   ├── iter_0.jsonl               # Synthetic prompt/response pairs from iteration 0
+│   ├── iter_0.jsonl                 # Synthetic prompt/response pairs from iteration 0
 │   └── iter_1.jsonl
-└── checkpoints/
-    ├── iter_0/
-    │   ├── config.json            # Model config
-    │   ├── model.safetensors      # Merged weights (LoRA adapters merged in)
-    │   ├── tokenizer_config.json
-    │   ├── .done                  # Sentinel written after full save
-    │   └── tb_logs/               # Per-iteration TensorBoard run
-    └── iter_1/
-        └── ...
+├── checkpoints/
+│   ├── iter_0/
+│   │   ├── config.json              # Model config
+│   │   ├── model.safetensors        # Merged weights (LoRA adapters merged in)
+│   │   ├── tokenizer_config.json
+│   │   ├── .done                    # Sentinel written after full save
+│   │   └── tb_logs/                 # Per-iteration TensorBoard run (training)
+│   └── iter_1/
+│       └── ...
+├── eval_results/
+│   ├── iter_0.parsed.json           # Per-task benchmark scores for this checkpoint
+│   ├── iter_1.parsed.json
+│   ├── comparative_summary.txt      # Human-readable TSV + narrative comparison
+│   └── comparative_summary.json     # Full results list (all iterations)
+└── tensorboard/
+    └── eval_compare/                # Evaluation TensorBoard run
 ```
 
 The final model is at `checkpoints/iter_{num_iterations-1}/`.
@@ -133,7 +243,7 @@ No flags are needed. On restart, the script:
 2. Reloads cached synthetic JSONL files for completed iterations.
 3. Calls `get_last_checkpoint()` inside the current iteration directory to resume mid-training if a HuggingFace checkpoint exists.
 
-## TensorBoard
+## TensorBoard (training)
 
 ```bash
 tensorboard --logdir ./spin_outputs
@@ -164,6 +274,7 @@ Available panels (depending on config flags):
 | File | Description |
 |------|-------------|
 | [main.py](main.py) | Entry point — outer SPIN loop, resume logic, orchestration |
+| [evaluate.py](evaluate.py) | Benchmark evaluation — six tasks, iteration comparison, TensorBoard logging |
 | [spin_config.py](spin_config.py) | `SPINConfig` dataclass — all hyperparameters with inline docs |
 | [spin_trainer.py](spin_trainer.py) | `SPINTrainer` and `RMSPropSPINTrainer` — loss and memory-split backward |
 | [spin_dataset.py](spin_dataset.py) | `SPINDataset` — pre-tokenises chosen/rejected pairs |

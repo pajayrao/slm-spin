@@ -55,8 +55,6 @@ class TensorBoardCallbackExtended(TrainerCallback):
       system/gpu_util_pct     — GPU compute utilisation percentage
       system/cpu_rss_mb       — CPU RSS
 
-    weights/* (every parameter_log_interval steps, per layer):
-      weights/mean, std, norm, absmax, delta_norm
 
     gradients/* (every parameter_log_interval steps, per layer):
       gradients/norm, absmax, histogram
@@ -76,6 +74,13 @@ class TensorBoardCallbackExtended(TrainerCallback):
 
     def __init__(self, log_dir: str, cfg: SPINConfig, log_histograms: bool = False,
                  tokenizer=None, iteration: int = 0):
+        """Args:
+            log_dir:        TensorBoard log directory for this SPIN iteration.
+            cfg:            SPIN configuration (controls which metrics are logged).
+            log_histograms: if True, write weight/gradient histogram events (large files).
+            tokenizer:      used to decode token IDs for the PROJECTOR embedding labels.
+            iteration:      SPIN iteration index — included in hparam records for cross-run comparison.
+        """
         self.writer = SummaryWriter(log_dir)
         self.cfg = cfg
         self.log_histograms = log_histograms
@@ -94,6 +99,15 @@ class TensorBoardCallbackExtended(TrainerCallback):
         # Captured from on_log so on_train_end can include it in hparams
         self._spin_lambda_val: float = 0.0
 
+        # Final metric values tracked across every on_log call.
+        # Used in on_train_end to populate hparam_metrics reliably, because the
+        # Trainer's final log_history entry is a timing summary that omits SPIN metrics.
+        self._final_loss: float = float("nan")
+        self._final_margin: float = float("nan")
+        self._final_win_rate: float = float("nan")
+        self._final_logp_gap: float = float("nan")
+        self._final_kl_from_ref: float = float("nan")
+
         # Throughput tracking
         self._step_start_time: float = 0.0
 
@@ -106,12 +120,13 @@ class TensorBoardCallbackExtended(TrainerCallback):
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        logger.info(
+            f"TensorBoardCallbackExtended: training started — "
+            f"SPIN iter={self._spin_iteration}, lr={args.learning_rate:.2e}, "
+            f"epochs={args.num_train_epochs}, batch={args.per_device_train_batch_size}"
+        )
         if model is None:
             return
-        # Snapshot weights at iteration start for drift tracking
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.initial_params[name] = param.detach().float().cpu().clone()
 
         # Log a text summary of the training config for reference
         cfg_text = "\n".join(f"    {k}: {v}" for k, v in vars(self.cfg).items())
@@ -149,7 +164,8 @@ class TensorBoardCallbackExtended(TrainerCallback):
         })
         self.writer.flush()
 
-    def on_step_begin(self, args, state, control, **kwargs):
+    def on_step_begin(self, _args, _state, _control, **_kwargs):
+        """Record the wall-clock time at the start of each step for throughput calculation."""
         self._step_start_time = time.time()
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -177,13 +193,23 @@ class TensorBoardCallbackExtended(TrainerCallback):
             gap = chosen - rejected
             self.writer.add_scalar("train/logp_gap", gap, step)
             self._epoch_gaps.append(gap)
+            self._final_logp_gap = gap
 
         loss   = logs.get("loss") or logs.get("train_loss")
         margin = logs.get("margin_mean")
         wr     = logs.get("win_rate")
-        if loss   is not None: self._epoch_losses.append(loss)
-        if margin is not None: self._epoch_margins.append(margin)
-        if wr     is not None: self._epoch_win_rates.append(wr)
+        kl     = logs.get("kl_from_ref")
+        if loss   is not None:
+            self._epoch_losses.append(loss)
+            self._final_loss = float(loss)
+        if margin is not None:
+            self._epoch_margins.append(margin)
+            self._final_margin = float(margin)
+        if wr     is not None:
+            self._epoch_win_rates.append(wr)
+            self._final_win_rate = float(wr)
+        if kl     is not None:
+            self._final_kl_from_ref = float(kl)
 
         # Perplexity: exp(loss) — more interpretable than raw cross-entropy for LLMs
         if loss is not None:
@@ -201,6 +227,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
                 self.writer.add_scalar("train/throughput_sps", sps, step)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Log system metrics, gradient norms, and per-parameter stats after each optimizer step."""
         if self.writer is None or model is None:
             return
         step = state.global_step
@@ -254,15 +281,6 @@ class TensorBoardCallbackExtended(TrainerCallback):
             tag = name.replace(".", "/")
             total_weight_sq += w.norm().item() ** 2
 
-            if self.log_histograms or self.cfg.log_parameter_histograms:
-                self.writer.add_histogram(f"weights/{tag}", w, step)
-
-            if self.cfg.log_parameter_scalars:
-                self.writer.add_scalar(f"weights/mean/{tag}",   w.mean().item(),      step)
-                self.writer.add_scalar(f"weights/std/{tag}",    w.std().item(),       step)
-                self.writer.add_scalar(f"weights/norm/{tag}",   w.norm().item(),      step)
-                self.writer.add_scalar(f"weights/absmax/{tag}", w.abs().max().item(), step)
-
             # Weight drift from the start of this SPIN iteration
             if name in self.initial_params:
                 delta = w - self.initial_params[name]
@@ -300,6 +318,14 @@ class TensorBoardCallbackExtended(TrainerCallback):
         within a single SPIN iteration.
         """
         epoch = int(state.epoch) if state.epoch is not None else 0
+        loss_mean = (sum(self._epoch_losses) / len(self._epoch_losses)) if self._epoch_losses else float("nan")
+        margin_mean = (sum(self._epoch_margins) / len(self._epoch_margins)) if self._epoch_margins else float("nan")
+        win_rate_mean = (sum(self._epoch_win_rates) / len(self._epoch_win_rates)) if self._epoch_win_rates else float("nan")
+        logger.info(
+            f"Epoch {epoch} complete — loss={loss_mean:.4f}, "
+            f"margin={margin_mean:.4f}, win_rate={win_rate_mean:.3f}, "
+            f"steps={state.global_step}"
+        )
 
         if self._epoch_losses:
             self.writer.add_scalar("epoch/loss_mean",  sum(self._epoch_losses) / len(self._epoch_losses), epoch)
@@ -340,6 +366,11 @@ class TensorBoardCallbackExtended(TrainerCallback):
         """
         Writes a final summary at the end of training for this SPIN iteration.
         """
+        logger.info(
+            f"TensorBoardCallbackExtended: training ended — "
+            f"SPIN iter={self._spin_iteration}, total_steps={state.global_step}, "
+            f"final_loss={self._final_loss:.4f}, final_win_rate={self._final_win_rate:.3f}"
+        )
         if model is not None and self.initial_params:
             total_delta_sq = sum(
                 (param.detach().float().cpu() - self.initial_params[name]).norm().item() ** 2
@@ -380,33 +411,46 @@ class TensorBoardCallbackExtended(TrainerCallback):
         hparam_dict = {
             "learning_rate":    args.learning_rate,
             "batch_size":       args.per_device_train_batch_size,
-            "num_epochs":       args.num_train_epochs,
-            "spin_iteration":   self._spin_iteration,
+            "num_epochs":       float(args.num_train_epochs),
+            "spin_iteration":   float(self._spin_iteration),
             "spin_lambda":      self._spin_lambda_val,
         }
-        hparam_metrics: dict = {}
-        loss_val = last_metrics.get("loss") or last_metrics.get("train_loss")
-        if loss_val is not None:
-            hparam_metrics["hparam/final_loss"] = loss_val
-        margin_val = last_metrics.get("margin_mean")
-        if margin_val is not None:
-            hparam_metrics["hparam/final_margin"] = margin_val
-        wr_val = last_metrics.get("win_rate")
-        if wr_val is not None:
-            hparam_metrics["hparam/final_win_rate"] = wr_val
-        if "pi_chosen_logp" in last_metrics and "pi_rejected_logp" in last_metrics:
-            hparam_metrics["hparam/final_logp_gap"] = (
-                last_metrics["pi_chosen_logp"] - last_metrics["pi_rejected_logp"]
-            )
-        kl_val = last_metrics.get("kl_from_ref")
-        if kl_val is not None:
-            hparam_metrics["hparam/final_kl_from_ref"] = kl_val
 
-        if hparam_metrics:
-            try:
-                self.writer.add_hparams(hparam_dict, hparam_metrics)
-            except Exception as e:
-                logger.warning(f"add_hparams failed: {e}")
+        # Build metric dict from values tracked across all on_log calls.
+        # The Trainer's final log_history entry is a timing summary that omits SPIN
+        # metrics (margin_mean, logp_gap, etc.), so we cannot rely on last_metrics here.
+        hparam_metrics: dict = {}
+        if not math.isnan(self._final_loss):
+            hparam_metrics["hparam/final_loss"]        = self._final_loss
+        if not math.isnan(self._final_margin):
+            hparam_metrics["hparam/final_margin"]      = self._final_margin
+        if not math.isnan(self._final_win_rate):
+            hparam_metrics["hparam/final_win_rate"]    = self._final_win_rate
+        if not math.isnan(self._final_logp_gap):
+            hparam_metrics["hparam/final_logp_gap"]    = self._final_logp_gap
+        if not math.isnan(self._final_kl_from_ref):
+            hparam_metrics["hparam/final_kl_from_ref"] = self._final_kl_from_ref
+
+        # Guarantee at least one metric so the HParams table always has a row.
+        if not hparam_metrics:
+            hparam_metrics["hparam/final_loss"] = float("inf")
+
+        # Write hparam experiment/session summaries directly into the existing
+        # file_writer instead of calling self.writer.add_hparams().
+        # add_hparams() internally creates a second SummaryWriter at the same log_dir,
+        # producing a conflicting event file that makes the TABLE / PARALLEL COORDINATES /
+        # SCATTER PLOT views show empty data in TensorBoard's HParams plugin.
+        try:
+            from torch.utils.tensorboard.summary import hparams as _tb_hparams
+            exp, ssi, sei = _tb_hparams(hparam_dict, hparam_metrics)
+            fw = self.writer.file_writer
+            fw.add_summary(exp)
+            fw.add_summary(ssi)
+            fw.add_summary(sei)
+            for k, v in hparam_metrics.items():
+                self.writer.add_scalar(k, v, global_step=state.global_step)
+        except Exception as e:
+            logger.warning(f"add_hparams failed: {e}")
 
         self.writer.flush()
         self.writer.close()
@@ -471,6 +515,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
             logger.warning(f"Could not log token embeddings: {e}")
 
     def _should_log_params(self, step: int) -> bool:
+        """Return True when per-parameter stats should be logged for this step."""
         # HuggingFace Trainer increments global_step before calling on_step_end,
         # so the first call has step=1; check step==1 to always log on the first optimizer step.
         return step == 1 or step % self.cfg.parameter_log_interval == 0

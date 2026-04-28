@@ -28,11 +28,17 @@ class MemoryProbeCallback(TrainerCallback):
     """
 
     def __init__(self, writer: SummaryWriter = None, log_every_n_steps: int = 50):
+        """Args:
+            writer: optional SummaryWriter; metrics are logged to TensorBoard when provided.
+            log_every_n_steps: throttle interval; the first 3 steps are always logged
+                               regardless of this setting to capture warmup spikes.
+        """
         # writer: optional SummaryWriter; if None, metrics are only printed to logger
         self.writer = writer
         self.log_every_n_steps = log_every_n_steps
 
     def _write(self, tag: str, step: int):
+        """Log memory stats to the Python logger and optionally to TensorBoard."""
         log_memory(tag)
         if self.writer is None or not torch.cuda.is_available():
             return
@@ -42,12 +48,17 @@ class MemoryProbeCallback(TrainerCallback):
         self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
 
     def on_train_begin(self, _args, _state, _control, **_kwargs):
+        """Capture baseline memory immediately before the first training step."""
+        logger.info(f"MemoryProbeCallback: started — logging every {self.log_every_n_steps} steps.")
         self._write("train_begin", 0)
 
     def on_step_end(self, _args, state, _control, **_kwargs):
+        """Log memory at every step for the first 3 steps; throttled thereafter."""
         # Always log the first 3 steps (warmup spikes); then throttle to every N steps
         if state.global_step < 3 or state.global_step % self.log_every_n_steps == 0:
             self._write(f"step_{state.global_step}", state.global_step)
 
     def on_train_end(self, _args, state, _control, **_kwargs):
+        """Capture final memory snapshot after all training steps complete."""
+        logger.info(f"MemoryProbeCallback: training ended at step {state.global_step}.")
         self._write("train_end", state.global_step)

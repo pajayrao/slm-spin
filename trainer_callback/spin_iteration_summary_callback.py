@@ -52,6 +52,10 @@ class SPINIterationSummaryCallback(TrainerCallback):
     """
 
     def __init__(self, log_dir: str, cfg: SPINConfig = None):
+        """Args:
+            log_dir: directory for the global (cross-iteration) TensorBoard writer.
+            cfg:     SPIN configuration; used to gate optional features (graph logging, etc.).
+        """
         os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir)
         self.cfg = cfg
@@ -173,6 +177,7 @@ class SPINIterationSummaryCallback(TrainerCallback):
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Snapshot iteration-start weights for drift tracking; write the architecture graph on iter 0."""
         if model is None:
             return
         # Snapshot weights at the start of this SPIN iteration for drift calculation

@@ -113,6 +113,7 @@ pydantic==2.12.5
 pydantic-extra-types==2.11.2
 pydantic_core==2.41.5
 Pygments==2.19.2
+pynvml==13.0.1
 pyparsing==3.3.2
 pyspark==4.1.1
 python-dateutil==2.9.0.post0

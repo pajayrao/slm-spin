@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "microsoft/harrier-oss-v1-0.6b"
+    model_name_or_path: str = "microsoft/harrier-oss-v1-270m"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -65,20 +65,6 @@ class SPINConfig:
     # Name of the column that contains the ground-truth human response (the "chosen" side).
     response_field: str = "response"
 
-    # Column name for the real/human response in explicit preference-format datasets.
-    real_field: str = "real"
-
-    # Column name for the model-generated response in preference-format datasets.
-    generated_field: str = "generated"
-
-    # Column name for multi-turn conversation data (list of {"role": ..., "content": ...} dicts).
-    # Set to None to use single-turn prompt_field / response_field mode.
-    conversations_field: Optional[str] = None
-
-    # When True and conversations_field is set, only the first user+assistant turn is extracted.
-    # Useful for keeping sequences short and reducing padding waste.
-    use_first_turn_only: bool = False
-
     # ── Formatting ───────────────────────────────────────────────────────────
 
     # Controls how the prompt is wrapped before tokenisation.
@@ -106,10 +92,6 @@ class SPINConfig:
     # Recommended range: 128–1024. For an 8 GB GPU, keep ≤ 512.
     max_prompt_length: int = 512
 
-    # Informational cap on response length. The hard limit on total sequence length
-    # is max_length; the effective response budget is max_length − prompt_length.
-    max_response_length: int = 512
-
     # Hard cap on total tokens (prompt + response) fed into the model during training.
     # Sequences longer than this are truncated. Activation memory scales as O(seq_len²)
     # for standard attention and O(seq_len) for Flash Attention.
@@ -126,7 +108,7 @@ class SPINConfig:
     # Number of prompts decoded in a single GPU batch during synthetic generation.
     # Reduce if generation causes OOM (each beam holds its own KV cache).
     # Range: 1–64; for an 8 GB GPU with max_length=1024, start at 4.
-    generation_batch_size: int = 32
+    generation_batch_size: int = 128
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -171,22 +153,31 @@ class SPINConfig:
     #   2. Trains a new model to prefer human responses over those synthetic ones.
     # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 5
+    num_iterations: int = 100
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
     # Range: 1–5. Typical: 1–3.
     num_epochs_per_iteration: int = 1
 
+    # Hard cap on the total number of records read from the dataset at load time.
+    # Applied in load_base_dataset_fixed() before any per-iteration sampling.
+    # Use this to bound memory and startup time when the source dataset is very large
+    # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
+    # 0 = load the full dataset split.
+    # Range: 0 (unlimited) or any positive integer ≤ dataset size.
+    max_data_load: int = 250000
+
+
     # How many prompts (rows) to generate synthetic responses for each iteration.
     # 0 = use the entire dataset. Reduce to limit GPU time spent on generation.
     # Range: 0 (all) or any positive integer ≤ dataset size.
-    synthetic_examples_per_iteration: int = 128
+    synthetic_examples_per_iteration: int = 2048
 
     # If True, synthetic rows from all previous iterations are included in the current
     # training set (growing curriculum). If False, only the current iteration's synthetic
     # data is used (fixed-size training set). True generally gives better convergence.
-    accumulate_previous_synthetic: bool = True
+    accumulate_previous_synthetic: bool = False
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -211,9 +202,6 @@ class SPINConfig:
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
     loss_type: str = "logistic"
 
-    # Defines which model acts as the frozen reference (π_ref) in the SPIN loss.
-    # "frozen_prev" — standard SPIN: use the checkpoint from the previous iteration.
-    reference_mode: str = "frozen_prev"
 
     # ── Training hyperparameters ─────────────────────────────────────────────
 
@@ -225,7 +213,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 6
+    per_device_train_batch_size: int = 4
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -364,9 +352,6 @@ class SPINConfig:
     # and sampling. Change to run with different randomness while keeping everything else fixed.
     seed: int = 42
 
-    # Local process rank used in multi-GPU / distributed training (set by torchrun automatically).
-    # -1 = single-GPU or CPU mode.
-    local_rank: int = -1
 
     # If True, save each iteration's synthetic prompt/response pairs to a .jsonl file.
     # Useful for inspecting generation quality and for resuming without re-generating.
@@ -458,16 +443,16 @@ class SPINConfig:
     # Log per-parameter weight value histograms to TensorBoard.
     # Useful for detecting dead neurons (weight values collapsing to zero) or
     # exploding weights (distribution spreading extremely wide). High storage cost.
-    log_parameter_histograms: bool = True
+    log_parameter_histograms: bool = False
 
     # Log per-parameter gradient histograms to TensorBoard.
     # Useful for diagnosing vanishing gradients (histogram near zero) or
     # exploding gradients (histogram spread over large values).
-    log_gradient_histograms: bool = True
+    log_gradient_histograms: bool = False
 
     # Log scalar statistics (mean, std, L2 norm) for each parameter tensor.
     # Much lower storage overhead than full histograms; a good default to leave on.
-    log_parameter_scalars: bool = True
+    log_parameter_scalars: bool = False
 
     # Log parameter statistics every N optimizer steps.
     # Higher values reduce TensorBoard file size and logging overhead.
@@ -481,7 +466,7 @@ class SPINConfig:
 
     # Log a summary of trainable vs total parameter counts when a model is prepared
     # for training. Disabled by default to keep logs quiet during normal runs.
-    log_trainable_parameters: bool = True
+    log_trainable_parameters: bool = False
 
     # ── TensorBoard visualization extras ─────────────────────────────────────
 

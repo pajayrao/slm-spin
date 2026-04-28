@@ -32,7 +32,30 @@ logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
 
 
+def find_start_iteration(cfg) -> int:
+    """Return the first iteration index that has not yet completed.
+
+    Primary signal: .done sentinel, written explicitly after all saves finish.
+    Fallback: tokenizer_config.json written by tokenizer.save_pretrained(), which
+    runs after trainer.save_model() — supports runs completed before .done was added.
+    If neither file exists the iteration is treated as incomplete even if the dir
+    was created by ensure_dir() before training started.
+    """
+    for i in range(cfg.num_iterations - 1, -1, -1):
+        iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{i}")
+        if (os.path.exists(os.path.join(iter_dir, ".done")) or
+                os.path.exists(os.path.join(iter_dir, "tokenizer_config.json"))):
+            return i + 1  # everything up to i is done; resume at i+1
+    return 0
+
 def pre_start_cleanup():
+    """Remove stale HuggingFace lock files left behind by killed processes.
+
+    HF datasets/hub write .lock files to coordinate concurrent downloads.
+    If a previous run was killed, those locks are never released and subsequent
+    runs hang forever waiting to acquire them.  Deleting them at process start
+    is safe because this process is the only one using this cache directory.
+    """
     hf_cache = os.path.expanduser("~/.cache/huggingface")
     for lock_file in glob.glob(os.path.join(hf_cache, "**", "*.lock"), recursive=True):
         try:
@@ -44,11 +67,17 @@ def pre_start_cleanup():
 pre_start_cleanup()
 
 def ensure_dir(path: str):
+    """Create a directory (and all parents) if it does not already exist."""
     os.makedirs(path, exist_ok=True)
 
 
 def log_memory(tag: str):
-        
+    """Log current CPU RSS and GPU allocated/reserved memory to the Python logger.
+
+    Args:
+        tag: A short label (e.g. "before_trainer_init") printed alongside the numbers
+             so spikes can be correlated with specific code events in the log.
+    """
     rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
 
     if torch.cuda.is_available():
@@ -59,6 +88,13 @@ def log_memory(tag: str):
         logger.info(f"[MEM {tag}] CPU RSS {rss_mb:.0f} MB")
 
 def str2dtype(name: str):
+    """Convert a dtype name string to the corresponding torch.dtype.
+
+    Accepted values: "float16", "bfloat16", "float32" (case-insensitive).
+    bfloat16 is preferred over float16 on CUDA because it preserves the same
+    dynamic range as float32 while halving memory, avoiding the overflow/underflow
+    issues that float16 can introduce during LLM training.
+    """
     name = name.lower()
     if name == "float16":
         return torch.float16
@@ -69,6 +105,14 @@ def str2dtype(name: str):
     raise ValueError(f"Unsupported torch_dtype: {name}")
 
 def parse_args() -> SPINConfig:
+    """Parse CLI arguments and return a populated SPINConfig dataclass.
+
+    Dynamically generates one argparse flag per SPINConfig field so the config
+    is the single source of truth — adding a field to SPINConfig automatically
+    exposes it as a CLI flag without touching this function.  Boolean fields
+    are accepted as strings ("true"/"false"/"1"/"0") because argparse cannot
+    natively handle bool defaults without ambiguity.
+    """
     parser = argparse.ArgumentParser(description="SPIN training")
 
     for field_name, field_def in SPINConfig.__dataclass_fields__.items():
@@ -98,6 +142,15 @@ def parse_args() -> SPINConfig:
 # -----------------------------
 
 def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> str:
+    """Format a raw user prompt according to the configured chat template mode.
+
+    Modes:
+      "plain"                — return the prompt unchanged.
+      "instruction_response" — wrap with cfg.instruction_prefix / response_prefix.
+      "auto"                 — use the tokenizer's built-in chat template when
+                               available (covers LLaMA-3, Mistral, Phi-3, etc.),
+                               falling back to instruction_response otherwise.
+    """
     if cfg.chat_template_mode == "plain":
         return user_prompt
     if cfg.chat_template_mode == "instruction_response":
@@ -116,6 +169,13 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
     raise ValueError(f"Unknown chat_template_mode: {cfg.chat_template_mode}")
 
 def normalize_chat_dataset_record(example):
+    """Extract a (prompt, response) pair from a multi-turn chat dataset record.
+
+    Reads the first user and first assistant turn from the 'messages' list,
+    tolerating common role-name variants (user/human, assistant/model/gpt/bot).
+    Returns None for records that lack a valid user→assistant exchange so they
+    can be silently skipped by the caller rather than causing downstream errors.
+    """
     messages = example.get("messages", [])
     if not messages or len(messages) < 2:
         return None
@@ -142,6 +202,17 @@ def normalize_chat_dataset_record(example):
     return {"prompt": user_prompt, "response": assistant_response}
 
 def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="train_sft", data_path=None, limit=None):
+    """Load and normalize the base training dataset.
+
+    Accepts either a HuggingFace Hub dataset (dataset_name + optional config +
+    split) or a local file (JSONL, JSON, Parquet).  Every record is passed
+    through normalize_chat_dataset_record; records that don't yield a valid
+    user→assistant pair are silently skipped.  The optional limit cap bounds
+    startup time when the source dataset is very large.
+
+    Returns an HFDataset with columns {"prompt": str, "response": str}.
+    Raises ValueError if no valid pairs are found after filtering.
+    """
     if data_path:
         if data_path.endswith(".jsonl") or data_path.endswith(".json"):
             ds = load_dataset("json", data_files=data_path, split="train")
@@ -178,27 +249,48 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
 # -----------------------------
 
 def load_tokenizer(cfg: SPINConfig):
+    """Load and configure the tokenizer for SPIN training.
+
+    Sets pad_token to eos_token when none is defined (required by many models
+    so padding doesn't trigger unknown-token errors), and forces left-side
+    truncation so the response end (which carries the most training signal)
+    is always preserved when sequences exceed max_length.
+    """
     tok_name = cfg.tokenizer_name_or_path or cfg.model_name_or_path
+    logger.info(f"Loading tokenizer from: {tok_name}")
     tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=cfg.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        logger.info("  pad_token was None — set to eos_token.")
     tokenizer.truncation_side = cfg.truncation_side
     tokenizer.padding_side = "left"
+    logger.info(f"  Tokenizer ready: vocab_size={tokenizer.vocab_size}, truncation_side={cfg.truncation_side}")
     return tokenizer
 
 def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
+    """Load a causal language model from a local or Hub path.
+
+    When trainable=False the model is returned in eval mode with all gradients
+    disabled — this is the π_ref (reference / previous-iteration) model.
+    When trainable=True it is returned in train mode ready for make_trainable()
+    to apply LoRA or enable full fine-tuning.  Gradient checkpointing is enabled
+    here when requested so use_cache is disabled before any weights move to CUDA.
+    """
+    logger.info(f"Loading causal LM from: {model_path} (trainable={trainable}, dtype={cfg.torch_dtype})")
     kwargs = dict(
         trust_remote_code=cfg.trust_remote_code,
-        torch_dtype=str2dtype(cfg.torch_dtype),
+        dtype=str2dtype(cfg.torch_dtype),
     )
     if cfg.attn_implementation:
         kwargs["attn_implementation"] = cfg.attn_implementation
+        logger.info(f"  Attention implementation: {cfg.attn_implementation}")
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
 
     if trainable and cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+        logger.info("  Gradient checkpointing enabled; use_cache disabled.")
     else:
         model.config.use_cache = cfg.generation_use_cache
 
@@ -206,10 +298,13 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
+        logger.info("  Model frozen (eval mode, no grad).")
+    else:
+        if cfg.log_trainable_parameters:
+            _log_trainable_parameters(model)
 
-    if cfg.log_trainable_parameters:
-        _log_trainable_parameters(model)
-
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    logger.info(f"  Model loaded: {n_params:.0f}M parameters.")
     return model
 
 
@@ -218,15 +313,30 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
 # -----------------------------
 
 def build_prompt_text(prompt: str, tokenizer, cfg: SPINConfig) -> str:
+    """Return the formatted prompt string (chat template applied, no response appended)."""
     return maybe_apply_chat_template(tokenizer, prompt, cfg)
 
 def build_full_text(prompt: str, response: str, tokenizer, cfg: SPINConfig) -> str:
+    """Concatenate the formatted prompt and response into one string for tokenization.
+
+    Appends eos_token when cfg.add_eos_to_response is True and the response
+    doesn't already end with it, so the model learns to terminate cleanly.
+    """
     txt = build_prompt_text(prompt, tokenizer, cfg) + response
     if cfg.add_eos_to_response and tokenizer.eos_token and not txt.endswith(tokenizer.eos_token):
         txt += tokenizer.eos_token
     return txt
 
 def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINConfig) -> Dict[str, Any]:
+    """Tokenize a prompt+response pair and produce supervised-learning labels.
+
+    The prompt and full text are tokenized together (not separately) to avoid
+    boundary artifacts — tokenizers can split subwords differently at the
+    boundary when strings are encoded in isolation.  Prompt token positions are
+    masked to -100 in `labels` so the loss is computed only over the response.
+
+    Returns a dict with keys: input_ids, attention_mask, labels.
+    """
     prompt_text = build_prompt_text(prompt, tokenizer, cfg)
     full_text = build_full_text(prompt, response, tokenizer, cfg)
 
@@ -258,12 +368,22 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
     }
 
 def pad_to_max_len(seqs: List[List[int]], pad_value: int) -> torch.Tensor:
+    """Right-pad a list of token-id lists to the length of the longest sequence.
+
+    Returns a 2-D LongTensor of shape (batch, max_len).
+    """
     max_len = max(len(x) for x in seqs)
     out = [x + [pad_value] * (max_len - len(x)) for x in seqs]
     return torch.tensor(out, dtype=torch.long)
 
 
 def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Compute the sum of per-token log-probabilities for each sequence in a batch.
+
+    Applies the standard auto-regressive shift (predict token t from tokens 0..t-1),
+    masks positions where labels == -100 (i.e. prompt tokens), and sums the
+    remaining log-probs.  Returns a 1-D tensor of shape (batch,).
+    """
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
     log_probs = F.log_softmax(shift_logits, dim=-1)
@@ -273,11 +393,28 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
     return token_logps.sum(dim=-1)
 
 def model_sequence_logprob(model, input_ids, attention_mask, labels):
+    """Run a forward pass and return sequence log-probs via sequence_logprob_from_logits.
+
+    use_cache=False prevents KV-cache allocation during log-prob scoring, which
+    is unnecessary (no generation) and wastes GPU memory.
+    """
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     return sequence_logprob_from_logits(outputs.logits, labels)
 
 @torch.no_grad()
 def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], cfg: SPINConfig) -> List[Dict[str, str]]:
+    """Generate synthetic (rejected) responses for each row using the current model.
+
+    Called once per SPIN iteration to produce the 'rejected' side of the training
+    pairs.  The model (π_prev, frozen from the previous iteration) generates
+    completions that the next iteration will learn to surpass.
+
+    Prompts are batched in chunks of cfg.generation_batch_size to bound GPU memory.
+    Only the newly generated tokens are decoded — input_lengths derived from the
+    attention_mask is used to slice off the prompt portion of each output sequence.
+
+    Returns a list of dicts with keys: prompt, response (human), synthetic_response.
+    """
     model.eval()
     out_rows = []
     bs = cfg.generation_batch_size
@@ -286,7 +423,7 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
     for start in range(0, len(rows), bs):
         chunk = rows[start:start + bs]
         prompts = [build_prompt_text(r["prompt"], tokenizer, cfg) for r in chunk]
-        logger.info("generate_synthetic_responses ============================ 2 ==================================")
+        logger.info("generate_synthetic_responses ============================ 2 ================================== with start" + str(start))
 
         enc = tokenizer(
             prompts,
@@ -332,16 +469,36 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
 # -----------------------------
 
 def get_iteration_lambda(cfg: SPINConfig, iteration: int) -> float:
+    """Return the SPIN λ (margin regularisation weight) for a given iteration.
+
+    If cfg.final_iteration_lambda_only is set and this is the last iteration,
+    returns cfg.lambda_final_iteration so a stronger regularisation can be applied
+    on the final alignment pass without affecting earlier training dynamics.
+    """
     if cfg.final_iteration_lambda_only and cfg.lambda_final_iteration is not None and iteration == cfg.num_iterations - 1:
         return cfg.lambda_final_iteration
     return cfg.lambda_initial
 
 def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
+    """Return the learning rate for a given SPIN iteration.
+
+    Supports a two-phase LR schedule: cfg.learning_rate for early iterations
+    and cfg.learning_rate_late once cfg.late_lr_start_iteration is reached.
+    Useful for decaying LR in later iterations when the model is already close
+    to alignment and smaller updates prevent overshooting.
+    """
     if iteration >= cfg.late_lr_start_iteration:
         return cfg.learning_rate_late
     return cfg.learning_rate
 
 def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: float) -> TrainingArguments:
+    """Construct a HuggingFace TrainingArguments from SPINConfig for one iteration.
+
+    Per-iteration output_dir (iteration_dir) keeps every iteration's checkpoints
+    and TensorBoard logs isolated so they can be compared side-by-side.
+    report_to is set to [] when cfg.report_to == "none" to avoid HuggingFace
+    trying to import optional logging integrations (wandb, mlflow, etc.).
+    """
     return TrainingArguments(
         output_dir=iteration_dir,
         num_train_epochs=cfg.num_epochs_per_iteration,
@@ -367,15 +524,18 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
     )
 
 def save_json(path: str, obj: Any):
+    """Serialise obj to a pretty-printed UTF-8 JSON file."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 def save_jsonl(path: str, rows: List[Dict[str, Any]]):
+    """Write a list of dicts to a UTF-8 JSONL file, one JSON object per line."""
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
+    """Read a JSONL file and return its records as a list of dicts. Skips blank lines."""
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -385,6 +545,7 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 def _log_trainable_parameters(model):
+    """Log the trainable vs total parameter count and the trainable percentage."""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     pct = 100.0 * trainable / total if total else 0.0
@@ -452,6 +613,12 @@ def merge_lora_and_get_base(model, cfg: SPINConfig):
 
 
 def free_model(model):
+    """Delete a model reference, run garbage collection, and empty the CUDA cache.
+
+    Called between SPIN iterations after trainer.save_model() completes.  Each
+    checkpoint can be several GB; freeing before loading the next iteration's model
+    prevents OOM when total GPU memory is close to the model size.
+    """
     try:
         del model
     except Exception:
@@ -463,6 +630,17 @@ def free_model(model):
 
 @torch.no_grad()
 def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPINConfig) -> List[Dict[str, float]]:
+    """Score every (chosen, rejected) pair under the frozen reference model.
+
+    Must be called while the model is still in its frozen state (before
+    make_trainable() converts it to the trainable π_θ).  The resulting log-probs
+    are stored alongside each training row so the SPINDataset / SPINTrainer can
+    compute the SPIN margin loss without a second reference-model forward pass
+    during training, saving both memory and time.
+
+    Returns a list of dicts with keys: ref_chosen_logp, ref_rejected_logp.
+    """
+    logger.info(f"Computing reference log-probs for {len(rows)} rows...")
     model.eval()
     ref_logprobs = []
     for row in rows:
@@ -481,5 +659,6 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
             "ref_chosen_logp": model_sequence_logprob(model, chosen_ids, chosen_mask, chosen_labels).item(),
             "ref_rejected_logp": model_sequence_logprob(model, rejected_ids, rejected_mask, rejected_labels).item(),
         })
+    logger.info(f"Reference log-probs computed for {len(ref_logprobs)} rows.")
     return ref_logprobs
 

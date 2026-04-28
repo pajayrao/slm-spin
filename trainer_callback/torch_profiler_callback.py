@@ -45,6 +45,12 @@ class TorchProfilerCallback(TrainerCallback):
         spin_iteration: int = 0,
         tb_writer: SummaryWriter = None,
     ):
+        """Args:
+            cfg:           SPIN configuration (profiler schedule, activity flags, etc.).
+            spin_iteration: index of the current SPIN iteration — used to name the
+                            output directory so profiles from each iteration are isolated.
+            tb_writer:     optional SummaryWriter that receives the key-averages text card.
+        """
         self.cfg = cfg
         self.spin_iteration = spin_iteration
         self.tb_writer = tb_writer
@@ -53,7 +59,8 @@ class TorchProfilerCallback(TrainerCallback):
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def on_train_begin(self, args, state, control, **kwargs):
+    def on_train_begin(self, _args, state, _control, **_kwargs):
+        """Start the profiler at the beginning of training for this SPIN iteration."""
         if not self.cfg.enable_profiler:
             return
 
@@ -97,11 +104,13 @@ class TorchProfilerCallback(TrainerCallback):
             f"Traces → {self._run_dir}"
         )
 
-    def on_step_end(self, args, state, control, **kwargs):
+    def on_step_end(self, _args, _state, _control, **_kwargs):
+        """Advance the profiler schedule by one step so the wait/warmup/active phases progress."""
         if self.prof is not None:
             self.prof.step()
 
-    def on_train_end(self, args, state, control, **kwargs):
+    def on_train_end(self, _args, _state, _control, **_kwargs):
+        """Stop the profiler, export stacks, and log the key-averages operator table."""
         if self.prof is None:
             return
 

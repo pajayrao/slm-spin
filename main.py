@@ -1,4 +1,13 @@
 import os
+
+# Must be set before torch is imported so the CUDA allocator picks it up.
+# expandable_segments: reduces fragmentation when many tensors of varying sizes
+# are allocated/freed rapidly (typical during forward+backward of variable-length sequences).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
+
+
 import gc
 import random
 import logging
@@ -12,34 +21,32 @@ from trainer_callback import *
 from spin_trainer import *
 
 
+
 logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
 
-# Must be set before torch is imported so the CUDA allocator picks it up.
-# expandable_segments: reduces fragmentation when many tensors of varying sizes
-# are allocated/freed rapidly (typical during forward+backward of variable-length sequences).
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def _find_start_iteration(cfg) -> int:
-    """Return the first iteration index that has not yet completed.
-
-    Primary signal: .done sentinel, written explicitly after all saves finish.
-    Fallback: tokenizer_config.json written by tokenizer.save_pretrained(), which
-    runs after trainer.save_model() — supports runs completed before .done was added.
-    If neither file exists the iteration is treated as incomplete even if the dir
-    was created by ensure_dir() before training started.
-    """
-    for i in range(cfg.num_iterations - 1, -1, -1):
-        iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{i}")
-        if (os.path.exists(os.path.join(iter_dir, ".done")) or
-                os.path.exists(os.path.join(iter_dir, "tokenizer_config.json"))):
-            return i + 1  # everything up to i is done; resume at i+1
-    return 0
 
 
 def main():
+    """Entry point for SPIN (Self-Play Fine-Tuning) training.
 
+    Orchestrates the outer SPIN loop:
+      1. Parse config and set up output directories.
+      2. Load the tokenizer and base dataset once (reused across all iterations).
+      3. Detect the first incomplete iteration (supports crash resume via .done sentinels).
+      4. For each iteration:
+         a. Load π_prev (previous-iteration or base model, frozen).
+         b. Generate or reload synthetic 'rejected' responses.
+         c. Score every (chosen, rejected) pair under π_prev (ref log-probs).
+         d. Convert π_prev to a trainable model (LoRA or full fine-tune).
+         e. Train with SPINTrainer; log progress via TensorBoard callbacks.
+         f. Merge LoRA adapters (if used), save model + tokenizer, write .done.
+         g. Free GPU memory before the next iteration.
+      5. Close the global cross-iteration TensorBoard writer.
+
+    The final checkpoint is saved at cfg.checkpoints_dir/iter_{N-1}/ and is a
+    plain AutoModelForCausalLM with no PEFT dependency.
+    """
     cfg = parse_args()
 
     ensure_dir(cfg.output_dir)
@@ -58,20 +65,16 @@ def main():
         dataset_config_name=cfg.dataset_config_name if cfg.dataset_config_name else None,
         split=cfg.train_split,
         data_path=cfg.data_path if cfg.data_path else None,
-        limit=cfg.synthetic_examples_per_iteration if cfg.synthetic_examples_per_iteration > 0 else None,
+        limit=cfg.max_data_load if cfg.max_data_load > 0 else None,
     )
 
     base_rows = [base_ds[i] for i in range(len(base_ds))]
-
-    # Shuffle with fresh system entropy on every program start so that a restart
-    # after a kill does not re-process the same rows in the same order.
-    random.shuffle(base_rows)
-    logger.info(f"base_rows shuffled: {len(base_rows)} rows (fresh order this run).")
+    logger.info(f"Loaded full dataset: {len(base_rows)} rows (sampled per-iteration).")
 
     # ── Resume detection ────────────────────────────────────────────────────
     # Find the first iteration that hasn't written its .done sentinel yet.
     # Completed iterations are skipped entirely; the loop picks up from there.
-    start_iteration = _find_start_iteration(cfg)
+    start_iteration = find_start_iteration(cfg)
     if start_iteration > 0:
         logger.info(f"Resuming: iterations 0–{start_iteration - 1} already complete. "
                     f"Starting at iteration {start_iteration}.")
@@ -126,7 +129,10 @@ def main():
             logger.info("============================ 3 (cached) ==================================")
             logger.info("============================ 4 (cached) ==================================")
         else:
-            rows_for_generation = base_rows[:limit]
+            # Use a seed derived from (global seed + iteration) so the sample is
+            # different each iteration but fully reproducible on resume.
+            iter_rng = random.Random(cfg.seed + iteration)
+            rows_for_generation = iter_rng.sample(base_rows, min(limit, len(base_rows)))
             logger.info(f"============================ 2.6 Length of dataset {len(rows_for_generation)}")
             logger.info("============================ 3 ==================================")
             synthetic_rows = generate_synthetic_responses(prev_model, tokenizer, rows_for_generation, cfg)
@@ -189,6 +195,7 @@ def main():
         # summary_cb must be last: its on_train_end writes the cross-iteration summary
         # after all other callbacks have finished their on_train_end
         callbacks.append(summary_cb)
+        print(len(dataset), dataset)
         logger.info("============================ 6.5 ==================================")
 
         log_memory("before_trainer_init")
@@ -228,7 +235,7 @@ def main():
         tokenizer.save_pretrained(iter_dir)
         logger.info("============================ 11 ==================================")
 
-        # Write a sentinel so _find_start_iteration() can skip this iteration on restart.
+        # Write a sentinel so find_start_iteration() can skip this iteration on restart.
         # Written AFTER both model and tokenizer are fully saved.
         open(os.path.join(iter_dir, ".done"), "w").close()
         logger.info(f"Iteration {iteration} complete. Sentinel written to {iter_dir}/.done")
