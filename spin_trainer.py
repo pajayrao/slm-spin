@@ -214,6 +214,6 @@ class RMSPropSPINTrainer(SPINTrainer):
                 eps=1e-8,     # added to denominator for numerical stability
                 momentum=0.0,
                 centered=False,
-                foreach=False,  # processes params one at a time; uses less peak memory than foreach=True
+                foreach=True,   # fuses the update across all params into fewer CUDA kernels; ~10% faster per step
             )
         return self.optimizer

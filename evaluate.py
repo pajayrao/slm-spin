@@ -43,6 +43,9 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -158,12 +161,12 @@ DEFAULT_SHOTS: dict[str, int] = {
 # Set to an integer to cap the number of rows used from that dataset;
 # None means fall back to the global --limit (or all rows if --limit is also None).
 DATASET_LIMITS: dict[str, Optional[int]] = {
-    "arc_challenge":  100,
-    "truthfulqa_mc2": 100,
-    "winogrande":     100,
-    "gsm8k":          100,
-    "hellaswag":      100,
-    "mmlu":           100,
+    "arc_challenge":  None,
+    "truthfulqa_mc2": None,
+    "winogrande":     None,
+    "gsm8k":          None,
+    "hellaswag":      None,
+    "mmlu":           None,
 }
 
 # Quick lookup: is a given key a task label (vs "Average")?
@@ -252,7 +255,7 @@ def find_model_path(iter_dir: Path) -> Path:
     return iter_dir.resolve()
 
 
-def load_model_and_tokenizer(model_path: str, device: str):
+def load_model_and_tokenizer(model_path: str, device: str, attn_implementation: str = "sdpa"):
     """Load a causal LM and its tokenizer from a local checkpoint directory.
 
     Uses bfloat16 on CUDA (half memory, same dynamic range as float32) and
@@ -266,19 +269,34 @@ def load_model_and_tokenizer(model_path: str, device: str):
         tokenizer.pad_token = tokenizer.eos_token
         logger.info("  pad_token was None — set to eos_token.")
 
-    # bfloat16 is preferred on CUDA: it halves memory vs float32 and avoids the
-    # narrow dynamic range of float16 that can cause NaN in large-scale models.
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    logger.info(f"Loading model: dtype={torch_dtype}, device={device}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        dtype=torch_dtype,
-        trust_remote_code=_TRUST_REMOTE_CODE,
-    ).to(device)
-    model.eval()   # disable dropout; we are only doing inference here
+    logger.info(f"Loading model: dtype={torch_dtype}, device={device}, attn={attn_implementation}")
+    kwargs = dict(dtype=torch_dtype, trust_remote_code=_TRUST_REMOTE_CODE)
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).to(device)
+    model.eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info(f"  Model loaded: {n_params:.0f}M parameters, eval mode.")
     return model, tokenizer
+
+
+def maybe_compile_model(model, backend: str = "inductor"):
+    """Wrap model with torch.compile() for faster inference throughput.
+
+    Falls back gracefully if torch.compile is unavailable (PyTorch < 2.0) or fails.
+    Note: compile + model.generate() requires PyTorch >= 2.1.
+    """
+    if not hasattr(torch, "compile"):
+        logger.warning("torch.compile not available (requires PyTorch >= 2.0); skipping.")
+        return model
+    logger.info(f"Compiling model with backend={backend!r}...")
+    try:
+        model = torch.compile(model, backend=backend)
+        logger.info("  Model compiled successfully.")
+    except Exception as exc:
+        logger.warning(f"  torch.compile failed ({exc}); running in eager mode.")
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +382,76 @@ def score_continuation(
     return token_log_probs.sum().item()
 
 
+@torch.no_grad()
+def score_continuations_batched(
+    model,
+    tokenizer,
+    context: str,
+    continuations: list[str],
+    device: str,
+) -> list[float]:
+    """Score all continuations for one context in a single batched forward pass.
+
+    Produces numerically identical results to calling score_continuation() once
+    per continuation, but requires only one GPU kernel launch instead of N.
+    For a 4-choice task this gives ~4x throughput; for 2-choice (Winogrande) ~2x.
+
+    Sequences are left-padded to the batch maximum length — the standard for
+    causal-LM batched inference — so that real tokens are right-aligned and
+    attention patterns are valid across the batch.
+    """
+    if not continuations:
+        return []
+
+    pad_id = tokenizer.pad_token_id
+    seq_data: list[tuple[list[int], int, int]] = []  # (full_ids, cont_start, cont_len)
+
+    for cont in continuations:
+        full_ids: list[int] = tokenizer(context + cont, add_special_tokens=True)["input_ids"]
+        cont_raw: list[int] = tokenizer(cont, add_special_tokens=False)["input_ids"]
+        cont_len = len(cont_raw)
+        if cont_len == 0:
+            seq_data.append(([], 0, 0))
+            continue
+        cont_start = len(full_ids) - cont_len
+        if len(full_ids) > MAX_SEQ_LEN:
+            full_ids = full_ids[-MAX_SEQ_LEN:]
+            cont_start = max(1, len(full_ids) - cont_len)
+        seq_data.append((full_ids, cont_start, cont_len))
+
+    max_len = max((len(d[0]) for d in seq_data), default=0)
+    padded_ids, attn_masks, adj_starts = [], [], []
+
+    for full_ids, cont_start, _ in seq_data:
+        if not full_ids:
+            padded_ids.append([pad_id] * max_len)
+            attn_masks.append([0] * max_len)
+            adj_starts.append(0)
+            continue
+        pad_len = max_len - len(full_ids)
+        padded_ids.append([pad_id] * pad_len + full_ids)
+        attn_masks.append([0] * pad_len + [1] * len(full_ids))
+        adj_starts.append(cont_start + pad_len)  # shift start to account for left-padding
+
+    input_ids_t  = torch.tensor(padded_ids, dtype=torch.long, device=device)
+    attn_mask_t  = torch.tensor(attn_masks,  dtype=torch.long, device=device)
+    logits       = model(input_ids=input_ids_t, attention_mask=attn_mask_t).logits  # [B, L, V]
+    log_probs    = F.log_softmax(logits, dim=-1)
+
+    scores: list[float] = []
+    for i, (full_ids, _, cont_len) in enumerate(seq_data):
+        if not full_ids or cont_len == 0:
+            scores.append(0.0)
+            continue
+        cs = adj_starts[i]
+        actual_len = min(cont_len, max_len - cs)
+        cont_tok_ids = input_ids_t[i, cs:cs + actual_len]
+        pred_lp      = log_probs[i, cs - 1:cs - 1 + actual_len]
+        scores.append(pred_lp[torch.arange(actual_len, device=device), cont_tok_ids].sum().item())
+
+    return scores
+
+
 def _pick_best(scores: list[float], choices: list[str], normalize: bool) -> int:
     """Select the index of the highest-scoring choice.
 
@@ -429,7 +517,7 @@ def eval_arc_challenge(
         context = few_shot_prefix + f"Question: {ex['question']}\nAnswer:"
         # Each choice is prepended with a space for proper tokenisation boundary
         choices = [f" {t}" for t in texts]
-        scores = [score_continuation(model, tokenizer, context, c, device) for c in choices]
+        scores = score_continuations_batched(model, tokenizer, context, choices, device)
         predicted_idx = _pick_best(scores, choices, normalize=True)
         if labels[predicted_idx] == ex["answerKey"]:
             correct += 1
@@ -480,7 +568,7 @@ def eval_truthfulqa_mc2(
 
         # Compute log-likelihood of each choice continuation, then softmax to get probs
         log_lls = torch.tensor(
-            [score_continuation(model, tokenizer, context, f" {c}", device) for c in choices],
+            score_continuations_batched(model, tokenizer, context, [f" {c}" for c in choices], device),
             dtype=torch.float64,
         )
         # Softmax turns the log-likelihoods into a valid probability distribution
@@ -543,8 +631,7 @@ def eval_winogrande(
         rest = sentence[blank_idx + 1:]  # text that follows the blank in the sentence
 
         # Score both options as continuations of the context, then pick the higher one
-        s1 = score_continuation(model, tokenizer, context, ex["option1"] + rest, device)
-        s2 = score_continuation(model, tokenizer, context, ex["option2"] + rest, device)
+        s1, s2 = score_continuations_batched(model, tokenizer, context, [ex["option1"] + rest, ex["option2"] + rest], device)
         predicted = "1" if s1 > s2 else "2"
         if predicted == ex["answer"]:
             correct += 1
@@ -697,7 +784,7 @@ def eval_hellaswag(
         context = few_shot_prefix + _clean_hellaswag(ex["activity_label"] + ": " + ex["ctx"])
         # Each ending is prepended with a space for consistent tokenisation
         endings = [" " + _clean_hellaswag(e) for e in ex["endings"]]
-        scores = [score_continuation(model, tokenizer, context, e, device) for e in endings]
+        scores = score_continuations_batched(model, tokenizer, context, endings, device)
         predicted = _pick_best(scores, endings, normalize=True)
         if predicted == int(ex["label"]):
             correct += 1
@@ -780,7 +867,7 @@ def eval_mmlu(
 
         context = few_shot_prefix + _mmlu_format(ex)
         # No length normalisation: all choice labels are single characters
-        scores = [score_continuation(model, tokenizer, context, c, device) for c in choices]
+        scores = score_continuations_batched(model, tokenizer, context, choices, device)
         predicted = _pick_best(scores, choices, normalize=False)
         if predicted == ex["answer"]:
             correct += 1
@@ -1015,7 +1102,7 @@ def write_summary(rows: list[dict], path: Path) -> None:
             lines.append(f"status: below best-so-far iteration {row['best_iteration_so_far']}")
         lines.append("")
 
-    path.write_text("\n".join(lines))
+    path.write_text("\n".join(lines), encoding="utf-8")
     logger.info(f"Comparative summary written to: {path}")
 
 
@@ -1050,32 +1137,11 @@ def _make_leaderboard_md(row: dict) -> str:
     return "\n".join(lines)
 
 
-def log_tensorboard(rows: list[dict], tb_dir: Path, args: argparse.Namespace) -> None:
-    """Write all evaluation metrics to TensorBoard.
-
-    Scalar tags written per iteration (step = iteration number):
-      eval/average                  — macro-average score across all tasks (%)
-      eval/best_so_far_average      — running maximum average seen so far (%)
-      eval/task_count               — number of tasks that completed successfully
-      eval/tasks/<task_label>       — individual task scores (%)  [as scalars]
-      compare_vs_prev/<task_label>  — score delta vs previous iteration (pp)
-      compare_vs_prev/average       — average delta vs previous (pp)
-      compare_vs_prev/improved_task_count  — number of tasks that improved
-      compare_vs_prev/declined_task_count  — number of tasks that declined
-      compare_vs_prev/improvement_rate     — improved_count / total_tasks (0–1)
-
-    Text cards written per iteration:
-      eval/scorecard                — Markdown table with per-task scores and deltas
-      eval/best_iteration           — note when a new best average is reached
-
-    Metadata text card (written once at step 0):
-      eval/run_config               — shot counts, example limit, device, checkpoint dir
-    """
-    logger.info(f"Writing TensorBoard metrics to: {tb_dir}")
+def _tb_setup(tb_dir: Path, args: argparse.Namespace, n_iters: int) -> "SummaryWriter":
+    """Open a SummaryWriter, register the custom scalar layout, and write the run-config card."""
+    logger.info(f"Opening TensorBoard writer: {tb_dir}")
     writer = SummaryWriter(log_dir=str(tb_dir))
 
-    # Register custom scalar layout so TensorBoard groups related metrics under
-    # named sections in the "Custom Scalars" dashboard tab
     writer.add_custom_scalars({
         "Evaluation": {
             "Average Score (%)": ["Multiline", [_TB_TAG_AVG, _TB_TAG_BEST_AVG]],
@@ -1089,7 +1155,6 @@ def log_tensorboard(rows: list[dict], tb_dir: Path, args: argparse.Namespace) ->
         },
     })
 
-    # ── Run-level metadata card (written once so it's easy to find in the TEXT tab) ──
     shot_summary = ", ".join(f"{k}={v}" for k, v in sorted(args.n_shots_resolved.items()))
     config_md = (
         "## Evaluation Run Configuration\n\n"
@@ -1100,75 +1165,74 @@ def log_tensorboard(rows: list[dict], tb_dir: Path, args: argparse.Namespace) ->
         f"| Device | `{args.device}` |\n"
         f"| Example limit | `{args.limit if args.limit else 'full dataset'}` |\n"
         f"| Shot counts | `{shot_summary}` |\n"
-        f"| Iterations evaluated | `{len(rows)}` |\n"
+        f"| Iterations planned | `{n_iters}` |\n"
     )
     writer.add_text(_TB_TAG_RUN_CONFIG, config_md, global_step=0)
+    return writer
 
-    for row in rows:
-        # Use the iteration number as the TensorBoard x-axis step so that
-        # iter_0, iter_1, … line up with a natural integer axis
-        step = iter_num(row["iteration"])
-        metrics = row["metrics"]
 
-        # ── Core scalar metrics ──────────────────────────────────────────────
-        avg = metrics.get("Average")
-        if avg is not None:
-            writer.add_scalar(_TB_TAG_AVG, avg, step)
+def _tb_write_row(writer: "SummaryWriter", row: dict) -> None:
+    """Write one iteration's metrics to an already-open SummaryWriter and flush."""
+    step = iter_num(row["iteration"])
+    metrics = row["metrics"]
 
-        # Log each task as both an individual scalar and as part of the grouped scalars
-        task_scores: dict[str, float] = {
-            t[1].lower(): metrics[t[1]]
-            for t in TASKS if metrics.get(t[1]) is not None
-        }
-        if task_scores:
-            # add_scalars writes one event with multiple series — shows in the same chart
-            writer.add_scalars(_TB_TAG_TASKS, task_scores, step)
-            # Also write individually so each task has its own chart under eval/tasks/<name>
-            for name, score in task_scores.items():
-                writer.add_scalar(f"{_TB_TAG_TASKS}/{name}", score, step)
+    avg = metrics.get("Average")
+    if avg is not None:
+        writer.add_scalar(_TB_TAG_AVG, avg, step)
 
-        writer.add_scalar(_TB_TAG_TASK_COUNT, len(task_scores), step)
+    task_scores: dict[str, float] = {
+        t[1].lower(): metrics[t[1]]
+        for t in TASKS if metrics.get(t[1]) is not None
+    }
+    if task_scores:
+        writer.add_scalars(_TB_TAG_TASKS, task_scores, step)
+        for name, score in task_scores.items():
+            writer.add_scalar(f"{_TB_TAG_TASKS}/{name}", score, step)
 
-        best_avg = row.get("best_so_far_avg")
-        if best_avg is not None:
-            writer.add_scalar(_TB_TAG_BEST_AVG, best_avg, step)
+    writer.add_scalar(_TB_TAG_TASK_COUNT, len(task_scores), step)
 
-        # ── Delta vs previous iteration ──────────────────────────────────────
-        if row["delta_prev"]:
-            d = row["delta_prev"]
-            for k, v in d.items():
-                if v is not None:
-                    writer.add_scalar(f"{_TB_TAG_DELTA_PREFIX}{k.lower()}", v, step)
+    best_avg = row.get("best_so_far_avg")
+    if best_avg is not None:
+        writer.add_scalar(_TB_TAG_BEST_AVG, best_avg, step)
 
-            # Count tasks that improved, declined, or stayed the same this iteration
-            improved_count = sum(
-                1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v > 0
-            )
-            declined_count = sum(
-                1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v < 0
-            )
-            total_valid = sum(
-                1 for k, v in d.items() if k in _TASK_LABELS and v is not None
-            )
-            writer.add_scalar(_TB_TAG_IMPROVED_COUNT, improved_count, step)
-            writer.add_scalar(_TB_TAG_DECLINED_COUNT, declined_count, step)
-            # Improvement rate: fraction of tasks that got better this iteration
-            if total_valid > 0:
-                writer.add_scalar(_TB_TAG_IMPROVEMENT_RATE, improved_count / total_valid, step)
+    if row["delta_prev"]:
+        d = row["delta_prev"]
+        for k, v in d.items():
+            if v is not None:
+                writer.add_scalar(f"{_TB_TAG_DELTA_PREFIX}{k.lower()}", v, step)
 
-        # ── Text cards ───────────────────────────────────────────────────────
-        # Scorecard table — visible in the TEXT tab of TensorBoard
-        writer.add_text(_TB_TAG_SCORECARD, _make_leaderboard_md(row), step)
+        improved_count = sum(
+            1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v > 0
+        )
+        declined_count = sum(
+            1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v < 0
+        )
+        total_valid = sum(
+            1 for k, v in d.items() if k in _TASK_LABELS and v is not None
+        )
+        writer.add_scalar(_TB_TAG_IMPROVED_COUNT, improved_count, step)
+        writer.add_scalar(_TB_TAG_DECLINED_COUNT, declined_count, step)
+        if total_valid > 0:
+            writer.add_scalar(_TB_TAG_IMPROVEMENT_RATE, improved_count / total_valid, step)
 
-        # New-best annotation — makes it easy to scan the TEXT tab for breakthroughs
-        if row["best_iteration_so_far"] == row["iteration"] and avg is not None:
-            writer.add_text(
-                _TB_TAG_BEST_ITER,
-                f"**{row['iteration']}** achieved new best average: **{fmt(avg)}%**",
-                step,
-            )
+    writer.add_text(_TB_TAG_SCORECARD, _make_leaderboard_md(row), step)
+
+    if row["best_iteration_so_far"] == row["iteration"] and avg is not None:
+        writer.add_text(
+            _TB_TAG_BEST_ITER,
+            f"**{row['iteration']}** achieved new best average: **{fmt(avg)}%**",
+            step,
+        )
 
     writer.flush()
+    logger.info(f"TensorBoard: flushed metrics for {row['iteration']} (step={step})")
+
+
+def log_tensorboard(rows: list[dict], tb_dir: Path, args: argparse.Namespace) -> None:
+    """Write all evaluation metrics to TensorBoard (batch mode — called with completed rows)."""
+    writer = _tb_setup(tb_dir, args, len(rows))
+    for row in rows:
+        _tb_write_row(writer, row)
     writer.close()
     logger.info(f"TensorBoard logging complete: {len(rows)} iteration(s) written to {tb_dir}")
 
@@ -1201,6 +1265,18 @@ def main() -> None:
         help="TensorBoard log directory for evaluation metrics.",
     )
     ap.add_argument("--device", default=DEFAULT_DEVICE)
+    ap.add_argument(
+        "--attn-impl", default="sdpa",
+        help="Attention implementation: sdpa (default), flash_attention_2, or empty string for eager.",
+    )
+    ap.add_argument(
+        "--compile", action="store_true", default=True,
+        help="Apply torch.compile() to each checkpoint model before evaluation (requires PyTorch >= 2.0).",
+    )
+    ap.add_argument(
+        "--compile-backend", default="inductor",
+        help="torch.compile backend (default: inductor). Use aot_eager if triton is unavailable.",
+    )
     ap.add_argument(
         "--limit", type=int, default=None,
         help="Max examples per task for smoke testing. Do NOT use for real benchmarks.",
@@ -1262,6 +1338,7 @@ def main() -> None:
     prev_metrics: dict | None = None    # metrics from the immediately preceding iteration
 
     run_start = time.time()
+    tb_writer = _tb_setup(tb_dir, args, len(iters))
 
     for iter_path in iters:
         iter_name  = iter_path.name
@@ -1273,7 +1350,11 @@ def main() -> None:
         print(f"{'='*60}", flush=True)
 
         try:
-            model, tokenizer = load_model_and_tokenizer(str(model_path), args.device)
+            model, tokenizer = load_model_and_tokenizer(
+                str(model_path), args.device, attn_implementation=args.attn_impl or None,
+            )
+            if args.compile:
+                model = maybe_compile_model(model, backend=args.compile_backend)
         except Exception as exc:
             logger.error(f"Failed to load model for {iter_name}: {exc}")
             continue
@@ -1300,14 +1381,16 @@ def main() -> None:
             best_iter = iter_name
             logger.info(f"New best average: {best_avg:.2f}% at {best_iter}")
 
-        rows.append({
+        row = {
             "iteration":             iter_name,
             "metrics":               metrics,
             "delta_prev":            dprev,
             "best_so_far_avg":       best_avg,
             "best_iteration_so_far": best_iter,
             "elapsed_seconds":       elapsed,
-        })
+        }
+        rows.append(row)
+        _tb_write_row(tb_writer, row)
         prev_metrics = metrics
 
         # ── Per-iteration CLI summary ────────────────────────────────────────
@@ -1351,7 +1434,7 @@ def main() -> None:
     json_summary = out_dir / "comparative_summary.json"
     json_summary.write_text(json.dumps(rows, indent=2))
     logger.info(f"JSON summary written to: {json_summary}")
-    log_tensorboard(rows, tb_dir, args)
+    tb_writer.close()
 
     logger.info(f"Best iteration overall: {best_iter} ({fmt(best_avg)}%)")
     print(f"\nSaved summary : {summary_path}")

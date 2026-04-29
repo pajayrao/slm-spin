@@ -15,10 +15,15 @@ class SPINDataCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         batch = {}
         for prefix in ["chosen", "rejected"]:
-            batch[f"{prefix}_input_ids"] = pad_to_max_len([f[f"{prefix}_input_ids"] for f in features], self.pad_id)
-            batch[f"{prefix}_attention_mask"] = pad_to_max_len([f[f"{prefix}_attention_mask"] for f in features], 0)
-            batch[f"{prefix}_labels"] = pad_to_max_len([f[f"{prefix}_labels"] for f in features], -100)
+            batch[f"{prefix}_input_ids"] = pad_to_max_len(
+                [f[f"{prefix}_input_ids"] for f in features], self.pad_id)
+            batch[f"{prefix}_attention_mask"] = pad_to_max_len(
+                [f[f"{prefix}_attention_mask"] for f in features], 0)
+            batch[f"{prefix}_labels"] = pad_to_max_len(
+                [f[f"{prefix}_labels"] for f in features], -100)
         if "ref_chosen_logp" in features[0]:
-            batch["ref_chosen_logp"] = torch.tensor([f["ref_chosen_logp"] for f in features], dtype=torch.float32)
-            batch["ref_rejected_logp"] = torch.tensor([f["ref_rejected_logp"] for f in features], dtype=torch.float32)
+            batch["ref_chosen_logp"] = torch.tensor(
+                [f["ref_chosen_logp"] for f in features], dtype=torch.float32)
+            batch["ref_rejected_logp"] = torch.tensor(
+                [f["ref_rejected_logp"] for f in features], dtype=torch.float32)
         return batch

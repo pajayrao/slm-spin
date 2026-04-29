@@ -23,9 +23,9 @@ from transformers import (
 from spin_config import *
 
 logging_kwargs = {
-    "format":'%(asctime)s %(levelname)-8s %(message)s',
-    "level":logging.INFO,
-    "datefmt":'%Y-%m-%d %H:%M:%S',
+    "format": '%(asctime)s %(levelname)-8s %(message)s',
+    "level": logging.INFO,
+    "datefmt": '%Y-%m-%d %H:%M:%S',
 }
 
 logging.basicConfig(**logging_kwargs)
@@ -48,6 +48,7 @@ def find_start_iteration(cfg) -> int:
             return i + 1  # everything up to i is done; resume at i+1
     return 0
 
+
 def pre_start_cleanup():
     """Remove stale HuggingFace lock files left behind by killed processes.
 
@@ -64,7 +65,9 @@ def pre_start_cleanup():
         except OSError:
             pass
 
+
 pre_start_cleanup()
+
 
 def ensure_dir(path: str):
     """Create a directory (and all parents) if it does not already exist."""
@@ -83,9 +86,11 @@ def log_memory(tag: str):
     if torch.cuda.is_available():
         alloc_mb = torch.cuda.memory_allocated() / 1024 ** 2
         reserved_mb = torch.cuda.memory_reserved() / 1024 ** 2
-        logger.info(f"[MEM {tag}] CPU RSS {rss_mb:.0f} MB | GPU alloc {alloc_mb:.0f} MB | GPU reserved {reserved_mb:.0f} MB")
+        logger.info(
+            f"[MEM {tag}] CPU RSS {rss_mb:.0f} MB | GPU alloc {alloc_mb:.0f} MB | GPU reserved {reserved_mb:.0f} MB")
     else:
         logger.info(f"[MEM {tag}] CPU RSS {rss_mb:.0f} MB")
+
 
 def str2dtype(name: str):
     """Convert a dtype name string to the corresponding torch.dtype.
@@ -104,6 +109,7 @@ def str2dtype(name: str):
         return torch.float32
     raise ValueError(f"Unsupported torch_dtype: {name}")
 
+
 def parse_args() -> SPINConfig:
     """Parse CLI arguments and return a populated SPINConfig dataclass.
 
@@ -118,7 +124,8 @@ def parse_args() -> SPINConfig:
     for field_name, field_def in SPINConfig.__dataclass_fields__.items():
         default = field_def.default
         if isinstance(default, bool):
-            parser.add_argument(f"--{field_name}", type=str, default=str(default))
+            parser.add_argument(f"--{field_name}",
+                                type=str, default=str(default))
         else:
             parser.add_argument(
                 f"--{field_name}",
@@ -168,6 +175,7 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
         return f"{cfg.instruction_prefix}{user_prompt}{cfg.response_prefix}"
     raise ValueError(f"Unknown chat_template_mode: {cfg.chat_template_mode}")
 
+
 def normalize_chat_dataset_record(example):
     """Extract a (prompt, response) pair from a multi-turn chat dataset record.
 
@@ -200,6 +208,7 @@ def normalize_chat_dataset_record(example):
         return None
 
     return {"prompt": user_prompt, "response": assistant_response}
+
 
 def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="train_sft", data_path=None, limit=None):
     """Load and normalize the base training dataset.
@@ -258,14 +267,45 @@ def load_tokenizer(cfg: SPINConfig):
     """
     tok_name = cfg.tokenizer_name_or_path or cfg.model_name_or_path
     logger.info(f"Loading tokenizer from: {tok_name}")
-    tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=cfg.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tok_name, trust_remote_code=cfg.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         logger.info("  pad_token was None — set to eos_token.")
     tokenizer.truncation_side = cfg.truncation_side
     tokenizer.padding_side = "left"
-    logger.info(f"  Tokenizer ready: vocab_size={tokenizer.vocab_size}, truncation_side={cfg.truncation_side}")
+    logger.info(
+        f"  Tokenizer ready: vocab_size={tokenizer.vocab_size}, truncation_side={cfg.truncation_side}")
     return tokenizer
+
+
+def maybe_compile_model(model, cfg: SPINConfig, label: str = "model"):
+    """Wrap model with torch.compile() using the settings from cfg.
+
+    Falls back gracefully when torch.compile is unavailable (PyTorch < 2.0) or
+    when compilation fails, so the caller always gets a usable model back.
+    """
+    if not hasattr(torch, "compile"):
+        logger.warning(
+            "torch.compile not available (requires PyTorch >= 2.0). Skipping.")
+        return model
+    logger.info(
+        f"Compiling {label} with backend={cfg.compile_backend!r}, "
+        f"mode={cfg.compile_mode!r}, fullgraph={cfg.compile_fullgraph}"
+    )
+    try:
+        model = torch.compile(
+            model,
+            backend=cfg.compile_backend,
+            mode=cfg.compile_mode,
+            fullgraph=cfg.compile_fullgraph,
+        )
+        logger.info(f"  {label} compiled successfully.")
+    except Exception as e:
+        logger.warning(
+            f"  torch.compile failed for {label} ({e}); falling back to eager mode.")
+    return model
+
 
 def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
     """Load a causal language model from a local or Hub path.
@@ -276,7 +316,8 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
     to apply LoRA or enable full fine-tuning.  Gradient checkpointing is enabled
     here when requested so use_cache is disabled before any weights move to CUDA.
     """
-    logger.info(f"Loading causal LM from: {model_path} (trainable={trainable}, dtype={cfg.torch_dtype})")
+    logger.info(
+        f"Loading causal LM from: {model_path} (trainable={trainable}, dtype={cfg.torch_dtype})")
     kwargs = dict(
         trust_remote_code=cfg.trust_remote_code,
         dtype=str2dtype(cfg.torch_dtype),
@@ -299,6 +340,8 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
         for p in model.parameters():
             p.requires_grad = False
         logger.info("  Model frozen (eval mode, no grad).")
+        if cfg.compile_ref_model:
+            model = maybe_compile_model(model, cfg, label="ref_model")
     else:
         if cfg.log_trainable_parameters:
             _log_trainable_parameters(model)
@@ -316,6 +359,7 @@ def build_prompt_text(prompt: str, tokenizer, cfg: SPINConfig) -> str:
     """Return the formatted prompt string (chat template applied, no response appended)."""
     return maybe_apply_chat_template(tokenizer, prompt, cfg)
 
+
 def build_full_text(prompt: str, response: str, tokenizer, cfg: SPINConfig) -> str:
     """Concatenate the formatted prompt and response into one string for tokenization.
 
@@ -326,6 +370,7 @@ def build_full_text(prompt: str, response: str, tokenizer, cfg: SPINConfig) -> s
     if cfg.add_eos_to_response and tokenizer.eos_token and not txt.endswith(tokenizer.eos_token):
         txt += tokenizer.eos_token
     return txt
+
 
 def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINConfig) -> Dict[str, Any]:
     """Tokenize a prompt+response pair and produce supervised-learning labels.
@@ -367,6 +412,7 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
         "labels": labels,
     }
 
+
 def pad_to_max_len(seqs: List[List[int]], pad_value: int) -> torch.Tensor:
     """Right-pad a list of token-id lists to the length of the longest sequence.
 
@@ -388,9 +434,11 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
     shift_labels = labels[:, 1:].contiguous()
     log_probs = F.log_softmax(shift_logits, dim=-1)
     safe_labels = shift_labels.masked_fill(shift_labels == -100, 0)
-    token_logps = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    token_logps = torch.gather(
+        log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
     token_logps = token_logps * (shift_labels != -100)
     return token_logps.sum(dim=-1)
+
 
 def model_sequence_logprob(model, input_ids, attention_mask, labels):
     """Run a forward pass and return sequence log-probs via sequence_logprob_from_logits.
@@ -398,8 +446,10 @@ def model_sequence_logprob(model, input_ids, attention_mask, labels):
     use_cache=False prevents KV-cache allocation during log-prob scoring, which
     is unnecessary (no generation) and wastes GPU memory.
     """
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    outputs = model(input_ids=input_ids,
+                    attention_mask=attention_mask, use_cache=False)
     return sequence_logprob_from_logits(outputs.logits, labels)
+
 
 @torch.no_grad()
 def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], cfg: SPINConfig) -> List[Dict[str, str]]:
@@ -418,12 +468,15 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
     model.eval()
     out_rows = []
     bs = cfg.generation_batch_size
-    logger.info("generate_synthetic_responses ============================ 1 ==================================")
+    logger.info(
+        f"Starting synthetic generation: {len(rows)} rows, batch_size={bs}.")
 
     for start in range(0, len(rows), bs):
         chunk = rows[start:start + bs]
-        prompts = [build_prompt_text(r["prompt"], tokenizer, cfg) for r in chunk]
-        logger.info("generate_synthetic_responses ============================ 2 ================================== with start" + str(start))
+        prompts = [build_prompt_text(
+            r["prompt"], tokenizer, cfg) for r in chunk]
+        logger.info(
+            f"Batch {start // bs + 1}: processing examples {start}–{start + len(chunk) - 1} ({len(chunk)} prompts).")
 
         enc = tokenizer(
             prompts,
@@ -433,7 +486,8 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
             max_length=cfg.max_prompt_length,
         )
         enc = {k: v.to(model.device) for k, v in enc.items()}
-        logger.info("generate_synthetic_responses ============================ 3 ==================================")
+        logger.info(
+            f"Prompts tokenized and moved to {model.device}. Running model.generate (max_new_tokens={cfg.generation_max_new_tokens}).")
 
         outputs = model.generate(
             **enc,
@@ -448,18 +502,21 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        logger.info("generate_synthetic_responses ============================ 4 ==================================")
+        logger.info(
+            f"model.generate done. Decoding {len(outputs)} sequences (slicing off prompt tokens).")
 
         input_lengths = enc["attention_mask"].sum(dim=1).tolist()
         for i, seq in enumerate(outputs):
             gen_ids = seq[input_lengths[i]:]
-            synthetic = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            synthetic = tokenizer.decode(
+                gen_ids, skip_special_tokens=True).strip()
             out_rows.append({
                 "prompt": chunk[i]["prompt"],
                 "response": chunk[i]["response"],
                 "synthetic_response": synthetic,
             })
-        logger.info("generate_synthetic_responses ============================ 4 ==================================")
+        logger.info(
+            f"Batch decoded and appended. Running total: {len(out_rows)} rows.")
 
     return out_rows
 
@@ -479,6 +536,7 @@ def get_iteration_lambda(cfg: SPINConfig, iteration: int) -> float:
         return cfg.lambda_final_iteration
     return cfg.lambda_initial
 
+
 def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
     """Return the learning rate for a given SPIN iteration.
 
@@ -490,6 +548,7 @@ def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
     if iteration >= cfg.late_lr_start_iteration:
         return cfg.learning_rate_late
     return cfg.learning_rate
+
 
 def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: float) -> TrainingArguments:
     """Construct a HuggingFace TrainingArguments from SPINConfig for one iteration.
@@ -513,26 +572,37 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
         save_total_limit=cfg.save_total_limit,
         bf16=cfg.bf16,
         fp16=cfg.fp16,
-        logging_dir=os.path.join(iteration_dir, "tb_logs"),   
-        logging_strategy="steps",                            
+        logging_dir=os.path.join(iteration_dir, "tb_logs"),
+        logging_strategy="steps",
         report_to=[] if cfg.report_to == "none" else [cfg.report_to],
         remove_unused_columns=cfg.remove_unused_columns,
         dataloader_num_workers=cfg.dataloader_num_workers,
+        dataloader_pin_memory=cfg.dataloader_pin_memory,
         gradient_checkpointing=cfg.gradient_checkpointing,
         max_grad_norm=cfg.max_grad_norm,
         deepspeed=cfg.deepspeed,
     )
+
 
 def save_json(path: str, obj: Any):
     """Serialise obj to a pretty-printed UTF-8 JSON file."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+
 def save_jsonl(path: str, rows: List[Dict[str, Any]]):
     """Write a list of dicts to a UTF-8 JSONL file, one JSON object per line."""
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def atomic_save_jsonl(path: str, rows: List[Dict[str, Any]]):
+    """Write to a .tmp file then atomically rename so a kill mid-write never leaves a corrupt cache."""
+    tmp = path + ".tmp"
+    save_jsonl(tmp, rows)
+    os.replace(tmp, path)
+
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
     """Read a JSONL file and return its records as a list of dicts. Skips blank lines."""
@@ -544,12 +614,14 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
                 rows.append(json.loads(line))
     return rows
 
+
 def _log_trainable_parameters(model):
     """Log the trainable vs total parameter count and the trainable percentage."""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     pct = 100.0 * trainable / total if total else 0.0
-    logger.info(f"Trainable parameters: {trainable:,} / {total:,} ({pct:.2f}%)")
+    logger.info(
+        f"Trainable parameters: {trainable:,} / {total:,} ({pct:.2f}%)")
 
 
 def make_trainable(model, cfg: SPINConfig):
@@ -591,6 +663,8 @@ def make_trainable(model, cfg: SPINConfig):
         model.config.use_cache = cfg.generation_use_cache
     if cfg.log_trainable_parameters:
         _log_trainable_parameters(model)
+    if cfg.compile_model:
+        model = maybe_compile_model(model, cfg, label="train_model")
     return model
 
 
@@ -600,9 +674,17 @@ def merge_lora_and_get_base(model, cfg: SPINConfig):
     Called before save_pretrained so the checkpoint written to disk is a plain
     AutoModelForCausalLM with no PEFT dependency.  The next SPIN iteration then
     loads it with load_causal_lm() exactly like any other checkpoint.
+
+    Handles the case where the model was wrapped by torch.compile: the compiled
+    wrapper stores the original module at ._orig_mod, which is unwrapped first so
+    PeftModel.merge_and_unload() can operate on the underlying PEFT model.
     """
     if not cfg.use_lora:
         return model
+    # Unwrap torch.compile() wrapper so PeftModel isinstance check succeeds.
+    if hasattr(model, "_orig_mod"):
+        logger.info("Unwrapping torch.compile wrapper before LoRA merge.")
+        model = model._orig_mod
     try:
         if isinstance(model, PeftModel):
             model = model.merge_and_unload()
@@ -638,27 +720,52 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
     compute the SPIN margin loss without a second reference-model forward pass
     during training, saving both memory and time.
 
+    Processes rows in batches of cfg.ref_logprob_batch_size for GPU efficiency.
+    Sequences within a batch are right-padded to the batch maximum length;
+    padding positions carry label -100 so they are masked out of the log-prob sum.
+
     Returns a list of dicts with keys: ref_chosen_logp, ref_rejected_logp.
     """
-    logger.info(f"Computing reference log-probs for {len(rows)} rows...")
+    bs = cfg.ref_logprob_batch_size
+    pad_id = tokenizer.pad_token_id
+    logger.info(
+        f"Computing reference log-probs for {len(rows)} rows (batch_size={bs})...")
     model.eval()
     ref_logprobs = []
-    for row in rows:
-        chosen = tokenize_prompt_response(tokenizer, row["prompt"], row["response"], cfg)
-        rejected = tokenize_prompt_response(tokenizer, row["prompt"], row["synthetic_response"], cfg)
 
-        chosen_ids = torch.tensor([chosen["input_ids"]], dtype=torch.long).to(model.device)
-        chosen_mask = torch.tensor([chosen["attention_mask"]], dtype=torch.long).to(model.device)
-        chosen_labels = torch.tensor([chosen["labels"]], dtype=torch.long).to(model.device)
+    for start in range(0, len(rows), bs):
+        chunk = rows[start:start + bs]
 
-        rejected_ids = torch.tensor([rejected["input_ids"]], dtype=torch.long).to(model.device)
-        rejected_mask = torch.tensor([rejected["attention_mask"]], dtype=torch.long).to(model.device)
-        rejected_labels = torch.tensor([rejected["labels"]], dtype=torch.long).to(model.device)
+        chosen_tok = [tokenize_prompt_response(
+            tokenizer, r["prompt"], r["response"],           cfg) for r in chunk]
+        rejected_tok = [tokenize_prompt_response(
+            tokenizer, r["prompt"], r["synthetic_response"], cfg) for r in chunk]
 
-        ref_logprobs.append({
-            "ref_chosen_logp": model_sequence_logprob(model, chosen_ids, chosen_mask, chosen_labels).item(),
-            "ref_rejected_logp": model_sequence_logprob(model, rejected_ids, rejected_mask, rejected_labels).item(),
-        })
+        chosen_ids = pad_to_max_len(
+            [x["input_ids"] for x in chosen_tok],   pad_id).to(model.device)
+        chosen_mask = pad_to_max_len(
+            [x["attention_mask"] for x in chosen_tok],   0).to(model.device)
+        chosen_labels = pad_to_max_len(
+            [x["labels"] for x in chosen_tok],   -100).to(model.device)
+
+        rejected_ids = pad_to_max_len(
+            [x["input_ids"] for x in rejected_tok], pad_id).to(model.device)
+        rejected_mask = pad_to_max_len(
+            [x["attention_mask"] for x in rejected_tok], 0).to(model.device)
+        rejected_labels = pad_to_max_len(
+            [x["labels"] for x in rejected_tok], -100).to(model.device)
+
+        chosen_logps = model_sequence_logprob(
+            model, chosen_ids,   chosen_mask,   chosen_labels)
+        rejected_logps = model_sequence_logprob(
+            model, rejected_ids, rejected_mask, rejected_labels)
+
+        for c_lp, r_lp in zip(chosen_logps.tolist(), rejected_logps.tolist()):
+            ref_logprobs.append(
+                {"ref_chosen_logp": c_lp, "ref_rejected_logp": r_lp})
+
+        logger.info(
+            f"  ref_logprob: {min(start + bs, len(rows))}/{len(rows)} rows scored.")
+
     logger.info(f"Reference log-probs computed for {len(ref_logprobs)} rows.")
     return ref_logprobs
-

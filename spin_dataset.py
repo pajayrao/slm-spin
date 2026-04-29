@@ -31,6 +31,9 @@ class SPINDataset(Dataset):
             "rejected_input_ids": rejected["input_ids"],
             "rejected_attention_mask": rejected["attention_mask"],
             "rejected_labels": rejected["labels"],
+            # Used by Trainer's LengthGroupedSampler (group_by_length=True) to sort
+            # batches by sequence length, minimising padding waste.
+            "length": max(len(chosen["input_ids"]), len(rejected["input_ids"])),
         }
         if self.ref_logprobs is not None:
             item["ref_chosen_logp"] = self.ref_logprobs[idx]["ref_chosen_logp"]

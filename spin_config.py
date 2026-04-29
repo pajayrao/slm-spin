@@ -34,10 +34,10 @@ class SPINConfig:
     torch_dtype: str = "bfloat16"
 
     # Attention kernel implementation.
-    # None              — default PyTorch eager attention (compatible with all hardware).
+    # None                — default PyTorch eager attention (compatible with all hardware).
     # "flash_attention_2" — requires flash-attn package + Ampere+ GPU; 2-4x faster, uses less memory.
-    # "sdpa"            — PyTorch scaled_dot_product_attention (good default on modern GPUs).
-    attn_implementation: Optional[str] = None
+    # "sdpa"              — PyTorch scaled_dot_product_attention; free on PyTorch 2.0+, good default.
+    attn_implementation: Optional[str] = "sdpa"
 
     # ── Data ─────────────────────────────────────────────────────────────────
 
@@ -90,13 +90,13 @@ class SPINConfig:
     # Longer prompts are truncated from the left (see truncation_side).
     # Reducing this is the fastest way to lower GPU memory: activation memory ∝ seq_len².
     # Recommended range: 128–1024. For an 8 GB GPU, keep ≤ 512.
-    max_prompt_length: int = 512
+    max_prompt_length: int = 256
 
     # Hard cap on total tokens (prompt + response) fed into the model during training.
     # Sequences longer than this are truncated. Activation memory scales as O(seq_len²)
     # for standard attention and O(seq_len) for Flash Attention.
     # Recommended range for 8 GB GPU: 512–1024.
-    max_length: int = 1024
+    max_length: int = 512
 
     # Which end of an overlong sequence to truncate.
     # "left"  — drops tokens from the beginning of the prompt (preserves the question tail).
@@ -146,6 +146,12 @@ class SPINConfig:
     # True = faster generation (recommended). False = lower peak memory during generation.
     generation_use_cache: bool = True
 
+    # Number of rows scored in a single forward pass during compute_ref_logprobs().
+    # The old default was 1 (row-by-row); batching gives roughly batch_size × speedup.
+    # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
+    # Range: 8–256. Start at 32 and double until you hit memory limits.
+    ref_logprob_batch_size: int = 64
+
     # ── SPIN training loop ───────────────────────────────────────────────────
 
     # Total number of SPIN outer iterations. Each iteration:
@@ -168,11 +174,10 @@ class SPINConfig:
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
     max_data_load: int = 250000
 
-
     # How many prompts (rows) to generate synthetic responses for each iteration.
     # 0 = use the entire dataset. Reduce to limit GPU time spent on generation.
     # Range: 0 (all) or any positive integer ≤ dataset size.
-    synthetic_examples_per_iteration: int = 2048
+    synthetic_examples_per_iteration: int = 16384
 
     # If True, synthetic rows from all previous iterations are included in the current
     # training set (growing curriculum). If False, only the current iteration's synthetic
@@ -202,7 +207,6 @@ class SPINConfig:
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
     loss_type: str = "logistic"
 
-
     # ── Training hyperparameters ─────────────────────────────────────────────
 
     # Root directory where all run outputs are written (config snapshot, logs, checkpoints).
@@ -213,7 +217,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 16
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -233,7 +237,7 @@ class SPINConfig:
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
-    late_lr_start_iteration: int = 2
+    late_lr_start_iteration: int = 20
 
     # L2 regularisation coefficient applied to weight matrices (not biases or layer norms).
     # 0.0 is standard for supervised fine-tuning. Small values (1e-4) can help generalisation.
@@ -243,7 +247,7 @@ class SPINConfig:
     # Number of linear LR warmup steps at the beginning of each iteration.
     # Prevents large gradient updates when the optimizer states are cold.
     # Range: 0–100. Typical: 10–50.
-    warmup_steps: int = 10
+    warmup_steps: int = 0
 
     # Learning rate scheduler shape after warmup.
     # "cosine"  — smooth decay to 0; best for fine-tuning.
@@ -298,6 +302,18 @@ class SPINConfig:
     # Range: 0–8. Use 0 on Windows; 2–4 on Linux.
     dataloader_num_workers: int = 2
 
+    # Pin DataLoader output tensors into page-locked (pinned) CPU memory before
+    # transferring to the GPU. Enables async DMA so the CPU→GPU transfer overlaps
+    # with compute. Almost always a win when training on GPU; set False only if
+    # you are CPU-memory constrained (pinned memory cannot be swapped to disk).
+    dataloader_pin_memory: bool = True
+
+    # Sort training examples by sequence length so batches contain similarly-sized
+    # sequences. Minimises padding waste from ~50% average padding to ~5–10%.
+    # Uses HuggingFace Trainer's built-in LengthGroupedSampler; requires the
+    # dataset to expose a "length" field (added automatically by SPINDataset).
+    group_by_length: bool = True
+
     # Must remain False. The HuggingFace Trainer strips columns not in the model's forward()
     # signature when True; our custom keys (ref_chosen_logp, ref_rejected_logp) would be dropped.
     remove_unused_columns: bool = False
@@ -315,6 +331,36 @@ class SPINConfig:
     # None = DeepSpeed disabled. ZeRO-2/3 can enable training models larger than GPU memory
     # by offloading optimizer states (ZeRO-2) or parameters (ZeRO-3) to CPU RAM.
     deepspeed: Optional[str] = None
+
+    # ── torch.compile ────────────────────────────────────────────────────────
+
+    # Apply torch.compile() to the trainable model before each iteration's training.
+    # Requires PyTorch >= 2.0. Typically yields 10–30% throughput gains on Ampere+ GPUs
+    # via kernel fusion and graph optimisation. Disable if you see compilation errors
+    # (common with certain LoRA target module combinations or older triton versions).
+    compile_model: bool = False
+
+    # Backend passed to torch.compile().
+    # "inductor"   — default; best GPU throughput via Triton kernel fusion (requires triton pkg).
+    # "aot_eager"  — AOT Autograd with eager execution; no Triton needed; useful for debugging.
+    # "eager"      — disables actual compilation; effectively a no-op useful for A/B testing.
+    compile_backend: str = "inductor"
+
+    # Trade-off between compile latency and runtime speed.
+    # "default"         — balanced; good for most use cases.
+    # "reduce-overhead" — minimises Python/CUDA kernel launch overhead; best for small batches.
+    # "max-autotune"    — exhaustive Triton kernel search; very long compile, highest throughput.
+    compile_mode: str = "default"
+
+    # Require the entire forward graph to compile without breaks (fullgraph=True).
+    # More performant when it succeeds, but raises if the model contains graph-break ops.
+    # Try False first; switch to True only after confirming your model compiles cleanly.
+    compile_fullgraph: bool = False
+
+    # Also compile the frozen reference model used for log-prob scoring and synthetic generation.
+    # Beneficial when compute_ref_logprobs or generation is a per-iteration bottleneck.
+    # Note: torch.compile + model.generate() requires PyTorch >= 2.1.
+    compile_ref_model: bool = False
 
     # ── LoRA / PEFT ──────────────────────────────────────────────────────────
 
@@ -351,7 +397,6 @@ class SPINConfig:
     # Master random seed passed to set_seed(); controls weight initialisation, data shuffling,
     # and sampling. Change to run with different randomness while keeping everything else fixed.
     seed: int = 42
-
 
     # If True, save each iteration's synthetic prompt/response pairs to a .jsonl file.
     # Useful for inspecting generation quality and for resuming without re-generating.

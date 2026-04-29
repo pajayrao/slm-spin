@@ -6,6 +6,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainerCallback
 from spin_config import SPINConfig
+from torch.utils.tensorboard.summary import hparams as _tb_hparams
 
 from utils import *
 import pynvml
@@ -440,17 +441,14 @@ class TensorBoardCallbackExtended(TrainerCallback):
         # add_hparams() internally creates a second SummaryWriter at the same log_dir,
         # producing a conflicting event file that makes the TABLE / PARALLEL COORDINATES /
         # SCATTER PLOT views show empty data in TensorBoard's HParams plugin.
-        try:
-            from torch.utils.tensorboard.summary import hparams as _tb_hparams
-            exp, ssi, sei = _tb_hparams(hparam_dict, hparam_metrics)
-            fw = self.writer.file_writer
-            fw.add_summary(exp)
-            fw.add_summary(ssi)
-            fw.add_summary(sei)
-            for k, v in hparam_metrics.items():
-                self.writer.add_scalar(k, v, global_step=state.global_step)
-        except Exception as e:
-            logger.warning(f"add_hparams failed: {e}")
+        exp, ssi, sei = _tb_hparams(hparam_dict, hparam_metrics)
+        fw = self.writer.file_writer
+        fw.add_summary(exp)
+        fw.add_summary(ssi)
+        fw.add_summary(sei)
+        for k, v in hparam_metrics.items():
+            self.writer.add_scalar(k, v, global_step=state.global_step)
+
 
         self.writer.flush()
         self.writer.close()
