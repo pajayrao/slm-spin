@@ -196,7 +196,9 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self._epoch_gaps.append(gap)
             self._final_logp_gap = gap
 
-        loss   = logs.get("loss") or logs.get("train_loss")
+        loss = logs.get("loss")
+        if loss is None:
+            loss = logs.get("train_loss")
         margin = logs.get("margin_mean")
         wr     = logs.get("win_rate")
         kl     = logs.get("kl_from_ref")
@@ -239,9 +241,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
             self.writer.add_scalar("system/cpu_rss_mb", psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2, step)
 
-
         # ── GPU utilization % ────────────────────────────────────────────────
-        # Try pynvml first (more accurate); fall back to torch.cuda.utilization()
         gpu_util = None
         if self._nvml_handle is not None:
             gpu_util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle).gpu
@@ -254,18 +254,16 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self.writer.add_scalar("system/gpu_util_pct", gpu_util, step)
 
         # ── Global gradient norm ─────────────────────────────────────────────
-        grad_sq_sum = sum(
-            p.grad.detach().float().norm().item() ** 2
-            for p in model.parameters()
-            if p.grad is not None
-        )
-        self.writer.add_scalar("train/grad_global_norm", grad_sq_sum ** 0.5, step)
+        # Compute in one fused operation with a single GPU sync instead of one .item() per parameter.
+        grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+        if grads:
+            grad_sq_sum = torch.stack([g.float().norm().pow(2) for g in grads]).sum().item()
+            self.writer.add_scalar("train/grad_global_norm", grad_sq_sum ** 0.5, step)
 
         # ── Per-parameter stats (throttled to parameter_log_interval) ────────
         # HuggingFace Trainer increments global_step before calling on_step_end,
         # so step starts at 1; check step == 1 to fire on the very first optimizer step.
         if not self._should_log_params(step):
-            self.writer.flush()
             return
 
         total_weight_sq = 0.0
@@ -436,46 +434,24 @@ class TensorBoardCallbackExtended(TrainerCallback):
         if not hparam_metrics:
             hparam_metrics["hparam/final_loss"] = float("inf")
 
-        # Write hparam experiment/session summaries directly into the existing
-        # file_writer instead of calling self.writer.add_hparams().
-        # add_hparams() internally creates a second SummaryWriter at the same log_dir,
-        # producing a conflicting event file that makes the TABLE / PARALLEL COORDINATES /
-        # SCATTER PLOT views show empty data in TensorBoard's HParams plugin.
+        # Write hparam session events and metric scalars together into a dedicated
+        # subdirectory. TensorBoard's HParams plugin identifies a session by the
+        # directory of its SSI event, then looks for metric scalars in that same
+        # directory — so both must live in the same place.
+        hparam_dir = os.path.join(self.writer.log_dir, "hparams")
+        os.makedirs(hparam_dir, exist_ok=True)
         exp, ssi, sei = _tb_hparams(hparam_dict, hparam_metrics)
-        fw = self.writer.file_writer
-        fw.add_summary(exp)
-        fw.add_summary(ssi)
-        fw.add_summary(sei)
-        for k, v in hparam_metrics.items():
-            self.writer.add_scalar(k, v, global_step=state.global_step)
+        with SummaryWriter(log_dir=hparam_dir) as hw:
+            hw.file_writer.add_summary(exp)
+            hw.file_writer.add_summary(ssi)
+            hw.file_writer.add_summary(sei)
+            for k, v in hparam_metrics.items():
+                hw.add_scalar(k, v, global_step=0)
 
 
         self.writer.flush()
         self.writer.close()
 
-    # def _log_model_graph(self, model):
-    #     """Write the architecture graph to the per-iteration GRAPHS tab.
-
-    #     Uses a traceable graph module built from model.config to avoid trace
-    #     failures from flash-attn / SDPA backends and HuggingFace control flow.
-    #     The authoritative copy (written to tb_global) comes from
-    #     SPINIterationSummaryCallback._write_graph_to_global on iteration 0.
-    #     """
-    #     if not self.cfg.log_model_graph or model is None:
-    #         return
-    #     try:
-    #         from trainer_callback.spin_iteration_summary_callback import SPINIterationSummaryCallback
-    #         graph_model = SPINIterationSummaryCallback._build_causal_lm_graph(model)
-    #         graph_model.eval()
-    #         dummy_ids  = torch.zeros(1, 8, dtype=torch.long)
-    #         dummy_mask = torch.ones(1, 8, dtype=torch.long)
-    #         with torch.no_grad():
-    #             self.writer.add_graph(graph_model, (dummy_ids, dummy_mask), use_strict_trace=True)
-    #         self.writer.flush()
-    #         logger.info("[GRAPHS] Architecture graph written to per-iteration TensorBoard run.")
-    #     except Exception as e:
-    #         logger.error(f"[GRAPHS] Graph trace failed in per-iteration writer: "
-    #                      f"{type(e).__name__}: {e}")
 
     def _log_token_embeddings(self, model, step: int, tag: str):
         """Extract and log the token embedding matrix (PROJECTOR tab)."""

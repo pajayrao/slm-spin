@@ -58,6 +58,8 @@ class SPINIterationSummaryCallback(TrainerCallback):
         """
         os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir)
+        logger.info(f"SPINIterationSummaryCallback: global TensorBoard writer opened at {log_dir}. "
+                    f"Tracks cross-iteration trends (loss, margin, win_rate, weight drift).")
         self.cfg = cfg
         self.spin_iteration: int = 0
 
@@ -91,6 +93,9 @@ class SPINIterationSummaryCallback(TrainerCallback):
         self._kl_vals.clear()
         self._final_lr = 0.0
         self._iter_start_params.clear()
+        logger.info(f"SPINIterationSummaryCallback.set_iteration(): iteration={iteration}, "
+                    f"spin_lambda={spin_lambda}, dataset_size={dataset_size}. "
+                    f"Accumulators cleared — ready to record metrics for this iteration.")
 
     # ── Architecture graph ─────────────────────────────────────────────────────
 
@@ -160,7 +165,7 @@ class SPINIterationSummaryCallback(TrainerCallback):
 
     def _write_graph_to_global(self, model):
         """Trace the architecture graph and write it to the global tb_global writer."""
-        if self.cfg is None or not getattr(self.cfg, 'log_model_graph', False):
+        if not self.cfg.log_model_graph:
             return
         try:
             graph_model = self._build_causal_lm_graph(model)
@@ -179,17 +184,20 @@ class SPINIterationSummaryCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         """Snapshot iteration-start weights for drift tracking; write the architecture graph on iter 0."""
         if model is None:
+            logger.warning("SPINIterationSummaryCallback.on_train_begin: model is None — skipping weight snapshot.")
             return
-        # Snapshot weights at the start of this SPIN iteration for drift calculation
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self._iter_start_params[name] = param.detach().float().cpu().clone()
 
-        # On iteration 0, also record the base model weights for cumulative drift,
-        # and write the model architecture graph to the global (tb_global) writer so
-        # it appears in the most prominent TensorBoard run.
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        for name, param in trainable:
+            self._iter_start_params[name] = param.detach().float().cpu().clone()
+        logger.info(f"SPINIterationSummaryCallback.on_train_begin: "
+                    f"snapshotted {len(self._iter_start_params)} trainable param tensors "
+                    f"at iteration {self.spin_iteration} start (for drift tracking).")
+
         if self.spin_iteration == 0 and not self.base_model_params:
             self.base_model_params = {k: v.clone() for k, v in self._iter_start_params.items()}
+            logger.info("  Base model weight snapshot captured at iteration 0 "
+                        "(used for cumulative drift from the original checkpoint).")
             self._write_graph_to_global(model)
 
         # Log a text card showing which SPIN iteration is starting
@@ -224,6 +232,15 @@ class SPINIterationSummaryCallback(TrainerCallback):
         all iterations appear on the same time axis in TensorBoard.
         """
         i = self.spin_iteration
+        final_loss   = self._losses[-1]   if self._losses   else float("nan")
+        final_margin = self._margins[-1]  if self._margins  else float("nan")
+        final_wr     = self._win_rates[-1] if self._win_rates else float("nan")
+        logger.info(f"SPINIterationSummaryCallback.on_train_end: writing cross-iteration summary "
+                    f"for iteration {i} (global TB step={i}).")
+        logger.info(f"  Accumulated steps logged: losses={len(self._losses)}, "
+                    f"margins={len(self._margins)}, win_rates={len(self._win_rates)}.")
+        logger.info(f"  Final metrics — loss={final_loss:.4f}, margin={final_margin:.4f}, "
+                    f"win_rate={final_wr:.3f}.")
 
         # ── Loss ────────────────────────────────────────────────────────────
         if self._losses:
@@ -323,8 +340,11 @@ class SPINIterationSummaryCallback(TrainerCallback):
         self.writer.add_text("spin_iterations/summary", "\n".join(summary_lines), i)
 
         self.writer.flush()
+        logger.info(f"SPINIterationSummaryCallback.on_train_end: iteration {i} summary flushed to TensorBoard.")
 
     def close(self):
         """Call after the outer SPIN loop ends."""
+        logger.info("SPINIterationSummaryCallback.close(): flushing and closing global TensorBoard writer.")
         self.writer.flush()
         self.writer.close()
+        logger.info("Global TensorBoard writer closed.")

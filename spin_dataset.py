@@ -9,14 +9,35 @@ logger = logging.getLogger(__name__)
 
 class SPINDataset(Dataset):
     def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig, ref_logprobs=None):
-        # Pre-tokenize all rows upfront so workers don't need the tokenizer or raw text
+        logger.info(f"SPINDataset.__init__() — pre-tokenizing {len(rows)} rows "
+                    f"(max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length})...")
         self.chosen = []
         self.rejected = []
-        for row in rows:
-            self.chosen.append(tokenize_prompt_response(tokenizer, row["prompt"], row["response"], cfg))
-            self.rejected.append(tokenize_prompt_response(tokenizer, row["prompt"], row["synthetic_response"], cfg))
-        # ref_logprobs: list of dicts or None
+        chosen_lens = []
+        rejected_lens = []
+
+        for i, row in enumerate(rows):
+            c = tokenize_prompt_response(tokenizer, row["prompt"], row["response"], cfg)
+            r = tokenize_prompt_response(tokenizer, row["prompt"], row["synthetic_response"], cfg)
+            self.chosen.append(c)
+            self.rejected.append(r)
+            chosen_lens.append(len(c["input_ids"]))
+            rejected_lens.append(len(r["input_ids"]))
+
+            if (i + 1) % 2000 == 0:
+                logger.info(f"  Tokenised {i + 1}/{len(rows)} rows...")
+
         self.ref_logprobs = ref_logprobs
+
+        avg_c = sum(chosen_lens) / len(chosen_lens) if chosen_lens else 0
+        avg_r = sum(rejected_lens) / len(rejected_lens) if rejected_lens else 0
+        max_c = max(chosen_lens) if chosen_lens else 0
+        max_r = max(rejected_lens) if rejected_lens else 0
+        logger.info(f"SPINDataset ready: {len(self.chosen)} examples.")
+        logger.info(f"  Chosen  seq lengths — avg={avg_c:.1f}, max={max_c} tokens.")
+        logger.info(f"  Rejected seq lengths — avg={avg_r:.1f}, max={max_r} tokens.")
+        logger.info(f"  ref_logprobs attached: {ref_logprobs is not None} "
+                    f"({'required for SPIN loss' if ref_logprobs is not None else 'absent — logprobs must come from batch'}).")
 
     def __len__(self):
         return len(self.chosen)
@@ -31,8 +52,7 @@ class SPINDataset(Dataset):
             "rejected_input_ids": rejected["input_ids"],
             "rejected_attention_mask": rejected["attention_mask"],
             "rejected_labels": rejected["labels"],
-            # Used by Trainer's LengthGroupedSampler (group_by_length=True) to sort
-            # batches by sequence length, minimising padding waste.
+            # Used by Trainer's LengthGroupedSampler to sort batches by length, minimising padding.
             "length": max(len(chosen["input_ids"]), len(rejected["input_ids"])),
         }
         if self.ref_logprobs is not None:

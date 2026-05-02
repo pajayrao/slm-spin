@@ -9,6 +9,7 @@ from dataclasses import asdict
 import logging
 import random
 import gc
+import shutil
 import torch
 import os
 
@@ -16,7 +17,11 @@ import os
 # expandable_segments: reduces fragmentation when many tensors of varying sizes
 # are allocated/freed rapidly (typical during forward+backward of variable-length sequences).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Debug env variables
 # os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+# os.environ.setdefault("TORCHDYNAMO_VERBOSE", "1")
+# os.environ.setdefault("TORCH_LOGS", "+dynamo")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -29,18 +34,34 @@ logger = logging.getLogger(__name__)
 # ── Setup ────────────────────────────────────────────────────────────────────
 
 def setup(cfg):
+    logger.info("=== setup() — creating output directories and saving config ===")
+    logger.info(f"  output_dir:          {cfg.output_dir}")
+    logger.info(f"  synthetic_cache_dir: {cfg.synthetic_cache_dir}")
+    logger.info(f"  checkpoints_dir:     {cfg.checkpoints_dir}")
+    logger.info(f"  tensorboard_dir:     {cfg.tensorboard_dir}")
     ensure_dir(cfg.output_dir)
     ensure_dir(cfg.synthetic_cache_dir)
     ensure_dir(cfg.checkpoints_dir)
+    ensure_dir(cfg.tensorboard_dir)
     if cfg.enable_profiler:
+        logger.info(f"  Profiler enabled — profile_dir: {cfg.profile_dir}")
         ensure_dir(cfg.profile_dir)
-    save_json(os.path.join(cfg.output_dir, "config.json"), asdict(cfg))
+    config_path = os.path.join(cfg.output_dir, "config.json")
+    save_json(config_path, asdict(cfg))
+    logger.info(f"  Config snapshot written to: {config_path}")
     set_seed(cfg.seed)
-    logger.info("Config parsed, seed set, output directories ready.")
+    logger.info(f"  Random seed set to {cfg.seed} (affects weight init, data shuffling, sampling).")
+    logger.info("setup() complete — directories created, config saved, seed fixed.")
 
 
 def load_tokenizer_and_data(cfg):
+    logger.info("=== load_tokenizer_and_data() — loading tokenizer and base dataset ===")
     tokenizer = load_tokenizer(cfg)
+    logger.info(f"  Tokenizer loaded. vocab_size={tokenizer.vocab_size}, pad_token='{tokenizer.pad_token}'")
+
+    data_source = cfg.data_path if cfg.data_path else f"{cfg.dataset_name} / split={cfg.train_split}"
+    logger.info(f"  Loading base dataset from: {data_source}")
+    logger.info(f"  max_data_load cap: {cfg.max_data_load if cfg.max_data_load > 0 else 'unlimited'}")
     base_ds = load_base_dataset_fixed(
         dataset_name=cfg.dataset_name if cfg.dataset_name else None,
         dataset_config_name=cfg.dataset_config_name if cfg.dataset_config_name else None,
@@ -50,7 +71,11 @@ def load_tokenizer_and_data(cfg):
     )
     base_rows = [base_ds[i] for i in range(len(base_ds))]
     logger.info(
-        f"Loaded full dataset: {len(base_rows)} rows (sampled per-iteration).")
+        f"  Base dataset materialised into {len(base_rows)} rows (Python list). "
+        f"Each row has keys: {list(base_rows[0].keys()) if base_rows else 'N/A'}.")
+    logger.info(
+        f"load_tokenizer_and_data() complete — {len(base_rows)} training prompts available "
+        f"(each iteration samples up to {cfg.synthetic_examples_per_iteration} of these).")
     return tokenizer, base_rows
 
 
@@ -67,6 +92,21 @@ def restore_accumulated_rows(cfg, start_iteration):
                 logger.info(f"  Restored {len(prev_rows)} rows from iter_{prev_iter}.jsonl "
                             f"(accumulated total: {len(accumulated_rows)}).")
     return accumulated_rows
+
+
+# ── Checkpoint cleanup ────────────────────────────────────────────────────────
+
+def _cleanup_trainer_checkpoints(iter_dir: str):
+    """Delete HF Trainer checkpoint-N subdirs after the merged model is fully saved.
+
+    The merged model is written directly into iter_dir by trainer.save_model();
+    the checkpoint-N subdirs are only needed for mid-training resume and can be
+    removed once the .done sentinel confirms the iteration completed cleanly.
+    """
+    for entry in os.scandir(iter_dir):
+        if entry.is_dir() and entry.name.startswith("checkpoint-"):
+            shutil.rmtree(entry.path)
+            logger.info(f"Removed intermediate trainer checkpoint: {entry.path}")
 
 
 # ── Per-iteration data helpers ────────────────────────────────────────────────
@@ -140,21 +180,28 @@ def get_or_compute_ref_logprobs(prev_model, tokenizer, train_rows, cfg, iteratio
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def build_callbacks(cfg, iter_dir, iteration, summary_cb, tokenizer):
+def build_callbacks(cfg, iteration, summary_cb, tokenizer):
+    logger.info(f"=== build_callbacks() — assembling trainer callbacks for iteration {iteration} ===")
     callbacks = (
         [TorchProfilerCallback(
             cfg, spin_iteration=iteration, tb_writer=summary_cb.writer)]
         if cfg.enable_profiler else []
     )
+    if cfg.enable_profiler:
+        logger.info("  [+] TorchProfilerCallback — records operator-level GPU/CPU timelines.")
+
+    tb_log_dir = os.path.join(cfg.tensorboard_dir, f"iter_{iteration}")
     callbacks.append(
         TensorBoardCallbackExtended(
-            log_dir=os.path.join(iter_dir, "tb_logs"),
+            log_dir=tb_log_dir,
             log_histograms=False,
             cfg=cfg,
             tokenizer=tokenizer,
             iteration=iteration,
         ),
     )
+    logger.info(f"  [+] TensorBoardCallbackExtended — per-step metrics → {tb_log_dir}")
+
     if cfg.log_trainable_parameters:
         callbacks.append(
             TensorBoardParameterStatsCallback(
@@ -162,38 +209,52 @@ def build_callbacks(cfg, iter_dir, iteration, summary_cb, tokenizer):
                 run_name=f"spin_iter_{iteration}",
             )
         )
-    # Pass the global writer so system/ memory metrics also appear in tb_global/
+        logger.info("  [+] TensorBoardParameterStatsCallback — per-parameter weight/gradient histograms.")
+
     callbacks.append(MemoryProbeCallback(writer=summary_cb.writer))
-    # summary_cb must be last: its on_train_end writes the cross-iteration summary
-    # after all other callbacks have finished their on_train_end
+    logger.info("  [+] MemoryProbeCallback — GPU/CPU memory logged to global TensorBoard writer.")
+
     callbacks.append(summary_cb)
+    logger.info("  [+] SPINIterationSummaryCallback — cross-iteration summary (last, so it fires after all others).")
+    logger.info(f"build_callbacks() complete — {len(callbacks)} callbacks registered.")
     return callbacks
 
 
 def run_training(train_model, train_rows, ref_logprobs, tokenizer, cfg, iter_dir, iteration, summary_cb):
     """Build dataset, initialize trainer, train, merge LoRA, save checkpoint. Returns saved model."""
-    # Pre-tokenizes all rows upfront; raw text no longer needed after this point.
+    logger.info(f"=== run_training() — SPIN iteration {iteration} ===")
+    logger.info(f"  Input: {len(train_rows)} training rows, ref_logprobs present={ref_logprobs is not None}")
+
+    logger.info("  Step 1/6: Pre-tokenizing all training rows into SPINDataset...")
     dataset = SPINDataset(train_rows, tokenizer, cfg,
                           ref_logprobs=ref_logprobs)
     n_train_rows = len(train_rows)
     del train_rows, ref_logprobs
     gc.collect()
+    logger.info(f"  SPINDataset created: {len(dataset)} (chosen, rejected) pairs tokenised. "
+                f"Raw text and ref_logprobs freed from memory.")
 
     collator = SPINDataCollator(tokenizer)
+    logger.info("  Step 2/6: Computing training hyperparameters for this iteration...")
     spin_lambda = get_iteration_lambda(cfg, iteration)
     lr = get_iteration_lr(cfg, iteration)
-    args = build_training_args(cfg, iter_dir, lr)
-    logger.info(f"Dataset pre-tokenized ({len(dataset)} examples). "
-                f"Training args built (lr={lr}, lambda={spin_lambda}).")
+    eff_batch = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
+    logger.info(f"  spin_lambda={spin_lambda}, lr={lr:.2e}, loss_type={cfg.loss_type}")
+    logger.info(f"  per_device_batch={cfg.per_device_train_batch_size}, "
+                f"grad_accum={cfg.gradient_accumulation_steps}, "
+                f"effective_batch={eff_batch}, epochs={cfg.num_epochs_per_iteration}")
+
+    args = build_training_args(cfg, iter_dir, lr, logging_dir=os.path.join(cfg.tensorboard_dir, f"iter_{iteration}"))
+    logger.info(f"  TrainingArguments built. output_dir={iter_dir}, optimizer={cfg.optimizer}")
 
     trainer_cls = RMSPropSPINTrainer if cfg.optimizer.lower() == "rmsprop" else SPINTrainer
-    summary_cb.set_iteration(
-        iteration, spin_lambda=spin_lambda, dataset_size=n_train_rows)
-    callbacks = build_callbacks(
-        cfg, iter_dir, iteration, summary_cb, tokenizer)
-    print(len(dataset), dataset)
-    logger.info("Callbacks registered. Initializing trainer.")
+    logger.info(f"  Trainer class selected: {trainer_cls.__name__} (optimizer='{cfg.optimizer}')")
 
+    logger.info("  Step 3/6: Setting up callbacks and registering iteration metadata...")
+    summary_cb.set_iteration(iteration, spin_lambda=spin_lambda, dataset_size=n_train_rows)
+    callbacks = build_callbacks(cfg, iteration, summary_cb, tokenizer)
+
+    logger.info("  Step 4/6: Initialising trainer and moving model to device...")
     log_memory("before_trainer_init")
     trainer = trainer_cls(
         model=train_model,
@@ -202,32 +263,29 @@ def run_training(train_model, train_rows, ref_logprobs, tokenizer, cfg, iter_dir
         args=args,
         train_dataset=dataset,
         data_collator=collator,
-        # tokenizer=tokenizer,
         callbacks=callbacks,
     )
     log_memory("after_trainer_init")
 
-    # Always resume from the latest HuggingFace checkpoint inside iter_dir if one exists.
-    # On the first run of an iteration iter_dir has no checkpoint subdirs, so this is None.
-    # On a restart after a kill mid-iteration, the trainer picks up where it left off.
     resume_ckpt = get_last_checkpoint(iter_dir)
     if resume_ckpt:
-        logger.info(f"Resuming mid-iteration from checkpoint: {resume_ckpt}")
-    logger.info("Starting training...")
+        logger.info(f"  Mid-iteration resume detected — continuing from checkpoint: {resume_ckpt}")
+    else:
+        logger.info(f"  No mid-iteration checkpoint found in {iter_dir} — starting fresh.")
 
+    logger.info("  Step 5/6: Starting trainer.train()...")
     log_memory("before_trainer_train")
     trainer.train(resume_from_checkpoint=resume_ckpt)
-    logger.info(
-        "Training complete. Merging LoRA adapters and saving model checkpoint.")
+    log_memory("after_trainer_train")
+    logger.info(f"  trainer.train() finished for iteration {iteration}.")
 
-    # If LoRA was used, merge adapters into the base weights before saving.
-    # This produces a plain AutoModelForCausalLM checkpoint with no PEFT
-    # dependency so the next iteration's load_causal_lm() just works.
+    logger.info("  Step 6/6: Merging LoRA adapters and saving full model checkpoint...")
     train_model = merge_lora_and_get_base(train_model, cfg)
-    # ensure trainer saves the unwrapped base model, not the PEFT wrapper
     trainer.model = train_model
     trainer.save_model(iter_dir)
-    logger.info(f"Model checkpoint saved to {iter_dir}.")
+    logger.info(f"  Model checkpoint saved to {iter_dir}. "
+                f"(LoRA merged={cfg.use_lora}, plain AutoModelForCausalLM on disk)")
+    logger.info(f"run_training() complete — iteration {iteration} model saved.")
     return train_model
 
 
@@ -235,41 +293,62 @@ def run_training(train_model, train_rows, ref_logprobs, tokenizer, cfg, iter_dir
 
 def run_iteration(prev_model, tokenizer, base_rows, accumulated_rows, cfg, iteration, iter_dir, summary_cb):
     """Run one complete SPIN iteration. Returns updated accumulated_rows."""
+    logger.info(f"=== run_iteration() — SPIN iteration {iteration} (5 phases) ===")
+
+    # ── Phase 1: Generate or load synthetic (rejected) responses ──────────────
+    logger.info(f"  Phase 1/5: Generating synthetic responses with frozen prev_model (π_prev)...")
     synthetic_rows, synth_cache_hit = get_or_generate_synthetic(
         prev_model, tokenizer, base_rows, cfg, iteration
     )
+    logger.info(f"  Phase 1 done — {len(synthetic_rows)} synthetic rows "
+                f"({'loaded from cache' if synth_cache_hit else 'freshly generated'}).")
 
+    # ── Phase 2: Assemble training data ───────────────────────────────────────
+    logger.info(f"  Phase 2/5: Assembling training dataset "
+                f"(accumulate_previous_synthetic={cfg.accumulate_previous_synthetic})...")
     if cfg.accumulate_previous_synthetic:
         accumulated_rows = synthetic_rows if iteration == 0 else accumulated_rows + synthetic_rows
         train_rows = accumulated_rows
+        logger.info(f"  Curriculum accumulation: {len(train_rows)} total rows "
+                    f"(prior accumulated={len(accumulated_rows) - len(synthetic_rows)}, "
+                    f"new={len(synthetic_rows)}).")
     else:
         train_rows = synthetic_rows
+        logger.info(f"  Fixed-size training set: {len(train_rows)} rows (current iteration only).")
     del synthetic_rows
-    logger.info(f"Training data assembled: {len(train_rows)} rows total "
-                f"(accumulate={cfg.accumulate_previous_synthetic}).")
 
-    # Score under frozen prev_model before converting it to the trainable π_θ.
+    # ── Phase 3: Score chosen+rejected under frozen prev_model ────────────────
+    logger.info(f"  Phase 3/5: Computing reference log-probs under frozen π_prev "
+                f"({len(train_rows)} rows to score)...")
     ref_logprobs = get_or_compute_ref_logprobs(
         prev_model, tokenizer, train_rows, cfg, iteration, synth_cache_hit
     )
+    logger.info(f"  Phase 3 done — {len(ref_logprobs)} ref log-prob pairs ready.")
+
+    # ── Phase 4: Convert prev_model → trainable π_θ and train ────────────────
+    logger.info(f"  Phase 4/5: Converting frozen π_prev → trainable π_θ (use_lora={cfg.use_lora})...")
     train_model = make_trainable(prev_model, cfg)
     del prev_model
+    logger.info("  prev_model reference released (memory eligible for GC).")
 
     train_model = run_training(
         train_model, train_rows, ref_logprobs, tokenizer, cfg, iter_dir, iteration, summary_cb
     )
 
+    # ── Phase 5: Save and clean up ────────────────────────────────────────────
+    logger.info(f"  Phase 5/5: Saving tokenizer and writing completion sentinel...")
     tokenizer.save_pretrained(iter_dir)
-    logger.info("Tokenizer saved. Writing .done sentinel.")
+    logger.info(f"  Tokenizer saved to {iter_dir}.")
 
-    # Write a sentinel so find_start_iteration() can skip this iteration on restart.
-    # Written AFTER both model and tokenizer are fully saved.
-    open(os.path.join(iter_dir, ".done"), "w").close()
-    logger.info(
-        f"Iteration {iteration} complete. Sentinel written to {iter_dir}/.done")
+    done_path = os.path.join(iter_dir, ".done")
+    open(done_path, "w").close()
+    logger.info(f"  .done sentinel written — iteration {iteration} will be skipped on any future restart.")
+
+    _cleanup_trainer_checkpoints(iter_dir)
 
     free_model(train_model)
-    logger.info("GPU memory freed. Ready for next iteration.")
+    logger.info("  GPU/CPU memory freed (model deleted, GC collected, CUDA cache cleared).")
+    logger.info(f"run_iteration() complete — iteration {iteration} finished successfully.")
 
     return accumulated_rows
 
@@ -277,7 +356,23 @@ def run_iteration(prev_model, tokenizer, base_rows, accumulated_rows, cfg, itera
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║              SPIN Training — main() starting                 ║")
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
+
     cfg = parse_args()
+    logger.info(f"Configuration parsed. Key settings:")
+    logger.info(f"  model:              {cfg.model_name_or_path}")
+    logger.info(f"  dataset:            {cfg.data_path or cfg.dataset_name} (split={cfg.train_split})")
+    logger.info(f"  num_iterations:     {cfg.num_iterations}")
+    logger.info(f"  epochs/iter:        {cfg.num_epochs_per_iteration}")
+    logger.info(f"  synthetic/iter:     {cfg.synthetic_examples_per_iteration}")
+    logger.info(f"  optimizer:          {cfg.optimizer}, lr={cfg.learning_rate:.2e}")
+    logger.info(f"  use_lora:           {cfg.use_lora} (r={cfg.lora_r}, α={cfg.lora_alpha})")
+    logger.info(f"  device:             {cfg.device}, dtype={cfg.torch_dtype}")
+    logger.info(f"  loss_type:          {cfg.loss_type}, lambda_initial={cfg.lambda_initial}")
+    logger.info(f"  compile_model:      {cfg.compile_model} ({cfg.compile_backend}, {cfg.compile_mode})")
+
     setup(cfg)
 
     tokenizer, base_rows = load_tokenizer_and_data(cfg)
@@ -286,38 +381,50 @@ def main():
     if start_iteration > 0:
         logger.info(f"Resuming: iterations 0–{start_iteration - 1} already complete. "
                     f"Starting at iteration {start_iteration}.")
+    else:
+        logger.info("Fresh run — starting from iteration 0.")
 
     accumulated_rows = restore_accumulated_rows(cfg, start_iteration)
+    logger.info(f"Accumulated rows from prior iterations: {len(accumulated_rows)}")
 
-    # Created once outside the loop so the x-axis spans all SPIN iterations.
-    # Writes to tb_global/ so it shows up as a separate run in TensorBoard,
-    # separate from the per-iteration tb_logs/ runs.
-    global_tb_dir = os.path.join(cfg.output_dir, "tb_global")
+    global_tb_dir = os.path.join(cfg.tensorboard_dir, "global")
     ensure_dir(global_tb_dir)
     summary_cb = SPINIterationSummaryCallback(log_dir=global_tb_dir, cfg=cfg)
-    logger.info("Global TensorBoard writer initialized. Starting SPIN loop.")
+    logger.info(f"Global TensorBoard writer initialised at: {global_tb_dir}")
+    logger.info(f"Starting SPIN loop: iterations {start_iteration} → {cfg.num_iterations - 1}.")
 
     for iteration in range(start_iteration, cfg.num_iterations):
-        logger.info(f"========== SPIN ITERATION {iteration} ==========")
+        remaining = cfg.num_iterations - iteration
+        logger.info(f"")
+        logger.info(f"╔══ SPIN ITERATION {iteration}/{cfg.num_iterations - 1} "
+                    f"({remaining} remaining) ══════════════════════════════╗")
         iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{iteration}")
         ensure_dir(iter_dir)
+        logger.info(f"  iter_dir: {iter_dir}")
 
         prev_model_path = (
             cfg.model_name_or_path if iteration == 0
             else os.path.join(cfg.checkpoints_dir, f"iter_{iteration - 1}")
         )
-        logger.info(f"prev_model_path: {prev_model_path}")
+        logger.info(f"  Loading π_prev (frozen reference model) from: {prev_model_path}")
+        log_memory(f"before_load_prev_model_iter{iteration}")
         prev_model = load_causal_lm(
             prev_model_path, cfg, trainable=False).to(cfg.device)
+        log_memory(f"after_load_prev_model_iter{iteration}")
 
         accumulated_rows = run_iteration(
             prev_model, tokenizer, base_rows, accumulated_rows,
             cfg, iteration, iter_dir, summary_cb,
         )
+        logger.info(f"╚══ SPIN ITERATION {iteration} COMPLETE ══════════════════════════════════╝")
 
     summary_cb.close()
-    logger.info(f"Done. Final model saved at: "
-                f"{os.path.join(cfg.checkpoints_dir, f'iter_{cfg.num_iterations - 1}')}")
+    final_model_path = os.path.join(cfg.checkpoints_dir, f"iter_{cfg.num_iterations - 1}")
+    logger.info("")
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║              SPIN Training — main() complete                 ║")
+    logger.info(f"║  Final model: {final_model_path}")
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
 
 
 if __name__ == "__main__":

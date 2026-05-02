@@ -4,6 +4,7 @@ import json
 import argparse
 import logging
 import glob
+import traceback
 from typing import List, Dict, Any
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
@@ -24,7 +25,7 @@ from spin_config import *
 
 logging_kwargs = {
     "format": '%(asctime)s %(levelname)-8s %(message)s',
-    "level": logging.INFO,
+    "level": logging.DEBUG,
     "datefmt": '%Y-%m-%d %H:%M:%S',
 }
 
@@ -41,11 +42,18 @@ def find_start_iteration(cfg) -> int:
     If neither file exists the iteration is treated as incomplete even if the dir
     was created by ensure_dir() before training started.
     """
+    logger.info("find_start_iteration() — scanning checkpoint dirs for the last completed iteration...")
     for i in range(cfg.num_iterations - 1, -1, -1):
         iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{i}")
-        if (os.path.exists(os.path.join(iter_dir, ".done")) or
-                os.path.exists(os.path.join(iter_dir, "tokenizer_config.json"))):
-            return i + 1  # everything up to i is done; resume at i+1
+        done_sentinel = os.path.join(iter_dir, ".done")
+        tok_cfg = os.path.join(iter_dir, "tokenizer_config.json")
+        if os.path.exists(done_sentinel):
+            logger.info(f"  iter_{i}: .done sentinel found → iterations 0–{i} complete, resuming at {i + 1}.")
+            return i + 1
+        if os.path.exists(tok_cfg):
+            logger.info(f"  iter_{i}: tokenizer_config.json found (legacy signal) → resuming at {i + 1}.")
+            return i + 1
+    logger.info("  No completed iterations found — starting from iteration 0 (fresh run).")
     return 0
 
 
@@ -159,20 +167,43 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
                                falling back to instruction_response otherwise.
     """
     if cfg.chat_template_mode == "plain":
+        logger.debug("maybe_apply_chat_template: mode=plain — prompt returned unchanged.")
         return user_prompt
+
     if cfg.chat_template_mode == "instruction_response":
-        return f"{cfg.instruction_prefix}{user_prompt}{cfg.response_prefix}"
+        result = f"{cfg.instruction_prefix}{user_prompt}{cfg.response_prefix}"
+        logger.debug(
+            f"maybe_apply_chat_template: mode=instruction_response — "
+            f"wrapped with prefix/suffix, output_len={len(result)} chars."
+        )
+        return result
+
     if cfg.chat_template_mode == "auto":
-        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        has_template = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
+        if has_template:
             try:
-                return tokenizer.apply_chat_template(
+                result = tokenizer.apply_chat_template(
                     [{"role": "user", "content": user_prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            except Exception:
+                logger.debug(
+                    f"maybe_apply_chat_template: mode=auto → used tokenizer.apply_chat_template, "
+                    f"output_len={len(result)} chars."
+                )
+                return result
+            except Exception as e:
+                logger.debug(
+                    f"maybe_apply_chat_template: apply_chat_template failed ({e}), "
+                    f"falling back to instruction_response format."
+                )
                 return f"{cfg.instruction_prefix}{user_prompt}{cfg.response_prefix}"
+        logger.debug(
+            "maybe_apply_chat_template: mode=auto — no chat_template on tokenizer, "
+            "falling back to instruction_response format."
+        )
         return f"{cfg.instruction_prefix}{user_prompt}{cfg.response_prefix}"
+
     raise ValueError(f"Unknown chat_template_mode: {cfg.chat_template_mode}")
 
 
@@ -222,7 +253,10 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
     Returns an HFDataset with columns {"prompt": str, "response": str}.
     Raises ValueError if no valid pairs are found after filtering.
     """
+    logger.info("load_base_dataset_fixed() — loading and normalising training dataset...")
     if data_path:
+        ext = data_path.rsplit(".", 1)[-1].lower()
+        logger.info(f"  Source: local file — {data_path} (format={ext})")
         if data_path.endswith(".jsonl") or data_path.endswith(".json"):
             ds = load_dataset("json", data_files=data_path, split="train")
         elif data_path.endswith(".parquet"):
@@ -230,7 +264,12 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
         else:
             raise ValueError(f"Unsupported file type: {data_path}")
     else:
+        logger.info(f"  Source: HuggingFace Hub — {dataset_name} "
+                    f"(config={dataset_config_name}, split={split})")
         ds = load_dataset(dataset_name, dataset_config_name, split=split)
+
+    logger.info(f"  Raw dataset loaded: {len(ds)} total records. "
+                f"Normalising to (prompt, response) pairs...")
 
     rows = []
     skipped = 0
@@ -242,15 +281,19 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
             continue
         rows.append(item)
         if limit is not None and len(rows) >= limit:
+            logger.info(f"  Reached limit of {limit} rows — stopping early.")
             break
 
-    logger.info(f"Loaded rows: {len(rows)}")
-    logger.info(f"Skipped rows: {skipped}")
+    logger.info(f"  Normalisation complete: {len(rows)} valid rows kept, {skipped} skipped "
+                f"(missing user→assistant turn or empty content).")
 
     if len(rows) == 0:
         raise ValueError("No valid prompt/response pairs found.")
 
-    return HFDataset.from_list(rows)
+    result = HFDataset.from_list(rows)
+    logger.info(f"load_base_dataset_fixed() complete — HFDataset with {len(result)} rows, "
+                f"columns={result.column_names}.")
+    return result
 
 
 # -----------------------------
@@ -296,6 +339,7 @@ def maybe_compile_model(model, cfg: SPINConfig, label: str = "model"):
     try:
         model = torch.compile(
             model,
+            dynamic=cfg.compile_dynamic,
             backend=cfg.compile_backend,
             mode=cfg.compile_mode,
             fullgraph=cfg.compile_fullgraph,
@@ -303,7 +347,9 @@ def maybe_compile_model(model, cfg: SPINConfig, label: str = "model"):
         logger.info(f"  {label} compiled successfully.")
     except Exception as e:
         logger.warning(
-            f"  torch.compile failed for {label} ({e}); falling back to eager mode.")
+            f"  torch.compile failed for {label} ({type(e).__name__}: {e}); falling back to eager mode.\n"
+            + traceback.format_exc()
+        )
     return model
 
 
@@ -400,11 +446,23 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
     )["input_ids"]
 
     if len(full_ids) < len(prompt_ids):
+        logger.debug(
+            f"tokenize_prompt_response: full_ids ({len(full_ids)}) shorter than prompt_ids "
+            f"({len(prompt_ids)}) — truncating prompt_ids to match (truncation_side={cfg.truncation_side})."
+        )
         prompt_ids = prompt_ids[:len(full_ids)]
 
     labels = full_ids.copy()
     for i in range(min(len(prompt_ids), len(labels))):
         labels[i] = -100
+
+    n_prompt_tokens   = min(len(prompt_ids), len(labels))
+    n_response_tokens = len(labels) - n_prompt_tokens
+    logger.debug(
+        f"tokenize_prompt_response: total={len(full_ids)} tokens "
+        f"(prompt={n_prompt_tokens} masked, response={n_response_tokens} active). "
+        f"Caps: max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length}."
+    )
 
     return {
         "input_ids": full_ids,
@@ -430,14 +488,37 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
     masks positions where labels == -100 (i.e. prompt tokens), and sums the
     remaining log-probs.  Returns a 1-D tensor of shape (batch,).
     """
+    batch, seq_len, vocab = logits.shape
+    logger.debug(
+        f"sequence_logprob_from_logits: input logits=({batch}, {seq_len}, {vocab}), "
+        f"labels=({batch}, {seq_len}) — shifting by 1 for autoregressive alignment."
+    )
+
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
     log_probs = F.log_softmax(shift_logits, dim=-1)
     safe_labels = shift_labels.masked_fill(shift_labels == -100, 0)
     token_logps = torch.gather(
         log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    token_logps = token_logps * (shift_labels != -100)
-    return token_logps.sum(dim=-1)
+
+    response_mask = (shift_labels != -100)
+    token_logps = token_logps * response_mask
+
+    # Per-sequence response-token count (non-masked positions = actual response tokens).
+    resp_lens = response_mask.sum(dim=-1)
+    seq_logps = token_logps.sum(dim=-1)
+
+    logger.debug(
+        f"  response token counts per sequence: min={resp_lens.min().item()}, "
+        f"max={resp_lens.max().item()}, mean={resp_lens.float().mean().item():.1f} "
+        f"(prompt positions masked with -100)."
+    )
+    logger.debug(
+        f"  sequence log-probs: mean={seq_logps.mean().item():.4f}, "
+        f"min={seq_logps.min().item():.4f}, max={seq_logps.max().item():.4f} "
+        f"(sum of per-token log-probs over response tokens only)."
+    )
+    return seq_logps
 
 
 def model_sequence_logprob(model, input_ids, attention_mask, labels):
@@ -446,9 +527,23 @@ def model_sequence_logprob(model, input_ids, attention_mask, labels):
     use_cache=False prevents KV-cache allocation during log-prob scoring, which
     is unnecessary (no generation) and wastes GPU memory.
     """
-    outputs = model(input_ids=input_ids,
-                    attention_mask=attention_mask, use_cache=False)
-    return sequence_logprob_from_logits(outputs.logits, labels)
+    batch, seq_len = input_ids.shape
+    logger.debug(
+        f"model_sequence_logprob: forward pass — "
+        f"input_ids=({batch}, {seq_len}), device={input_ids.device}, use_cache=False."
+    )
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    logger.debug(
+        f"  logits shape: {tuple(outputs.logits.shape)} "
+        f"(batch={batch}, seq={seq_len}, vocab={outputs.logits.shape[-1]})."
+    )
+    seq_logps = sequence_logprob_from_logits(outputs.logits, labels)
+    logger.debug(
+        f"  output sequence log-probs: shape={tuple(seq_logps.shape)}, "
+        f"mean={seq_logps.mean().item():.4f}, "
+        f"min={seq_logps.min().item():.4f}, max={seq_logps.max().item():.4f}."
+    )
+    return seq_logps
 
 
 @torch.no_grad()
@@ -532,9 +627,15 @@ def get_iteration_lambda(cfg: SPINConfig, iteration: int) -> float:
     returns cfg.lambda_final_iteration so a stronger regularisation can be applied
     on the final alignment pass without affecting earlier training dynamics.
     """
-    if cfg.final_iteration_lambda_only and cfg.lambda_final_iteration is not None and iteration == cfg.num_iterations - 1:
-        return cfg.lambda_final_iteration
-    return cfg.lambda_initial
+    is_final = (iteration == cfg.num_iterations - 1)
+    if cfg.final_iteration_lambda_only and cfg.lambda_final_iteration is not None and is_final:
+        lam = cfg.lambda_final_iteration
+        logger.info(f"get_iteration_lambda(iter={iteration}): final iteration — using lambda_final_iteration={lam} "
+                    f"(stronger alignment push on last pass).")
+    else:
+        lam = cfg.lambda_initial
+        logger.info(f"get_iteration_lambda(iter={iteration}): using lambda_initial={lam}.")
+    return lam
 
 
 def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
@@ -546,18 +647,39 @@ def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
     to alignment and smaller updates prevent overshooting.
     """
     if iteration >= cfg.late_lr_start_iteration:
-        return cfg.learning_rate_late
-    return cfg.learning_rate
+        lr = cfg.learning_rate_late
+        logger.info(f"get_iteration_lr(iter={iteration}): late phase — lr={lr:.2e} "
+                    f"(iteration >= late_lr_start_iteration={cfg.late_lr_start_iteration}).")
+    else:
+        lr = cfg.learning_rate
+        logger.info(f"get_iteration_lr(iter={iteration}): early phase — lr={lr:.2e} "
+                    f"({cfg.late_lr_start_iteration - iteration} iterations until late-phase switch).")
+    return lr
 
 
-def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: float) -> TrainingArguments:
+def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: float, logging_dir: str) -> TrainingArguments:
     """Construct a HuggingFace TrainingArguments from SPINConfig for one iteration.
 
     Per-iteration output_dir (iteration_dir) keeps every iteration's checkpoints
-    and TensorBoard logs isolated so they can be compared side-by-side.
+    isolated. logging_dir is passed explicitly so TB events land under the
+    consolidated tensorboard_dir rather than inside checkpoints/.
     report_to is set to [] when cfg.report_to == "none" to avoid HuggingFace
     trying to import optional logging integrations (wandb, mlflow, etc.).
     """
+    eff_batch = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
+    logger.info("build_training_args() — constructing HuggingFace TrainingArguments...")
+    logger.info(f"  output_dir:                  {iteration_dir}")
+    logger.info(f"  logging_dir (TensorBoard):   {logging_dir}")
+    logger.info(f"  num_train_epochs:            {cfg.num_epochs_per_iteration}")
+    logger.info(f"  per_device_train_batch_size: {cfg.per_device_train_batch_size}")
+    logger.info(f"  gradient_accumulation_steps: {cfg.gradient_accumulation_steps}  →  effective batch={eff_batch}")
+    logger.info(f"  learning_rate:               {learning_rate:.2e}")
+    logger.info(f"  lr_scheduler_type:           {cfg.lr_scheduler_type}  warmup_steps={cfg.warmup_steps}")
+    logger.info(f"  weight_decay:                {cfg.weight_decay}")
+    logger.info(f"  max_grad_norm:               {cfg.max_grad_norm}")
+    logger.info(f"  bf16={cfg.bf16}, fp16={cfg.fp16}, gradient_checkpointing={cfg.gradient_checkpointing}")
+    logger.info(f"  save_strategy={cfg.save_strategy}, save_total_limit={cfg.save_total_limit}")
+    logger.info(f"  report_to:                   {cfg.report_to}")
     return TrainingArguments(
         output_dir=iteration_dir,
         num_train_epochs=cfg.num_epochs_per_iteration,
@@ -572,7 +694,7 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
         save_total_limit=cfg.save_total_limit,
         bf16=cfg.bf16,
         fp16=cfg.fp16,
-        logging_dir=os.path.join(iteration_dir, "tb_logs"),
+        logging_dir=logging_dir,
         logging_strategy="steps",
         report_to=[] if cfg.report_to == "none" else [cfg.report_to],
         remove_unused_columns=cfg.remove_unused_columns,
@@ -631,9 +753,17 @@ def make_trainable(model, cfg: SPINConfig):
     parameters (a tiny fraction of the total) are made trainable.  This halves
     the memory needed for gradients and optimizer states compared to full fine-tuning.
     """
+    logger.info("make_trainable() — converting frozen π_prev into trainable π_θ...")
+
+    if hasattr(model, "_orig_mod"):
+        logger.info("  Unwrapping torch.compile OptimizedModule before PEFT/LoRA wrapping.")
+        model = model._orig_mod
+
     if cfg.use_lora:
-        # Base weights must be frozen before PEFT wraps them; PEFT then enables
-        # only the adapter parameters it inserts.
+        target_modules = cfg.lora_target_modules.split(",")
+        logger.info(f"  LoRA mode: freezing all base weights, adding adapters to: {target_modules}")
+        logger.info(f"  LoRA config: r={cfg.lora_r}, alpha={cfg.lora_alpha}, "
+                    f"dropout={cfg.lora_dropout}, scale={cfg.lora_alpha / cfg.lora_r:.2f}")
         for p in model.parameters():
             p.requires_grad = False
 
@@ -642,16 +772,17 @@ def make_trainable(model, cfg: SPINConfig):
             r=cfg.lora_r,
             lora_alpha=cfg.lora_alpha,
             lora_dropout=cfg.lora_dropout,
-            target_modules=cfg.lora_target_modules.split(","),
+            target_modules=target_modules,
             bias="none",
         )
         model = get_peft_model(model, lora_cfg)
+        logger.info("  PEFT model created — base weights frozen, LoRA adapter params trainable.")
 
-        # Required when using gradient checkpointing with PEFT so the first
-        # layer's input tensor tracks gradients even though it isn't a leaf.
         if cfg.gradient_checkpointing:
             model.enable_input_require_grads()
+            logger.info("  enable_input_require_grads() called (required for grad-ckpt + PEFT).")
     else:
+        logger.info("  Full fine-tuning mode: all parameters set to requires_grad=True.")
         for p in model.parameters():
             p.requires_grad = True
 
@@ -659,12 +790,20 @@ def make_trainable(model, cfg: SPINConfig):
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+        logger.info("  Gradient checkpointing enabled; use_cache=False.")
     else:
         model.config.use_cache = cfg.generation_use_cache
+
     if cfg.log_trainable_parameters:
         _log_trainable_parameters(model)
+
     if cfg.compile_model:
+        logger.info(f"  Compiling train_model with torch.compile "
+                    f"(backend={cfg.compile_backend}, mode={cfg.compile_mode}, "
+                    f"dynamic={cfg.compile_dynamic}, fullgraph={cfg.compile_fullgraph})...")
         model = maybe_compile_model(model, cfg, label="train_model")
+
+    logger.info("make_trainable() complete — model ready for SPINTrainer.")
     return model
 
 
@@ -685,12 +824,10 @@ def merge_lora_and_get_base(model, cfg: SPINConfig):
     if hasattr(model, "_orig_mod"):
         logger.info("Unwrapping torch.compile wrapper before LoRA merge.")
         model = model._orig_mod
-    try:
-        if isinstance(model, PeftModel):
-            model = model.merge_and_unload()
-            logger.info("LoRA adapters merged into base model weights.")
-    except ImportError:
-        logger.warning("peft not installed; skipping LoRA merge.")
+    if isinstance(model, PeftModel):
+        model = model.merge_and_unload()
+        logger.info("LoRA adapters merged into base model weights.")
+
     return model
 
 

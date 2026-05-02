@@ -32,19 +32,29 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         self.initial_params: dict = {}
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        log_dir = os.path.join(self.cfg.output_dir, "param_stats", self.run_name)
+        log_dir = os.path.join(self.cfg.tensorboard_dir, "param_stats", self.run_name)
         os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
+        logger.info(f"TensorBoardParameterStatsCallback: TensorBoard writer opened at {log_dir}.")
 
         if model is None:
+            logger.warning("TensorBoardParameterStatsCallback.on_train_begin: model is None — skipping baseline snapshot.")
             return
 
-        # Snapshot initial weights (step 0) and write baseline histograms/scalars
+        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        cap = self.cfg.parameter_log_max_tensors
+        logger.info(
+            f"  Snapshotting step-0 (baseline) weights for {min(len(trainable_names), cap)} "
+            f"of {len(trainable_names)} trainable tensors "
+            f"(histograms={self.cfg.log_parameter_histograms}, "
+            f"scalars={self.cfg.log_parameter_scalars})."
+        )
+
         logged = 0
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if logged >= self.cfg.parameter_log_max_tensors:
+            if logged >= cap:
                 break
 
             w = param.detach().float().cpu()
@@ -61,6 +71,7 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
             logged += 1
 
         self.writer.flush()
+        logger.info(f"  Baseline snapshot written for {logged} parameter tensors at step 0.")
 
     def _should_log(self, step: int) -> bool:
         # HuggingFace Trainer increments global_step before on_step_end fires,
@@ -73,6 +84,7 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         if not self._should_log(state.global_step):
             return
 
+        logger.info(f"TensorBoardParameterStatsCallback.on_step_end: logging parameter stats at step={state.global_step}.")
         logged = 0
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -108,11 +120,14 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
             logged += 1
 
         self.writer.flush()
+        logger.info(f"  Parameter stats flushed to TensorBoard for {logged} tensors at step={state.global_step}.")
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
         if self.writer is None:
             return
 
+        logger.info(f"TensorBoardParameterStatsCallback.on_train_end: writing final parameter snapshot "
+                    f"at step={state.global_step}.")
         # Log a final snapshot so every run has at least 2 histogram time steps
         # (step 0 from on_train_begin + final step here).  TensorBoard Distributions
         # requires ≥ 2 points to draw the percentile band chart; with only the
@@ -140,4 +155,5 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         self.writer.flush()
         self.writer.close()
         self.writer = None
+        logger.info("TensorBoardParameterStatsCallback: writer closed — parameter stats complete.")
 

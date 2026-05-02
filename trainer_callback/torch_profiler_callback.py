@@ -56,6 +56,15 @@ class TorchProfilerCallback(TrainerCallback):
         self.tb_writer = tb_writer
         self.prof = None
         self._run_dir: str = ""
+        logger.info(
+            f"TorchProfilerCallback initialised for SPIN iter={spin_iteration}. "
+            f"Schedule: wait={cfg.profile_schedule_wait}, warmup={cfg.profile_schedule_warmup}, "
+            f"active={cfg.profile_schedule_active}, repeat={cfg.profile_schedule_repeat}. "
+            f"Flags: cpu={cfg.profile_cpu}, cuda={cfg.profile_cuda}, "
+            f"memory={cfg.profile_memory}, stack={cfg.profile_with_stack}, "
+            f"flops={cfg.profile_with_flops}. "
+            f"Output: {cfg.profile_dir}/"
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

@@ -108,7 +108,7 @@ class SPINConfig:
     # Number of prompts decoded in a single GPU batch during synthetic generation.
     # Reduce if generation causes OOM (each beam holds its own KV cache).
     # Range: 1–64; for an 8 GB GPU with max_length=1024, start at 4.
-    generation_batch_size: int = 128
+    generation_batch_size: int = 256
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -149,8 +149,9 @@ class SPINConfig:
     # Number of rows scored in a single forward pass during compute_ref_logprobs().
     # The old default was 1 (row-by-row); batching gives roughly batch_size × speedup.
     # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
-    # Range: 8–256. Start at 32 and double until you hit memory limits.
-    ref_logprob_batch_size: int = 64
+    # logits tensor = batch × seq_len × vocab_size.
+    # even batch=8 allocates 8×512×256K×2B = 2 GB just for logits. For 8 GB GPUs, use 4–8.
+    ref_logprob_batch_size: int = 8
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -217,7 +218,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 8
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -253,7 +254,7 @@ class SPINConfig:
     # "cosine"  — smooth decay to 0; best for fine-tuning.
     # "linear"  — linear decay to 0.
     # "constant"— no decay; rarely used for fine-tuning.
-    lr_scheduler_type: str = "cosine"
+    lr_scheduler_type: str = "constant"
 
     # Optimizer algorithm.
     # "rmsprop" — 1 state tensor per parameter (running mean of squared gradients); lower GPU memory.
@@ -278,8 +279,9 @@ class SPINConfig:
     save_strategy: str = "epoch"
 
     # Maximum number of checkpoints to retain on disk. Older checkpoints are deleted automatically.
-    # Range: 1–10. Set to 1 to minimise disk usage.
-    save_total_limit: int = 2
+    # Set to 1 so only the latest mid-iteration HF Trainer checkpoint is kept; the merged
+    # model saved to iter_dir after training supersedes all of them.
+    save_total_limit: int = 1
 
     # Enable bfloat16 mixed-precision training. Halves GPU memory for activations and
     # intermediate tensors. Requires Ampere+ GPU (RTX 30xx, A100, H100).
@@ -300,19 +302,13 @@ class SPINConfig:
     # 0 — all data loading happens in the main process (required on Windows to avoid deadlocks).
     # >0 — parallel prefetching (faster on Linux); each worker forks the entire process.
     # Range: 0–8. Use 0 on Windows; 2–4 on Linux.
-    dataloader_num_workers: int = 2
+    dataloader_num_workers: int = 0
 
     # Pin DataLoader output tensors into page-locked (pinned) CPU memory before
     # transferring to the GPU. Enables async DMA so the CPU→GPU transfer overlaps
     # with compute. Almost always a win when training on GPU; set False only if
     # you are CPU-memory constrained (pinned memory cannot be swapped to disk).
     dataloader_pin_memory: bool = True
-
-    # Sort training examples by sequence length so batches contain similarly-sized
-    # sequences. Minimises padding waste from ~50% average padding to ~5–10%.
-    # Uses HuggingFace Trainer's built-in LengthGroupedSampler; requires the
-    # dataset to expose a "length" field (added automatically by SPINDataset).
-    group_by_length: bool = True
 
     # Must remain False. The HuggingFace Trainer strips columns not in the model's forward()
     # signature when True; our custom keys (ref_chosen_logp, ref_rejected_logp) would be dropped.
@@ -338,7 +334,7 @@ class SPINConfig:
     # Requires PyTorch >= 2.0. Typically yields 10–30% throughput gains on Ampere+ GPUs
     # via kernel fusion and graph optimisation. Disable if you see compilation errors
     # (common with certain LoRA target module combinations or older triton versions).
-    compile_model: bool = False
+    compile_model: bool = True
 
     # Backend passed to torch.compile().
     # "inductor"   — default; best GPU throughput via Triton kernel fusion (requires triton pkg).
@@ -347,19 +343,36 @@ class SPINConfig:
     compile_backend: str = "inductor"
 
     # Trade-off between compile latency and runtime speed.
-    # "default"         — balanced; good for most use cases.
-    # "reduce-overhead" — minimises Python/CUDA kernel launch overhead; best for small batches.
-    # "max-autotune"    — exhaustive Triton kernel search; very long compile, highest throughput.
-    compile_mode: str = "default"
+    # "default"                    — balanced; good for most use cases.
+    # "reduce-overhead"            — minimises Python/CUDA kernel launch overhead; best for small batches.
+    # "max-autotune"               — exhaustive Triton kernel search + CUDAGraphs; highest throughput for
+    #                                single-forward-per-step workloads (e.g. ref model scoring).
+    # "max-autotune-no-cudagraphs" — same kernel search but without CUDAGraph memory reuse. CUDAGraph
+    #                                capture requires a CPU-side C++ launcher compiled with OpenMP (omp.h),
+    #                                which is not available in this MSVC setup on Windows. Use this mode
+    #                                to get Triton kernel tuning without the C++ compilation step.
+    compile_mode: str = "max-autotune-no-cudagraphs"
+
+
+    # compile_dynamic (bool or None): Use dynamic shape tracing.  When this is True, we will up-front attempt
+    # to generate a kernel that is as dynamic as possible to avoid recompilations when
+    # sizes change.  This may not always work as some operations/optimizations will
+    # force specialization; use TORCH_LOGS=dynamic to debug overspecialization.
+    # When this is False, we will NEVER generate dynamic kernels, we will always specialize.
+    # By default (None), we automatically detect if dynamism has occurred and compile a more
+    # dynamic kernel upon recompile.
+    compile_dynamic: bool = True
+
 
     # Require the entire forward graph to compile without breaks (fullgraph=True).
     # More performant when it succeeds, but raises if the model contains graph-break ops.
     # Try False first; switch to True only after confirming your model compiles cleanly.
-    compile_fullgraph: bool = False
+    compile_fullgraph: bool = True
 
     # Also compile the frozen reference model used for log-prob scoring and synthetic generation.
-    # Beneficial when compute_ref_logprobs or generation is a per-iteration bottleneck.
-    # Note: torch.compile + model.generate() requires PyTorch >= 2.1.
+    # Disabled: model.generate() uses a Python while-loop that always causes a graph break,
+    # so compile_fullgraph=True fails silently (caught by maybe_compile_model's try/except)
+    # and falls back to eager — paying max-autotune search time for zero runtime benefit.
     compile_ref_model: bool = False
 
     # ── LoRA / PEFT ──────────────────────────────────────────────────────────
@@ -390,7 +403,10 @@ class SPINConfig:
     # The default covers all attention projections (q, k, v, o) and MLP projections
     # (gate, up, down) used in LLaMA-style architectures.
     # Adjust if using a model with differently named layers.
-    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    # Reduced to attention projections only (removed gate_proj,up_proj,down_proj).
+    # Attention LoRA is sufficient for alignment; skipping MLP projections reduces
+    # trainable params by ~43%, cutting backward compute and optimizer state accordingly.
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
 
     # ── Misc ─────────────────────────────────────────────────────────────────
 
@@ -410,6 +426,12 @@ class SPINConfig:
     # Structure: checkpoints_dir/iter_0/, checkpoints_dir/iter_1/, …
     checkpoints_dir: str = "./spin_outputs/checkpoints"
 
+    # Root directory for all TensorBoard event files.
+    # Subdirectories: global/, iter_N/, param_stats/spin_iter_N/, profile/
+    # Point the TensorBoard server at this single directory:
+    #   tensorboard --logdir ./spin_outputs/tensorboard
+    tensorboard_dir: str = "./spin_outputs/tensorboard"
+
     # When True, scan the current iteration's checkpoint directory for the latest checkpoint
     # and resume training from it. Useful for recovering from crashes mid-iteration.
     resume_from_checkpoint: bool = False
@@ -419,10 +441,10 @@ class SPINConfig:
     # Whether to run the PyTorch profiler. When enabled, records operator-level GPU/CPU
     # timelines and memory traces viewable in TensorBoard under the "Trace" and "Memory" tabs.
     # Disable in production runs to avoid the ~5% overhead.
-    enable_profiler: bool = True
+    enable_profiler: bool = False
 
     # Directory where profiler trace files (.pt.trace.json) are written.
-    profile_dir: str = "./spin_outputs/tb_profile"
+    profile_dir: str = "./spin_outputs/tensorboard/profile"
 
     # Number of steps to skip at the start before the profiler begins collecting.
     # The profiler needs (wait + warmup + active) steps before any trace is written.
@@ -488,16 +510,16 @@ class SPINConfig:
     # Log per-parameter weight value histograms to TensorBoard.
     # Useful for detecting dead neurons (weight values collapsing to zero) or
     # exploding weights (distribution spreading extremely wide). High storage cost.
-    log_parameter_histograms: bool = False
+    log_parameter_histograms: bool = True
 
     # Log per-parameter gradient histograms to TensorBoard.
     # Useful for diagnosing vanishing gradients (histogram near zero) or
     # exploding gradients (histogram spread over large values).
-    log_gradient_histograms: bool = False
+    log_gradient_histograms: bool = True
 
     # Log scalar statistics (mean, std, L2 norm) for each parameter tensor.
     # Much lower storage overhead than full histograms; a good default to leave on.
-    log_parameter_scalars: bool = False
+    log_parameter_scalars: bool = True
 
     # Log parameter statistics every N optimizer steps.
     # Higher values reduce TensorBoard file size and logging overhead.
@@ -511,7 +533,7 @@ class SPINConfig:
 
     # Log a summary of trainable vs total parameter counts when a model is prepared
     # for training. Disabled by default to keep logs quiet during normal runs.
-    log_trainable_parameters: bool = False
+    log_trainable_parameters: bool = True
 
     # ── TensorBoard visualization extras ─────────────────────────────────────
 
