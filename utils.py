@@ -25,7 +25,7 @@ from spin_config import *
 
 logging_kwargs = {
     "format": '%(asctime)s %(levelname)-8s %(message)s',
-    "level": logging.DEBUG,
+    "level": logging.INFO,
     "datefmt": '%Y-%m-%d %H:%M:%S',
 }
 

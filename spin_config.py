@@ -151,7 +151,7 @@ class SPINConfig:
     # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
     # logits tensor = batch × seq_len × vocab_size.
     # even batch=8 allocates 8×512×256K×2B = 2 GB just for logits. For 8 GB GPUs, use 4–8.
-    ref_logprob_batch_size: int = 8
+    ref_logprob_batch_size: int = 16
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -160,7 +160,7 @@ class SPINConfig:
     #   2. Trains a new model to prefer human responses over those synthetic ones.
     # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 100
+    num_iterations: int = 5
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
@@ -178,7 +178,7 @@ class SPINConfig:
     # How many prompts (rows) to generate synthetic responses for each iteration.
     # 0 = use the entire dataset. Reduce to limit GPU time spent on generation.
     # Range: 0 (all) or any positive integer ≤ dataset size.
-    synthetic_examples_per_iteration: int = 16384
+    synthetic_examples_per_iteration: int = 65536
 
     # If True, synthetic rows from all previous iterations are included in the current
     # training set (growing curriculum). If False, only the current iteration's synthetic
@@ -270,7 +270,7 @@ class SPINConfig:
     # Frequency (in optimizer steps) at which training metrics are written to the log.
     # Lower = more granular progress but slightly more I/O overhead.
     # Range: 1–500. Typical: 10–50.
-    logging_steps: int = 10
+    logging_steps: int = 50
 
     # When to save checkpoints.
     # "epoch" — save once per training epoch (default, safe).
