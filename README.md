@@ -102,88 +102,83 @@ Empirically, 3–5 iterations are sufficient for meaningful gains on 1B–7B mod
 
 ## How SPIN Works — Step by Step
 
-Each SPIN **iteration** performs five sequential phases:
+Each SPIN **iteration** processes the full training dataset in fixed-size chunks called
+**data batches** (controlled by `data_batch_size`). Within every data batch, three
+atomic steps run sequentially. Each step saves its output to disk before the next step
+begins, so a crash at any point resumes from the exact step boundary.
 
-### Phase 1 — Generate Synthetic Responses
+### The Inner Batch Loop
 
-The frozen `π_prev` model (loaded from the previous iteration's checkpoint, or the
-base model for iteration 0) runs inference on a sample of training prompts to produce
-**synthetic responses** — these become the *rejected* side of the training pairs.
+For each data batch `k` within iteration `i`:
+
+#### Step 1 — Generate Synthetic Responses
+
+The frozen `π_prev` model (the previous iteration's merged checkpoint, or the base
+model for iteration 0) runs inference on the `data_batch_size` prompts in this chunk
+to produce **synthetic responses** — these become the *rejected* side of the training
+pairs.
 
 Generation uses stochastic sampling (`do_sample=True`, temperature 0.9, top-p 0.95
-by default) to produce diverse completions rather than repetitive greedy outputs. The
-prompts are batched in chunks of `generation_batch_size` to bound GPU memory (each
-batch holds its own KV cache). Only the newly generated tokens are decoded by slicing
-off the prompt portion from the output sequence.
+by default). Prompts are sub-batched in chunks of `generation_batch_size` inside this
+step to bound GPU memory (each sub-batch holds its own KV cache).
 
-The resulting rows have three fields:
+**Output:** `synthetic/iter_{i}_batch_{k:06d}_synth.jsonl`
 ```json
 {"prompt": "...", "response": "...(human)...", "synthetic_response": "...(model)..."}
 ```
 
-These are cached atomically to `synthetic/iter_{N}.jsonl` so the generation step can
-be skipped on a restart without producing a different dataset.
+`π_prev` is moved to GPU for this step, then back to CPU to free GPU for training.
 
-### Phase 2 — Assemble the Training Set
+#### Step 2 — Score Chosen and Rejected Under `π_prev`
 
-With `accumulate_previous_synthetic=True` (the growing curriculum mode), synthetic
-rows from all prior iterations are appended to the current iteration's rows. This gives
-the model progressively more diverse negative examples — early iterations produce
-easy-to-distinguish synthetic outputs; later iterations produce harder ones, keeping
-training productive.
-
-With `accumulate_previous_synthetic=False`, only the current iteration's rows are used
-(fixed-size training set).
-
-### Phase 3 — Score Chosen and Rejected Under `π_prev`
-
-The frozen `π_prev` model computes **reference log-probabilities** for both the human
-response and the synthetic response for every training row:
+The same frozen `π_prev` computes **reference log-probabilities** for both sides:
 
 ```
 ref_chosen_logp   = log π_prev(y_human     | prompt)
 ref_rejected_logp = log π_prev(y_synthetic | prompt)
 ```
 
-These are the baseline probabilities that anchor the SPIN margin. Storing them up-front
-means the trainer never needs a second model in memory during the training loop — the
-reference values are pre-computed scalars attached to each batch element. The scoring
-is batched and cached to `iter_{N}_ref_logprobs.jsonl`.
+These scalars anchor the SPIN margin. Storing them per-batch means the trainer never
+needs a second model in memory during the training loop.
 
-### Phase 4 — Train `π_θ`
+**Output:** `synthetic/iter_{i}_batch_{k:06d}_logprobs.jsonl`
 
-The frozen `π_prev` is converted to a trainable `π_θ`:
+#### Step 3 — Train `π_θ` on This Batch
 
-- If `use_lora=True` (default), all base weights are frozen and small LoRA adapter
-  matrices are inserted into the attention projections. Only ~0.5–2% of parameters
-  are trainable, cutting gradient and optimizer-state memory by 10–100×.
-- If `use_lora=False`, all parameters are made trainable (full fine-tuning).
+With `π_prev` back on CPU, the trainable model `π_θ` is trained on just this batch's
+`data_batch_size` rows using the pre-computed logprobs:
 
-The `SPINTrainer` then trains for `num_epochs_per_iteration` epochs. Every training
-step computes the SPIN margin from two separate forward passes (chosen and rejected),
-applies the loss function, and backpropagates.
+- If `use_lora=True` (default), all base weights stay frozen and fresh LoRA adapter
+  matrices are applied. Only ~0.5–2% of parameters are trainable.
+- If `use_lora=False`, all parameters are updated (full fine-tuning).
 
-After training, LoRA adapters are merged back into the base weights so the saved
-checkpoint is a plain `AutoModelForCausalLM` with no PEFT dependency.
+The `SPINTrainer` runs `num_epochs_per_iteration` epochs on this batch. Every step
+computes the SPIN margin from two forward passes (chosen and rejected), applies the
+loss, and backpropagates.
 
-### Phase 5 — Save and Clean Up
+After training, LoRA adapters are **merged** into the base weights and the merged
+model is saved to disk. The next batch begins with fresh LoRA adapters on top of the
+improved base — the base model accumulates improvements batch by batch.
 
-- The tokenizer is saved alongside the model weights.
-- A `.done` sentinel file is written — this is the primary signal used by the resume
-  logic to detect completed iterations.
-- Intermediate HuggingFace `checkpoint-N/` directories are deleted; only the merged
-  model in `iter_{N}/` is retained.
-- The model is deleted and `torch.cuda.empty_cache()` is called to free GPU memory
-  before the next iteration loads a fresh checkpoint.
+**Output:** `checkpoints/iter_{i}/batch_{k:06d}/` + `.done` sentinel
+
+### Dataset Order
+
+The full dataset is iterated in **fixed index order** — no shuffling. This ensures
+every run (including resumes) processes identical data in an identical order.
+
+### Iteration Completion
+
+After all batches finish, the final batch's merged model is copied to `iter_{i}/`,
+the tokenizer is saved, and an iteration-level `.done` sentinel is written.
 
 ### Crash-Safe Resumption
 
-At startup the code scans checkpoint directories in reverse order for the `.done`
-sentinel. The first complete iteration determines where to restart. Within an iteration,
-`get_last_checkpoint()` detects partially-saved HuggingFace checkpoints and resumes
-training from the latest one. The deterministic seed (`cfg.seed + iteration`) ensures
-that the same rows are sampled for synthetic generation on a resume, so the dataset is
-byte-for-byte identical to what was used before the crash.
+At startup, `_find_start_batch()` scans batch checkpoints in order and returns the
+first batch where any of the three steps is incomplete. The model for that batch is
+loaded from the previous batch's checkpoint directory. Within a batch's training step,
+`get_last_checkpoint()` additionally detects a partially-saved HF Trainer checkpoint
+to resume mid-epoch if the process was killed during backpropagation.
 
 ---
 
@@ -237,21 +232,33 @@ trade-offs), RLHF or DPO with preference-labelled data is still superior.
    a separate argparse setup.
 2. **Setup** — Creates output directories and saves a `config.json` snapshot.
 3. **Load tokenizer and base dataset** — The dataset is fully materialised into a Python
-   list of `{prompt, response}` dicts once and reused across all iterations.
-4. **Detect resume point** — Scans `.done` sentinels and `tokenizer_config.json` files
-   (legacy signal) to skip already-complete iterations.
-5. **Restore accumulated rows** — When resuming, loads synthetic JSONL files from all
-   completed iterations to restore the training curriculum.
-6. **Run the iteration loop** — For each iteration: loads `π_prev` from disk as a frozen
-   non-trainable model, then runs one full iteration (all five phases).
-7. **Global TensorBoard** — An `SPINIterationSummaryCallback` writes cross-iteration
-   metrics to `tensorboard/global/`.
+   list of `{prompt, response}` dicts in **fixed index order** (no shuffling) and reused
+   across all iterations.
+4. **Detect resume point** — `find_start_iteration()` scans `.done` sentinels to skip
+   already-complete iterations; `_find_start_batch()` scans per-batch sentinels to skip
+   already-complete batches within the current iteration.
+5. **Run the iteration loop** — For each iteration: loads `π_prev` from disk to CPU as a
+   frozen reference model, then runs the inner batch loop (Steps 1–3 per batch).
+6. **Global TensorBoard** — A `SummaryWriter` at `tensorboard/global/` captures
+   cross-iteration memory and training signals.
 
-**Key design decision:** `π_prev` is always loaded from a checkpoint written by the
-*previous* iteration (or from `model_name_or_path` for iteration 0). This means each
-iteration starts from a clean, fully-merged model on disk — no in-memory state is
-shared between iterations. This simplifies memory management and makes crash recovery
-straightforward.
+**Key functions:**
+
+| Function | Role |
+|---|---|
+| `_find_start_batch(cfg, iteration, total_batches)` | Scans batch files in order; returns first k where synth, logprobs, or `.done` is missing |
+| `_init_train_model(prev_model, cfg, iteration, start_batch)` | Returns trainable model: wraps prev_model for batch 0, or loads merged checkpoint from batch k−1 for resume |
+| `_step_synth(prev_model, tokenizer, chunk, cfg, iteration, k)` | Step 1 — generates and saves synth; skips if file exists |
+| `_step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k)` | Step 2 — scores and saves logprobs; skips if file exists |
+| `_step_train(train_model, synth_rows, ref_lps, tokenizer, cfg, ...)` | Step 3 — trains, merges LoRA, saves model, writes `.done`; skips if `.done` exists |
+
+**Memory management within an iteration:**
+- `π_prev` lives on CPU throughout the iteration, moving to GPU only for Steps 1–2
+  of each batch, then back to CPU. This frees the GPU for the training step.
+- `train_model` stays in GPU memory between batches — no disk reload between batches
+  in the normal (non-resume) case.
+- After each batch's training, LoRA is merged into base weights, and `make_trainable()`
+  re-applies fresh adapters for the next batch.
 
 ### Configuration — [spin_config.py](spin_config.py)
 
@@ -697,7 +704,7 @@ python main.py \
   --dataset_name HuggingFaceH4/ultrachat_200k \
   --train_split train_sft \
   --num_iterations 3 \
-  --synthetic_examples_per_iteration 512 \
+  --data_batch_size 2048 \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 16 \
   --output_dir ./runs/my_run
@@ -749,9 +756,8 @@ All options live in [spin_config.py](spin_config.py). The most important ones:
 |------|---------|-------------|
 | `model_name_or_path` | `microsoft/harrier-oss-v1-270m` | HuggingFace Hub ID or local checkpoint path |
 | `dataset_name` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset (overridden by `data_path`) |
-| `num_iterations` | `100` | Number of SPIN outer loops |
-| `synthetic_examples_per_iteration` | `16384` | Prompts to generate per iteration; `0` = full dataset |
-| `accumulate_previous_synthetic` | `False` | Include synthetic data from prior iterations |
+| `num_iterations` | `5` | Number of SPIN outer loops |
+| `data_batch_size` | `16384` | Rows per checkpoint batch — each batch runs all 3 steps atomically; smaller = more frequent crash-recovery saves |
 | `lambda_initial` | `0.1` | SPIN loss scale λ for all but the last iteration |
 | `lambda_final_iteration` | `5.0` | λ for the final iteration (stronger alignment push) |
 | `loss_type` | `logistic` | `logistic` \| `hinge` \| `correlation` \| `exponential` |
@@ -759,13 +765,14 @@ All options live in [spin_config.py](spin_config.py). The most important ones:
 | `lora_r` | `16` | LoRA rank |
 | `optimizer` | `rmsprop` | `rmsprop` (less memory) \| `adamw` |
 | `per_device_train_batch_size` | `8` | Reduce to `1` on an 8 GB GPU |
-| `gradient_accumulation_steps` | `32` | Compensate for small batch size |
+| `gradient_accumulation_steps` | `32` | Compensate for small batch size. Must satisfy `data_batch_size ≥ per_device_train_batch_size × gradient_accumulation_steps` |
 | `learning_rate` | `5e-7` | Peak LR for early iterations |
 | `learning_rate_late` | `1e-7` | LR from `late_lr_start_iteration` onward |
 | `max_length` | `512` | Max tokens (prompt + response) during training |
 | `bf16` | `True` | bfloat16 mixed precision (Ampere+ GPU required) |
 | `gradient_checkpointing` | `False` | Recompute activations to save ~10× memory at ~33% compute cost |
 | `output_dir` | `./spin_outputs` | Root directory for all outputs |
+| `synthetic_examples_per_iteration` | *(ignored)* | Deprecated — the batched pipeline always iterates the full dataset |
 
 ### SPIN Loss
 
@@ -803,34 +810,46 @@ synthetic one. The `loss_type` maps this margin to a scalar:
 
 ```
 spin_outputs/
-├── config.json                      # Snapshot of SPINConfig used for this run
+├── config.json                           # Snapshot of SPINConfig for this run
 ├── synthetic/
-│   ├── iter_0.jsonl                 # Synthetic prompt/response pairs from iteration 0
-│   ├── iter_0_ref_logprobs.jsonl    # Pre-computed reference log-probs for iteration 0
-│   └── iter_1.jsonl
+│   ├── iter_0_batch_000000_synth.jsonl   # Step 1 output: synthetic responses for batch 0
+│   ├── iter_0_batch_000000_logprobs.jsonl# Step 2 output: ref log-probs for batch 0
+│   ├── iter_0_batch_000001_synth.jsonl
+│   ├── iter_0_batch_000001_logprobs.jsonl
+│   └── ...
 ├── checkpoints/
 │   ├── iter_0/
-│   │   ├── config.json              # Model config
-│   │   ├── model.safetensors        # Merged weights (LoRA adapters merged in)
+│   │   ├── batch_000000/                 # Step 3 output: merged model after batch 0
+│   │   │   ├── config.json
+│   │   │   ├── model.safetensors
+│   │   │   └── .done                     # Sentinel: all 3 steps done for this batch
+│   │   ├── batch_000001/
+│   │   │   └── ...
+│   │   ├── config.json                   # Final iteration model (copy of last batch)
+│   │   ├── model.safetensors
 │   │   ├── tokenizer_config.json
-│   │   └── .done                    # Sentinel written after full save
+│   │   └── .done                         # Iteration-level sentinel
 │   └── iter_1/
 │       └── ...
 ├── eval_results/
-│   ├── iter_0.parsed.json           # Per-task benchmark scores for this checkpoint
-│   ├── iter_1.parsed.json
-│   ├── comparative_summary.txt      # Human-readable TSV + narrative comparison
-│   └── comparative_summary.json     # Full results list (all iterations)
-└── tensorboard/                     # ALL TensorBoard data — point server here
-    ├── global/                      # Cross-iteration training metrics
-    ├── iter_0/                      # Per-iteration training metrics + HF Trainer logs
-    ├── iter_1/
+│   ├── iter_0.parsed.json
+│   ├── comparative_summary.txt
+│   └── comparative_summary.json
+└── tensorboard/
+    ├── global/                           # Memory + cross-iteration signals
+    ├── iter_0/
+    │   ├── batch_000000/                 # Per-batch TensorBoard logs
+    │   ├── batch_000001/
+    │   └── ...
     ├── param_stats/
-    │   └── spin_iter_0/             # Parameter statistics callback
-    ├── profile/                     # PyTorch profiler traces (if enabled)
-    │   └── run_iter_0_step_0/
-    └── eval_compare/                # Evaluation TensorBoard run
+    ├── profile/
+    └── eval_compare/
 ```
+
+**Disk usage note:** Each batch checkpoint in `checkpoints/iter_i/batch_k/` holds a
+full merged model. For a 270 M parameter model in bfloat16 this is ~540 MB per batch.
+With many small batches this can grow large. Delete old batch checkpoints after
+confirming the iteration completed (the iteration-level `.done` is the safe signal).
 
 The final model is at `checkpoints/iter_{num_iterations-1}/`.
 
@@ -838,12 +857,26 @@ The final model is at `checkpoints/iter_{num_iterations-1}/`.
 
 ## Resuming After a Crash
 
-No flags are needed. On restart, the script:
+No flags are needed. On restart, the script automatically resumes at the finest
+granularity possible:
 
-1. Scans `checkpoints_dir` for the last iteration that wrote a `.done` sentinel.
-2. Reloads cached synthetic JSONL files for completed iterations.
-3. Calls `get_last_checkpoint()` inside the current iteration directory to resume
-   mid-training if a HuggingFace checkpoint exists.
+**Iteration level** — `find_start_iteration()` scans `checkpoints/iter_*/`
+in reverse for an iteration-level `.done` sentinel. Completed iterations are skipped
+entirely.
+
+**Batch level** — within the current iteration, `_find_start_batch()` scans batches
+0 → N in order and returns the first batch where any step is incomplete. Each step
+is re-checked individually:
+
+| What's missing | Action |
+|---|---|
+| `_synth.jsonl` absent or empty | Re-run Step 1 (synthetic generation) |
+| `_logprobs.jsonl` absent or empty | Re-run Step 2 (logprob scoring) |
+| batch `.done` absent | Re-run Step 3 (training); within training, `get_last_checkpoint()` resumes from a partial HF Trainer checkpoint if one exists |
+
+Because each step writes its output atomically (write-to-temp → rename), a kill
+mid-write leaves the previous valid file intact — no corruption, no re-running
+earlier steps.
 
 ---
 
@@ -855,6 +888,9 @@ tensorboard --logdir ./spin_outputs/tensorboard
 
 The `global/` run plots metrics across all iterations on a single x-axis. Individual
 `iter_N/` runs show per-step detail for each iteration.
+
+The `global/` run plots memory metrics. Per-batch training metrics land under
+`iter_N/batch_K/` — each data batch gets its own TensorBoard sub-run.
 
 Available panels (depending on config flags):
 
