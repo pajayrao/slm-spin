@@ -29,6 +29,7 @@ Usage
   python evaluate.py --n-shots arc_challenge=10 gsm8k=3  # override shot counts
 """
 
+from torch.utils.tensorboard import SummaryWriter
 import argparse
 import logging
 import os
@@ -48,8 +49,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
-from torch.utils.tensorboard import SummaryWriter
 
 
 logging.basicConfig(
@@ -81,26 +80,27 @@ GSM8K_MAX_NEW_TOKENS: int = 256
 # Default CLI argument values
 # ---------------------------------------------------------------------------
 
-DEFAULT_BASE_DIR        = "./spin_outputs_1"
+DEFAULT_BASE_DIR = "./spin_outputs_1"
 DEFAULT_CHECKPOINTS_DIR = os.path.join(DEFAULT_BASE_DIR, "checkpoints")
-DEFAULT_OUTPUT_DIR      = os.path.join(DEFAULT_BASE_DIR, "eval_results")
-DEFAULT_TENSORBOARD_DIR = os.path.join(DEFAULT_BASE_DIR, "tensorboard/eval_compare")
-DEFAULT_DEVICE          = "cuda"
+DEFAULT_OUTPUT_DIR = os.path.join(DEFAULT_BASE_DIR, "eval_results")
+DEFAULT_TENSORBOARD_DIR = os.path.join(
+    DEFAULT_BASE_DIR, "tensorboard/eval_compare")
+DEFAULT_DEVICE = "cuda"
 
 # ---------------------------------------------------------------------------
 # TensorBoard tag strings
 # ---------------------------------------------------------------------------
 
-_TB_TAG_AVG              = "eval/average"
-_TB_TAG_BEST_AVG         = "eval/best_so_far_average"
-_TB_TAG_TASK_COUNT       = "eval/task_count"
-_TB_TAG_TASKS            = "eval/tasks"
-_TB_TAG_SCORECARD        = "eval/scorecard"
-_TB_TAG_BEST_ITER        = "eval/best_iteration"
-_TB_TAG_RUN_CONFIG       = "eval/run_config"
-_TB_TAG_DELTA_PREFIX     = "compare_vs_prev/"
-_TB_TAG_IMPROVED_COUNT   = "compare_vs_prev/improved_task_count"
-_TB_TAG_DECLINED_COUNT   = "compare_vs_prev/declined_task_count"
+_TB_TAG_AVG = "eval/average"
+_TB_TAG_BEST_AVG = "eval/best_so_far_average"
+_TB_TAG_TASK_COUNT = "eval/task_count"
+_TB_TAG_TASKS = "eval/tasks"
+_TB_TAG_SCORECARD = "eval/scorecard"
+_TB_TAG_BEST_ITER = "eval/best_iteration"
+_TB_TAG_RUN_CONFIG = "eval/run_config"
+_TB_TAG_DELTA_PREFIX = "compare_vs_prev/"
+_TB_TAG_IMPROVED_COUNT = "compare_vs_prev/improved_task_count"
+_TB_TAG_DECLINED_COUNT = "compare_vs_prev/declined_task_count"
 _TB_TAG_IMPROVEMENT_RATE = "compare_vs_prev/improvement_rate"
 
 # ---------------------------------------------------------------------------
@@ -134,8 +134,9 @@ TASKS: list[tuple[str, str, str, int, Optional[int]]] = [
 ]
 
 # Derived lookups — edit the TASKS list above; these stay in sync automatically.
-DEFAULT_SHOTS:  dict[str, int]           = {tid: shots for tid, _, _, shots, _   in TASKS}
-DATASET_LIMITS: dict[str, Optional[int]] = {tid: lim   for tid, _, _, _,     lim in TASKS}
+DEFAULT_SHOTS:  dict[str, int] = {tid: shots for tid, _, _, shots, _ in TASKS}
+DATASET_LIMITS: dict[str, Optional[int]] = {
+    tid: lim for tid, _, _, _,     lim in TASKS}
 
 # Quick lookup: is a given key a task label (vs "Average")?
 _TASK_LABELS: set[str] = {label for _, label, *_ in TASKS}
@@ -156,11 +157,11 @@ def resolve_task_filter(
     for task in tasks:
         task_id, label = task[0], task[1]
         lookup[task_id.lower()] = task
-        lookup[label.lower()]   = task
+        lookup[label.lower()] = task
 
     resolved: list[tuple] = []
-    unknown:  list[str]   = []
-    seen:     set[str]    = set()
+    unknown:  list[str] = []
+    seen:     set[str] = set()
     for name in names:
         key = name.lower()
         if key in lookup:
@@ -227,38 +228,45 @@ def find_model_path(iter_dir: Path) -> Path:
         if not p.is_dir():
             continue
         if any((p / m).exists() for m in _MODEL_CONFIG_MARKERS):
-            logger.info(f"  Found model root at candidate '{cand}': {p.resolve()}")
+            logger.info(
+                f"  Found model root at candidate '{cand}': {p.resolve()}")
             return p.resolve()
         if cand == "." and any((iter_dir / m).exists() for m in _MODEL_CONFIG_MARKERS):
-            logger.info(f"  Found model root at iteration directory itself: {iter_dir.resolve()}")
+            logger.info(
+                f"  Found model root at iteration directory itself: {iter_dir.resolve()}")
             return iter_dir.resolve()
 
     logger.info("  No candidate matched — falling back to recursive search.")
     for marker in _MODEL_CONFIG_MARKERS:
         found = list(iter_dir.rglob(marker))
         if found:
-            logger.info(f"  Recursive search found {marker} at: {found[0].parent.resolve()}")
+            logger.info(
+                f"  Recursive search found {marker} at: {found[0].parent.resolve()}")
             return found[0].parent.resolve()
 
-    logger.warning(f"  Could not locate a model config under {iter_dir}; will try iter_dir directly.")
+    logger.warning(
+        f"  Could not locate a model config under {iter_dir}; will try iter_dir directly.")
     return iter_dir.resolve()
 
 
 def load_model_and_tokenizer(model_path: str, device: str, attn_implementation: str = "sdpa"):
     """Load a causal LM and its tokenizer from a local checkpoint directory."""
     logger.info(f"Loading tokenizer from: {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=_TRUST_REMOTE_CODE)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=_TRUST_REMOTE_CODE)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         logger.info("  pad_token was None — set to eos_token.")
     tokenizer.padding_side = "left"  # required for correct batched generation
 
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    logger.info(f"Loading model: dtype={torch_dtype}, device={device}, attn={attn_implementation}")
+    logger.info(
+        f"Loading model: dtype={torch_dtype}, device={device}, attn={attn_implementation}")
     kwargs = dict(dtype=torch_dtype, trust_remote_code=_TRUST_REMOTE_CODE)
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
-    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, **kwargs).to(device)
     model.eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info(f"  Model loaded: {n_params:.0f}M parameters, eval mode.")
@@ -268,14 +276,16 @@ def load_model_and_tokenizer(model_path: str, device: str, attn_implementation: 
 def maybe_compile_model(model, backend: str = "inductor"):
     """Wrap model with torch.compile() for faster inference throughput."""
     if not hasattr(torch, "compile"):
-        logger.warning("torch.compile not available (requires PyTorch >= 2.0); skipping.")
+        logger.warning(
+            "torch.compile not available (requires PyTorch >= 2.0); skipping.")
         return model
     logger.info(f"Compiling model with backend={backend!r}...")
     try:
         model = torch.compile(model, backend=backend)
         logger.info("  Model compiled successfully.")
     except Exception as exc:
-        logger.warning(f"  torch.compile failed ({exc}); running in eager mode.")
+        logger.warning(
+            f"  torch.compile failed ({exc}); running in eager mode.")
     return model
 
 
@@ -303,8 +313,10 @@ def score_continuations_batched(
     seq_data: list[tuple[list[int], int, int]] = []
 
     for cont in continuations:
-        full_ids: list[int] = tokenizer(context + cont, add_special_tokens=True)["input_ids"]
-        cont_raw: list[int] = tokenizer(cont, add_special_tokens=False)["input_ids"]
+        full_ids: list[int] = tokenizer(
+            context + cont, add_special_tokens=True)["input_ids"]
+        cont_raw: list[int] = tokenizer(
+            cont, add_special_tokens=False)["input_ids"]
         cont_len = len(cont_raw)
         if cont_len == 0:
             seq_data.append(([], 0, 0))
@@ -331,8 +343,8 @@ def score_continuations_batched(
 
     input_ids_t = torch.tensor(padded_ids, dtype=torch.long, device=device)
     attn_mask_t = torch.tensor(attn_masks,  dtype=torch.long, device=device)
-    logits      = model(input_ids=input_ids_t, attention_mask=attn_mask_t).logits
-    log_probs   = F.log_softmax(logits, dim=-1)
+    logits = model(input_ids=input_ids_t, attention_mask=attn_mask_t).logits
+    log_probs = F.log_softmax(logits, dim=-1)
 
     scores: list[float] = []
     for i, (full_ids, _, cont_len) in enumerate(seq_data):
@@ -342,8 +354,9 @@ def score_continuations_batched(
         cs = adj_starts[i]
         actual_len = min(cont_len, max_len - cs)
         cont_tok_ids = input_ids_t[i, cs:cs + actual_len]
-        pred_lp      = log_probs[i, cs - 1:cs - 1 + actual_len]
-        scores.append(pred_lp[torch.arange(actual_len, device=device), cont_tok_ids].sum().item())
+        pred_lp = log_probs[i, cs - 1:cs - 1 + actual_len]
+        scores.append(pred_lp[torch.arange(
+            actual_len, device=device), cont_tok_ids].sum().item())
 
     return scores
 
@@ -369,8 +382,10 @@ def score_examples_batched(
     flat: list[tuple[list[int], int, int, int, int]] = []
     for ex_idx, (context, continuations) in enumerate(examples):
         for cont_idx, cont in enumerate(continuations):
-            full_ids: list[int] = tokenizer(context + cont, add_special_tokens=True)["input_ids"]
-            cont_len = len(tokenizer(cont, add_special_tokens=False)["input_ids"])
+            full_ids: list[int] = tokenizer(
+                context + cont, add_special_tokens=True)["input_ids"]
+            cont_len = len(
+                tokenizer(cont, add_special_tokens=False)["input_ids"])
             if cont_len == 0:
                 continue
             cont_start = len(full_ids) - cont_len
@@ -380,7 +395,7 @@ def score_examples_batched(
             flat.append((full_ids, cont_start, cont_len, ex_idx, cont_idx))
 
     for i in range(0, len(flat), rows_per_batch):
-        batch = flat[i : i + rows_per_batch]
+        batch = flat[i: i + rows_per_batch]
         max_len = max(len(r[0]) for r in batch)
 
         padded, masks, adj_cs = [], [], []
@@ -390,7 +405,7 @@ def score_examples_batched(
             masks.append([0] * pl + [1] * len(full_ids))
             adj_cs.append(cont_start + pl)
 
-        ids_t  = torch.tensor(padded, dtype=torch.long, device=device)
+        ids_t = torch.tensor(padded, dtype=torch.long, device=device)
         mask_t = torch.tensor(masks,  dtype=torch.long, device=device)
         lp = F.log_softmax(
             model(input_ids=ids_t, attention_mask=mask_t).logits, dim=-1
@@ -399,8 +414,9 @@ def score_examples_batched(
         for j, (full_ids, _, cont_len, ex_idx, cont_idx) in enumerate(batch):
             cs = adj_cs[j]
             alen = min(cont_len, max_len - cs)
-            tok = ids_t[j, cs : cs + alen]
-            score = lp[j, cs - 1 : cs - 1 + alen][torch.arange(alen, device=device), tok].sum().item()
+            tok = ids_t[j, cs: cs + alen]
+            score = lp[j, cs - 1: cs - 1 +
+                       alen][torch.arange(alen, device=device), tok].sum().item()
             output[ex_idx][cont_idx] = score
 
     return output
@@ -427,8 +443,10 @@ def eval_arc_challenge(
     model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
 ) -> float:
     """Evaluate ARC-Challenge using length-normalised log-likelihood (acc_norm)."""
-    logger.info(f"ARC-Challenge: loading dataset (n_shot={n_shot}, limit={limit})")
-    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+    logger.info(
+        f"ARC-Challenge: loading dataset (n_shot={n_shot}, limit={limit})")
+    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge",
+                      trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     test_examples = list(ds["test"])
     if limit:
         test_examples = test_examples[:limit]
@@ -438,16 +456,18 @@ def eval_arc_challenge(
     if n_shot > 0:
         for ex in list(ds["train"])[:n_shot]:
             labels = ex["choices"]["label"]
-            texts  = ex["choices"]["text"]
+            texts = ex["choices"]["text"]
             answer_text = texts[labels.index(ex["answerKey"])]
             few_shot_prefix += f"Question: {ex['question']}\nAnswer: {answer_text}\n\n"
 
     logger.info("  ARC-Challenge: scoring examples...")
     inputs = [
-        (few_shot_prefix + f"Question: {ex['question']}\nAnswer:", [f" {t}" for t in ex["choices"]["text"]])
+        (few_shot_prefix + f"Question: {ex['question']}\nAnswer:",
+         [f" {t}" for t in ex["choices"]["text"]])
         for ex in test_examples
     ]
-    all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
+    all_scores = score_examples_batched(
+        model, tokenizer, inputs, device, batch_size)
 
     correct = 0
     for ex_scores, ex, (_, choices) in zip(all_scores, test_examples, inputs):
@@ -467,25 +487,30 @@ def eval_truthfulqa_mc2(
     """Evaluate TruthfulQA MC2: softmax probability mass on correct answers."""
     logger.info(f"TruthfulQA MC2: loading dataset (zero-shot, limit={limit})")
     if n_shot != 0:
-        logger.warning(f"TruthfulQA has no few-shot train split; n_shot={n_shot} ignored.")
-    ds = load_dataset("truthful_qa", "multiple_choice", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+        logger.warning(
+            f"TruthfulQA has no few-shot train split; n_shot={n_shot} ignored.")
+    ds = load_dataset("truthful_qa", "multiple_choice",
+                      trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     examples = list(ds["validation"])
     if limit:
         examples = examples[:limit]
     logger.info(f"  TruthfulQA MC2: {len(examples)} validation examples.")
 
     inputs = [
-        (f"Q: {ex['question']}\nA:", [f" {c}" for c in ex["mc2_targets"]["choices"]])
+        (f"Q: {ex['question']}\nA:", [
+         f" {c}" for c in ex["mc2_targets"]["choices"]])
         for ex in examples
     ]
-    all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
+    all_scores = score_examples_batched(
+        model, tokenizer, inputs, device, batch_size)
 
     mc2_scores: list[float] = []
     for ex_scores, ex in zip(all_scores, examples):
-        labels  = ex["mc2_targets"]["labels"]
+        labels = ex["mc2_targets"]["labels"]
         log_lls = torch.tensor(ex_scores, dtype=torch.float64)
-        probs   = torch.softmax(log_lls, dim=0)
-        mc2_scores.append(float(sum(probs[i] for i, lbl in enumerate(labels) if lbl == 1)))
+        probs = torch.softmax(log_lls, dim=0)
+        mc2_scores.append(
+            float(sum(probs[i] for i, lbl in enumerate(labels) if lbl == 1)))
     return float(sum(mc2_scores) / len(mc2_scores))
 
 
@@ -497,8 +522,10 @@ def eval_winogrande(
     model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
 ) -> float:
     """Evaluate Winogrande commonsense pronoun resolution (acc)."""
-    logger.info(f"Winogrande: loading dataset (n_shot={n_shot}, limit={limit})")
-    ds = load_dataset("winogrande", "winogrande_xl", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+    logger.info(
+        f"Winogrande: loading dataset (n_shot={n_shot}, limit={limit})")
+    ds = load_dataset("winogrande", "winogrande_xl",
+                      trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     test_examples = list(ds["validation"])
     if limit:
         test_examples = test_examples[:limit]
@@ -508,16 +535,18 @@ def eval_winogrande(
     if n_shot > 0:
         for ex in list(ds["train"])[:n_shot]:
             answer_option = ex["option1"] if ex["answer"] == "1" else ex["option2"]
-            few_shot_prefix += ex["sentence"].replace("_", answer_option) + "\n\n"
+            few_shot_prefix += ex["sentence"].replace(
+                "_", answer_option) + "\n\n"
 
     inputs = []
     for ex in test_examples:
         blank_idx = ex["sentence"].index("_")
-        context   = few_shot_prefix + ex["sentence"][:blank_idx]
-        rest      = ex["sentence"][blank_idx + 1:]
+        context = few_shot_prefix + ex["sentence"][:blank_idx]
+        rest = ex["sentence"][blank_idx + 1:]
         inputs.append((context, [ex["option1"] + rest, ex["option2"] + rest]))
 
-    all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
+    all_scores = score_examples_batched(
+        model, tokenizer, inputs, device, batch_size)
 
     correct = sum(
         1 for (s1, s2), ex in zip(all_scores, test_examples)
@@ -543,8 +572,10 @@ def eval_gsm8k(
     model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 8
 ) -> float:
     """Evaluate GSM8k grade-school math via batched greedy generation (acc)."""
-    logger.info(f"GSM8k: loading dataset (n_shot={n_shot}, limit={limit}, max_new_tokens={GSM8K_MAX_NEW_TOKENS})")
-    ds = load_dataset("gsm8k", "main", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+    logger.info(
+        f"GSM8k: loading dataset (n_shot={n_shot}, limit={limit}, max_new_tokens={GSM8K_MAX_NEW_TOKENS})")
+    ds = load_dataset(
+        "gsm8k", "main", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     test_examples = list(ds["test"])
     if limit:
         test_examples = test_examples[:limit]
@@ -558,8 +589,9 @@ def eval_gsm8k(
     max_prompt_len = MAX_SEQ_LEN - GSM8K_MAX_NEW_TOKENS
     correct = 0
     for i in tqdm(range(0, len(test_examples), batch_size), desc="GSM8k", leave=False, unit="batch"):
-        batch   = test_examples[i : i + batch_size]
-        prompts = [few_shot_prefix + f"Question: {ex['question']}\nAnswer:" for ex in batch]
+        batch = test_examples[i: i + batch_size]
+        prompts = [few_shot_prefix +
+                   f"Question: {ex['question']}\nAnswer:" for ex in batch]
         enc = tokenizer(
             prompts, return_tensors="pt", padding=True,
             truncation=True, max_length=max_prompt_len,
@@ -575,7 +607,8 @@ def eval_gsm8k(
             )
         prompt_len = enc["input_ids"].shape[1]
         for j, ex in enumerate(batch):
-            generated = tokenizer.decode(out[j, prompt_len:], skip_special_tokens=True)
+            generated = tokenizer.decode(
+                out[j, prompt_len:], skip_special_tokens=True)
             if _extract_number(generated) == _extract_number(ex["answer"]):
                 correct += 1
 
@@ -597,7 +630,8 @@ def eval_hellaswag(
 ) -> float:
     """Evaluate HellaSwag commonsense sentence completion (acc_norm)."""
     logger.info(f"HellaSwag: loading dataset (n_shot={n_shot}, limit={limit})")
-    ds = load_dataset("Rowan/hellaswag", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+    ds = load_dataset("Rowan/hellaswag",
+                      trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     val_examples = list(ds["validation"])
     if limit:
         val_examples = val_examples[:limit]
@@ -606,18 +640,20 @@ def eval_hellaswag(
     few_shot_prefix = ""
     if n_shot > 0:
         for ex in list(ds["train"])[:n_shot]:
-            ctx         = _clean_hellaswag(ex["activity_label"] + ": " + ex["ctx"])
+            ctx = _clean_hellaswag(ex["activity_label"] + ": " + ex["ctx"])
             best_ending = _clean_hellaswag(ex["endings"][int(ex["label"])])
             few_shot_prefix += f"{ctx} {best_ending}\n\n"
 
     inputs = [
         (
-            few_shot_prefix + _clean_hellaswag(ex["activity_label"] + ": " + ex["ctx"]),
+            few_shot_prefix +
+            _clean_hellaswag(ex["activity_label"] + ": " + ex["ctx"]),
             [" " + _clean_hellaswag(e) for e in ex["endings"]],
         )
         for ex in val_examples
     ]
-    all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
+    all_scores = score_examples_batched(
+        model, tokenizer, inputs, device, batch_size)
 
     correct = sum(
         1 for ex_scores, ex, (_, endings) in zip(all_scores, val_examples, inputs)
@@ -651,11 +687,13 @@ def eval_mmlu(
 ) -> float:
     """Evaluate MMLU across 57 subjects using single-letter continuation scoring (acc)."""
     logger.info(f"MMLU: loading dataset (n_shot={n_shot}, limit={limit})")
-    ds = load_dataset("cais/mmlu", "all", trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
+    ds = load_dataset("cais/mmlu", "all",
+                      trust_remote_code=_TRUST_REMOTE_CODE_DATASETS)
     test_examples = list(ds["test"])
     if limit:
         test_examples = test_examples[:limit]
-    logger.info(f"  MMLU: {len(test_examples)} test examples across all subjects.")
+    logger.info(
+        f"  MMLU: {len(test_examples)} test examples across all subjects.")
 
     dev_by_subject: dict[str, list] = {}
     for ex in ds.get("dev", []):
@@ -671,7 +709,8 @@ def eval_mmlu(
                 few_shot_prefix += _mmlu_format(shot, with_answer=True)
         inputs.append((few_shot_prefix + _mmlu_format(ex), letter_choices))
 
-    all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
+    all_scores = score_examples_batched(
+        model, tokenizer, inputs, device, batch_size)
 
     correct = sum(
         1 for ex_scores, ex in zip(all_scores, test_examples)
@@ -714,14 +753,17 @@ def run_all_benchmarks(
         active_tasks = TASKS
     results: dict[str, float | None] = {}
     elapsed: dict[str, float] = {}
-    logger.info(f"Starting benchmark suite: {len(active_tasks)} tasks, device={device}, limit={limit}")
+    logger.info(
+        f"Starting benchmark suite: {len(active_tasks)} tasks, device={device}, limit={limit}")
 
     for task_id, label, _, _, task_limit in active_tasks:
         n_shot = n_shots.get(task_id, 0)
         effective_limit = task_limit if task_limit is not None else limit
         n_examples = f"limit={effective_limit}" if effective_limit else "full"
-        logger.info(f"--- Task: {label} ({task_id}) | {n_shot}-shot | {n_examples} ---")
-        print(f"  [{label}] {task_id} | {n_shot}-shot | {n_examples} ...", flush=True)
+        logger.info(
+            f"--- Task: {label} ({task_id}) | {n_shot}-shot | {n_examples} ---")
+        print(
+            f"  [{label}] {task_id} | {n_shot}-shot | {n_examples} ...", flush=True)
         t0 = time.time()
         try:
             score = _EVAL_FNS[task_id](
@@ -732,11 +774,14 @@ def run_all_benchmarks(
             )
             results[label] = round(score * 100.0, 4)
             elapsed[label] = round(time.time() - t0, 1)
-            logger.info(f"  {label} complete: {results[label]:.2f}%  ({elapsed[label]:.0f}s)")
-            print(f"    {label}: {results[label]:.2f}%  ({elapsed[label]:.0f}s)", flush=True)
+            logger.info(
+                f"  {label} complete: {results[label]:.2f}%  ({elapsed[label]:.0f}s)")
+            print(
+                f"    {label}: {results[label]:.2f}%  ({elapsed[label]:.0f}s)", flush=True)
         except Exception as exc:
             elapsed[label] = round(time.time() - t0, 1)
-            logger.warning(f"Task {task_id} failed after {elapsed[label]:.0f}s: {exc}")
+            logger.warning(
+                f"Task {task_id} failed after {elapsed[label]:.0f}s: {exc}")
             results[label] = None
 
     vals = [v for v in results.values() if v is not None]
@@ -770,7 +815,7 @@ def fmt_delta(v: float | None) -> str:
     if v is None:
         return "  NA  "
     arrow = "▲" if v > 0 else ("▼" if v < 0 else "─")
-    sign  = "+" if v > 0 else ""
+    sign = "+" if v > 0 else ""
     return f"{arrow}{sign}{v:.2f}"
 
 
@@ -785,13 +830,14 @@ def iter_num(name: str) -> int:
 
 def print_results_table(rows: list[dict]) -> None:
     """Print a formatted ASCII table of all iteration results to stdout."""
-    col_labels = ["Iteration", "Arc", "TruthfulQA", "Winogrande", "GSM8k", "HellaSwag", "MMLU", "Avg%", "ΔAvg", "Status"]
+    col_labels = ["Iteration", "Arc", "TruthfulQA", "Winogrande",
+                  "GSM8k", "HellaSwag", "MMLU", "Avg%", "ΔAvg", "Status"]
 
     data: list[list[str]] = []
     for row in rows:
-        m  = row["metrics"]
+        m = row["metrics"]
         dp = row["delta_prev"]
-        is_best   = row["best_iteration_so_far"] == row["iteration"]
+        is_best = row["best_iteration_so_far"] == row["iteration"]
         delta_avg = fmt_delta(dp.get("Average") if dp else None)
         data.append([
             row["iteration"],
@@ -802,15 +848,19 @@ def print_results_table(rows: list[dict]) -> None:
             "★ BEST" if is_best else "",
         ])
 
-    widths = [max(len(col_labels[i]), max((len(r[i]) for r in data), default=0)) for i in range(len(col_labels))]
-    sep        = "+-" + "-+-".join("-" * w for w in widths) + "-+"
-    header_row = "| " + " | ".join(col_labels[i].ljust(widths[i]) for i in range(len(col_labels))) + " |"
+    widths = [max(len(col_labels[i]), max((len(r[i])
+                  for r in data), default=0)) for i in range(len(col_labels))]
+    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    header_row = "| " + \
+        " | ".join(col_labels[i].ljust(widths[i])
+                   for i in range(len(col_labels))) + " |"
 
     print("\n" + sep)
     print(header_row)
     print(sep)
     for row_cells in data:
-        print("| " + " | ".join(row_cells[i].ljust(widths[i]) for i in range(len(col_labels))) + " |")
+        print("| " + " | ".join(row_cells[i].ljust(widths[i])
+              for i in range(len(col_labels))) + " |")
     print(sep + "\n")
 
 
@@ -843,22 +893,30 @@ def write_summary(rows: list[dict], path: Path) -> None:
     for row in rows:
         lines.append(f"[{row['iteration']}]")
         m = row["metrics"]
-        lines.append("scores: " + ", ".join(f"{k}={fmt(v)}" for k, v in m.items()))
+        lines.append(
+            "scores: " + ", ".join(f"{k}={fmt(v)}" for k, v in m.items()))
 
         if row["delta_prev"]:
-            d        = row["delta_prev"]
-            improved = [k for k, v in d.items() if k in _TASK_LABELS and v is not None and v > 0]
-            declined = [k for k, v in d.items() if k in _TASK_LABELS and v is not None and v < 0]
-            stable   = [k for k, v in d.items() if k in _TASK_LABELS and v is not None and v == 0]
-            lines.append("delta_vs_prev: " + ", ".join(f"{k}={fmt_delta(v)}" for k, v in d.items()))
-            lines.append(f"improved_tasks={improved}  declined_tasks={declined}  stable_tasks={stable}")
+            d = row["delta_prev"]
+            improved = [k for k, v in d.items(
+            ) if k in _TASK_LABELS and v is not None and v > 0]
+            declined = [k for k, v in d.items(
+            ) if k in _TASK_LABELS and v is not None and v < 0]
+            stable = [k for k, v in d.items(
+            ) if k in _TASK_LABELS and v is not None and v == 0]
+            lines.append("delta_vs_prev: " +
+                         ", ".join(f"{k}={fmt_delta(v)}" for k, v in d.items()))
+            lines.append(
+                f"improved_tasks={improved}  declined_tasks={declined}  stable_tasks={stable}")
         else:
-            lines.append("delta_vs_prev: baseline iteration (no previous to compare against)")
+            lines.append(
+                "delta_vs_prev: baseline iteration (no previous to compare against)")
 
         if row["best_iteration_so_far"] == row["iteration"]:
             lines.append("status: ★ NEW BEST average so far")
         else:
-            lines.append(f"status: below best-so-far iteration {row['best_iteration_so_far']}")
+            lines.append(
+                f"status: below best-so-far iteration {row['best_iteration_so_far']}")
         lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -871,7 +929,7 @@ def write_summary(rows: list[dict], path: Path) -> None:
 
 def _make_leaderboard_md(row: dict) -> str:
     """Render a single iteration's results as a Markdown table for TensorBoard."""
-    m  = row["metrics"]
+    m = row["metrics"]
     dp = row["delta_prev"]
     lines = [
         f"## {row['iteration']} — Benchmark Scores",
@@ -885,12 +943,14 @@ def _make_leaderboard_md(row: dict) -> str:
         score_str = fmt(m.get(label))
         delta_str = fmt_delta(dp.get(label) if dp else None)
         lines.append(f"| {label} | {score_str}% | {delta_str} |")
-    lines.append(f"| **Average** | **{fmt(m.get('Average'))}%** | **{fmt_delta(dp.get('Average') if dp else None)}** |")
+    lines.append(
+        f"| **Average** | **{fmt(m.get('Average'))}%** | **{fmt_delta(dp.get('Average') if dp else None)}** |")
     lines.append("")
     if row["best_iteration_so_far"] == row["iteration"]:
         lines.append(f"**★ New best average: {fmt(m.get('Average'))}%**")
     else:
-        lines.append(f"Best so far: {row['best_iteration_so_far']} ({fmt(row.get('best_so_far_avg'))}%)")
+        lines.append(
+            f"Best so far: {row['best_iteration_so_far']} ({fmt(row.get('best_so_far_avg'))}%)")
     return "\n".join(lines)
 
 
@@ -917,7 +977,7 @@ def _tb_setup(
         },
     })
 
-    active_ids   = [t[0] for t in active_tasks]
+    active_ids = [t[0] for t in active_tasks]
     shot_summary = ", ".join(
         f"{k}={v}" for k, v in sorted(args.n_shots_resolved.items()) if k in active_ids
     )
@@ -940,7 +1000,7 @@ def _tb_setup(
 
 def _tb_write_row(writer: "SummaryWriter", row: dict) -> None:
     """Write one iteration's metrics to an already-open SummaryWriter and flush."""
-    step    = iter_num(row["iteration"])
+    step = iter_num(row["iteration"])
     metrics = row["metrics"]
 
     avg = metrics.get("Average")
@@ -966,15 +1026,20 @@ def _tb_write_row(writer: "SummaryWriter", row: dict) -> None:
         d = row["delta_prev"]
         for k, v in d.items():
             if v is not None:
-                writer.add_scalar(f"{_TB_TAG_DELTA_PREFIX}{k.lower()}", v, step)
+                writer.add_scalar(
+                    f"{_TB_TAG_DELTA_PREFIX}{k.lower()}", v, step)
 
-        improved_count = sum(1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v > 0)
-        declined_count = sum(1 for k, v in d.items() if k in _TASK_LABELS and v is not None and v < 0)
-        total_valid    = sum(1 for k, v in d.items() if k in _TASK_LABELS and v is not None)
+        improved_count = sum(1 for k, v in d.items()
+                             if k in _TASK_LABELS and v is not None and v > 0)
+        declined_count = sum(1 for k, v in d.items()
+                             if k in _TASK_LABELS and v is not None and v < 0)
+        total_valid = sum(1 for k, v in d.items()
+                          if k in _TASK_LABELS and v is not None)
         writer.add_scalar(_TB_TAG_IMPROVED_COUNT, improved_count, step)
         writer.add_scalar(_TB_TAG_DECLINED_COUNT, declined_count, step)
         if total_valid > 0:
-            writer.add_scalar(_TB_TAG_IMPROVEMENT_RATE, improved_count / total_valid, step)
+            writer.add_scalar(_TB_TAG_IMPROVEMENT_RATE,
+                              improved_count / total_valid, step)
 
     writer.add_text(_TB_TAG_SCORECARD, _make_leaderboard_md(row), step)
 
@@ -986,7 +1051,8 @@ def _tb_write_row(writer: "SummaryWriter", row: dict) -> None:
         )
 
     writer.flush()
-    logger.info(f"TensorBoard: flushed metrics for {row['iteration']} (step={step})")
+    logger.info(
+        f"TensorBoard: flushed metrics for {row['iteration']} (step={step})")
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1113,7 @@ def main() -> None:
         help="Re-evaluate iterations even if a cached JSON result already exists.",
     )
 
-    valid_ids    = [t[0] for t in TASKS]
+    valid_ids = [t[0] for t in TASKS]
     valid_labels = [t[1] for t in TASKS]
     task_help = (
         "Task IDs or labels to run, space-separated. "
@@ -1058,8 +1124,10 @@ def main() -> None:
         "Task IDs or labels to exclude, space-separated. "
         "All other tasks run. Cannot be combined with --tasks."
     )
-    ap.add_argument("--tasks",      nargs="+", default=None, metavar="TASK", help=task_help)
-    ap.add_argument("--skip-tasks", nargs="+", default=None, metavar="TASK", help=skip_help)
+    ap.add_argument("--tasks",      nargs="+", default=None,
+                    metavar="TASK", help=task_help)
+    ap.add_argument("--skip-tasks", nargs="+", default=None,
+                    metavar="TASK", help=skip_help)
 
     args = ap.parse_args()
 
@@ -1070,13 +1138,14 @@ def main() -> None:
     if args.tasks:
         active_tasks = resolve_task_filter(args.tasks)
     elif args.skip_tasks:
-        skip_ids     = {t[0] for t in resolve_task_filter(args.skip_tasks)}
+        skip_ids = {t[0] for t in resolve_task_filter(args.skip_tasks)}
         active_tasks = [t for t in TASKS if t[0] not in skip_ids]
     else:
         active_tasks = list(TASKS)
 
     if not active_tasks:
-        raise SystemExit("No tasks selected — check --tasks / --skip-tasks arguments.")
+        raise SystemExit(
+            "No tasks selected — check --tasks / --skip-tasks arguments.")
 
     # Merge user-provided shot overrides into the per-task defaults from TASKS
     n_shots = dict(DEFAULT_SHOTS)
@@ -1091,13 +1160,15 @@ def main() -> None:
     logger.info(f"  Output dir      : {args.output_dir}")
     logger.info(f"  TensorBoard dir : {args.tensorboard_dir}")
     logger.info(f"  Device          : {args.device}")
-    logger.info(f"  Example limit   : {args.limit if args.limit else 'full dataset'}")
+    logger.info(
+        f"  Example limit   : {args.limit if args.limit else 'full dataset'}")
     logger.info(f"  Active tasks    : {[t[0] for t in active_tasks]}")
-    logger.info(f"  Shot counts     : { {tid: n_shots[tid] for tid, *_ in active_tasks} }")
+    logger.info(
+        f"  Shot counts     : { {tid: n_shots[tid] for tid, *_ in active_tasks} }")
 
     ckpt_dir = Path(args.checkpoints_dir)
-    out_dir  = Path(args.output_dir)
-    tb_dir   = Path(args.tensorboard_dir)
+    out_dir = Path(args.output_dir)
+    tb_dir = Path(args.tensorboard_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1107,7 +1178,8 @@ def main() -> None:
         logger.info(f"Evaluating specified iterations: {args.iters}")
     else:
         iters = sorted(
-            [p for p in ckpt_dir.iterdir() if p.is_dir() and re.match(r"iter_\d+", p.name)],
+            [p for p in ckpt_dir.iterdir() if p.is_dir()
+             and re.match(r"iter_\d+", p.name)],
             key=lambda p: iter_num(p.name),
         )
         logger.info(f"Auto-discovered {len(iters)} iteration(s) in {ckpt_dir}")
@@ -1116,16 +1188,18 @@ def main() -> None:
         raise SystemExit(f"No iteration directories found in {ckpt_dir}")
 
     logger.info(f"Iterations to evaluate: {[p.name for p in iters]}")
-    print(f"Found {len(iters)} iteration(s) to evaluate: {[p.name for p in iters]}")
+    print(
+        f"Found {len(iters)} iteration(s) to evaluate: {[p.name for p in iters]}")
     if args.limit:
-        logger.warning(f"SMOKE TEST: limit={args.limit} examples per task — do not use for real benchmarks.")
+        logger.warning(
+            f"SMOKE TEST: limit={args.limit} examples per task — do not use for real benchmarks.")
         print(f"[SMOKE TEST] Limiting to {args.limit} examples per task.")
 
     # State tracked across iterations
-    rows:         list[dict]       = []
-    best_avg:     float | None     = None
-    best_iter:    str   | None     = None
-    prev_metrics: dict  | None     = None
+    rows:         list[dict] = []
+    best_avg:     float | None = None
+    best_iter:    str | None = None
+    prev_metrics: dict | None = None
 
     run_start = time.time()
     tb_writer = _tb_setup(tb_dir, args, len(iters), active_tasks)
@@ -1140,7 +1214,7 @@ def main() -> None:
             logger.info(f"========== Loading cached {iter_name} ==========")
             print(f" {iter_name}  →  [cached] {json_path}", flush=True)
             print(f"{'='*60}", flush=True)
-            metrics         = json.loads(json_path.read_text())
+            metrics = json.loads(json_path.read_text())
             elapsed: dict[str, float] = {}
         else:
             model_path = find_model_path(iter_path)
@@ -1154,7 +1228,8 @@ def main() -> None:
                     str(model_path), args.device, attn_implementation=args.attn_impl or None,
                 )
                 if args.compile:
-                    model = maybe_compile_model(model, backend=args.compile_backend)
+                    model = maybe_compile_model(
+                        model, backend=args.compile_backend)
             except Exception as exc:
                 logger.error(f"Failed to load model for {iter_name}: {exc}")
                 continue
@@ -1174,11 +1249,12 @@ def main() -> None:
             logger.info(f"Scores saved to: {json_path}")
 
         # Compute deltas only when we have a previous iteration to compare against
-        dprev = delta(metrics, prev_metrics) if prev_metrics is not None else None
+        dprev = delta(
+            metrics, prev_metrics) if prev_metrics is not None else None
 
         avg = metrics["Average"]
         if avg is not None and (best_avg is None or avg > best_avg):
-            best_avg  = avg
+            best_avg = avg
             best_iter = iter_name
             logger.info(f"New best average: {best_avg:.2f}% at {best_iter}")
 
@@ -1194,9 +1270,9 @@ def main() -> None:
         _tb_write_row(tb_writer, row)
         prev_metrics = metrics
 
-        dprev_str   = fmt_delta(dprev.get("Average") if dprev else None)
+        dprev_str = fmt_delta(dprev.get("Average") if dprev else None)
         is_best_str = " ★ NEW BEST" if best_iter == iter_name else ""
-        total_time  = sum(elapsed.values())
+        total_time = sum(elapsed.values())
         logger.info(
             f"{iter_name}: avg={fmt(avg)}%  delta_prev={dprev_str}  "
             f"best_so_far={fmt(best_avg)}%{is_best_str}  ({total_time:.0f}s)"
@@ -1209,8 +1285,10 @@ def main() -> None:
             flush=True,
         )
         if dprev:
-            improved = [k for k, v in dprev.items() if k in _TASK_LABELS and v is not None and v > 0]
-            declined = [k for k, v in dprev.items() if k in _TASK_LABELS and v is not None and v < 0]
+            improved = [k for k, v in dprev.items(
+            ) if k in _TASK_LABELS and v is not None and v > 0]
+            declined = [k for k, v in dprev.items(
+            ) if k in _TASK_LABELS and v is not None and v < 0]
             if improved:
                 logger.info(f"  Improved tasks: {improved}")
                 print(f"  ▲ improved: {', '.join(improved)}", flush=True)
@@ -1224,7 +1302,8 @@ def main() -> None:
     print_results_table(rows)
 
     total_wall = time.time() - run_start
-    logger.info(f"All evaluations complete. Total wall-clock time: {total_wall/60:.1f} min")
+    logger.info(
+        f"All evaluations complete. Total wall-clock time: {total_wall/60:.1f} min")
     print(f"Total evaluation time: {total_wall/60:.1f} min", flush=True)
 
     summary_path = out_dir / "comparative_summary.txt"

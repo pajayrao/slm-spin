@@ -32,16 +32,20 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         self.initial_params: dict = {}
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        log_dir = os.path.join(self.cfg.tensorboard_dir, "param_stats", self.run_name)
+        log_dir = os.path.join(self.cfg.tensorboard_dir,
+                               "param_stats", self.run_name)
         os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
-        logger.info(f"TensorBoardParameterStatsCallback: TensorBoard writer opened at {log_dir}.")
+        logger.info(
+            f"TensorBoardParameterStatsCallback: TensorBoard writer opened at {log_dir}.")
 
         if model is None:
-            logger.warning("TensorBoardParameterStatsCallback.on_train_begin: model is None — skipping baseline snapshot.")
+            logger.warning(
+                "TensorBoardParameterStatsCallback.on_train_begin: model is None — skipping baseline snapshot.")
             return
 
-        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        trainable_names = [
+            n for n, p in model.named_parameters() if p.requires_grad]
         cap = self.cfg.parameter_log_max_tensors
         logger.info(
             f"  Snapshotting step-0 (baseline) weights for {min(len(trainable_names), cap)} "
@@ -64,14 +68,19 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
             if self.cfg.log_parameter_histograms:
                 self.writer.add_histogram(f"parameters/{tag}", w, 0)
             if self.cfg.log_parameter_scalars:
-                self.writer.add_scalar(f"parameters/mean/{tag}",   w.mean().item(),      0)
-                self.writer.add_scalar(f"parameters/std/{tag}",    w.std().item(),       0)
-                self.writer.add_scalar(f"parameters/norm/{tag}",   w.norm().item(),      0)
-                self.writer.add_scalar(f"parameters/absmax/{tag}", w.abs().max().item(), 0)
+                self.writer.add_scalar(
+                    f"parameters/mean/{tag}",   w.mean().item(),      0)
+                self.writer.add_scalar(
+                    f"parameters/std/{tag}",    w.std().item(),       0)
+                self.writer.add_scalar(
+                    f"parameters/norm/{tag}",   w.norm().item(),      0)
+                self.writer.add_scalar(
+                    f"parameters/absmax/{tag}", w.abs().max().item(), 0)
             logged += 1
 
         self.writer.flush()
-        logger.info(f"  Baseline snapshot written for {logged} parameter tensors at step 0.")
+        logger.info(
+            f"  Baseline snapshot written for {logged} parameter tensors at step 0.")
 
     def _should_log(self, step: int) -> bool:
         # HuggingFace Trainer increments global_step before on_step_end fires,
@@ -84,7 +93,8 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
         if not self._should_log(state.global_step):
             return
 
-        logger.info(f"TensorBoardParameterStatsCallback.on_step_end: logging parameter stats at step={state.global_step}.")
+        logger.info(
+            f"TensorBoardParameterStatsCallback.on_step_end: logging parameter stats at step={state.global_step}.")
         logged = 0
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -92,35 +102,47 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
             if logged >= self.cfg.parameter_log_max_tensors:
                 break
 
-            p   = param.detach().float().cpu()
+            p = param.detach().float().cpu()
             tag = name.replace(".", "/")
 
             if self.cfg.log_parameter_histograms:
-                self.writer.add_histogram(f"parameters/{tag}", p, state.global_step)
+                self.writer.add_histogram(
+                    f"parameters/{tag}", p, state.global_step)
             if self.cfg.log_parameter_scalars:
-                self.writer.add_scalar(f"parameters/mean/{tag}",   p.mean().item(),      state.global_step)
-                self.writer.add_scalar(f"parameters/std/{tag}",    p.std().item(),       state.global_step)
-                self.writer.add_scalar(f"parameters/norm/{tag}",   p.norm().item(),      state.global_step)
-                self.writer.add_scalar(f"parameters/absmax/{tag}", p.abs().max().item(), state.global_step)
+                self.writer.add_scalar(
+                    f"parameters/mean/{tag}",   p.mean().item(),      state.global_step)
+                self.writer.add_scalar(
+                    f"parameters/std/{tag}",    p.std().item(),       state.global_step)
+                self.writer.add_scalar(
+                    f"parameters/norm/{tag}",   p.norm().item(),      state.global_step)
+                self.writer.add_scalar(
+                    f"parameters/absmax/{tag}", p.abs().max().item(), state.global_step)
 
             # Delta from initial weights: shows which layers are changing most
             if name in self.initial_params:
                 delta = p - self.initial_params[name]
-                self.writer.add_scalar(f"parameter_delta/norm/{tag}", delta.norm().item(), state.global_step)
-                self.writer.add_scalar(f"parameter_delta/mean/{tag}", delta.mean().item(), state.global_step)
-                self.writer.add_scalar(f"parameter_delta/std/{tag}",  delta.std().item(),  state.global_step)
+                self.writer.add_scalar(
+                    f"parameter_delta/norm/{tag}", delta.norm().item(), state.global_step)
+                self.writer.add_scalar(
+                    f"parameter_delta/mean/{tag}", delta.mean().item(), state.global_step)
+                self.writer.add_scalar(
+                    f"parameter_delta/std/{tag}",  delta.std().item(),  state.global_step)
 
             # Gradient stats
             if self.cfg.log_gradient_histograms and param.grad is not None:
                 g = param.grad.detach().float().cpu()
-                self.writer.add_histogram(f"gradients/{tag}",        g,                   state.global_step)
-                self.writer.add_scalar(f"gradients/norm/{tag}",   g.norm().item(),      state.global_step)
-                self.writer.add_scalar(f"gradients/absmax/{tag}", g.abs().max().item(), state.global_step)
+                self.writer.add_histogram(
+                    f"gradients/{tag}",        g,                   state.global_step)
+                self.writer.add_scalar(
+                    f"gradients/norm/{tag}",   g.norm().item(),      state.global_step)
+                self.writer.add_scalar(
+                    f"gradients/absmax/{tag}", g.abs().max().item(), state.global_step)
 
             logged += 1
 
         self.writer.flush()
-        logger.info(f"  Parameter stats flushed to TensorBoard for {logged} tensors at step={state.global_step}.")
+        logger.info(
+            f"  Parameter stats flushed to TensorBoard for {logged} tensors at step={state.global_step}.")
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
         if self.writer is None:
@@ -144,16 +166,21 @@ class TensorBoardParameterStatsCallback(TrainerCallback):
                 tag = name.replace(".", "/")
 
                 if self.cfg.log_parameter_histograms:
-                    self.writer.add_histogram(f"parameters/{tag}", w, state.global_step)
+                    self.writer.add_histogram(
+                        f"parameters/{tag}", w, state.global_step)
                 if self.cfg.log_parameter_scalars:
-                    self.writer.add_scalar(f"parameters/mean/{tag}",   w.mean().item(),      state.global_step)
-                    self.writer.add_scalar(f"parameters/std/{tag}",    w.std().item(),       state.global_step)
-                    self.writer.add_scalar(f"parameters/norm/{tag}",   w.norm().item(),      state.global_step)
-                    self.writer.add_scalar(f"parameters/absmax/{tag}", w.abs().max().item(), state.global_step)
+                    self.writer.add_scalar(
+                        f"parameters/mean/{tag}",   w.mean().item(),      state.global_step)
+                    self.writer.add_scalar(
+                        f"parameters/std/{tag}",    w.std().item(),       state.global_step)
+                    self.writer.add_scalar(
+                        f"parameters/norm/{tag}",   w.norm().item(),      state.global_step)
+                    self.writer.add_scalar(
+                        f"parameters/absmax/{tag}", w.abs().max().item(), state.global_step)
                 logged += 1
 
         self.writer.flush()
         self.writer.close()
         self.writer = None
-        logger.info("TensorBoardParameterStatsCallback: writer closed — parameter stats complete.")
-
+        logger.info(
+            "TensorBoardParameterStatsCallback: writer closed — parameter stats complete.")

@@ -42,18 +42,22 @@ def find_start_iteration(cfg) -> int:
     If neither file exists the iteration is treated as incomplete even if the dir
     was created by ensure_dir() before training started.
     """
-    logger.info("find_start_iteration() — scanning checkpoint dirs for the last completed iteration...")
+    logger.info(
+        "find_start_iteration() — scanning checkpoint dirs for the last completed iteration...")
     for i in range(cfg.num_iterations - 1, -1, -1):
         iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{i}")
         done_sentinel = os.path.join(iter_dir, ".done")
         tok_cfg = os.path.join(iter_dir, "tokenizer_config.json")
         if os.path.exists(done_sentinel):
-            logger.info(f"  iter_{i}: .done sentinel found → iterations 0–{i} complete, resuming at {i + 1}.")
+            logger.info(
+                f"  iter_{i}: .done sentinel found → iterations 0–{i} complete, resuming at {i + 1}.")
             return i + 1
         if os.path.exists(tok_cfg):
-            logger.info(f"  iter_{i}: tokenizer_config.json found (legacy signal) → resuming at {i + 1}.")
+            logger.info(
+                f"  iter_{i}: tokenizer_config.json found (legacy signal) → resuming at {i + 1}.")
             return i + 1
-    logger.info("  No completed iterations found — starting from iteration 0 (fresh run).")
+    logger.info(
+        "  No completed iterations found — starting from iteration 0 (fresh run).")
     return 0
 
 
@@ -167,7 +171,8 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
                                falling back to instruction_response otherwise.
     """
     if cfg.chat_template_mode == "plain":
-        logger.debug("maybe_apply_chat_template: mode=plain — prompt returned unchanged.")
+        logger.debug(
+            "maybe_apply_chat_template: mode=plain — prompt returned unchanged.")
         return user_prompt
 
     if cfg.chat_template_mode == "instruction_response":
@@ -179,7 +184,8 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
         return result
 
     if cfg.chat_template_mode == "auto":
-        has_template = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
+        has_template = hasattr(
+            tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
         if has_template:
             try:
                 result = tokenizer.apply_chat_template(
@@ -253,7 +259,8 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
     Returns an HFDataset with columns {"prompt": str, "response": str}.
     Raises ValueError if no valid pairs are found after filtering.
     """
-    logger.info("load_base_dataset_fixed() — loading and normalising training dataset...")
+    logger.info(
+        "load_base_dataset_fixed() — loading and normalising training dataset...")
     if data_path:
         ext = data_path.rsplit(".", 1)[-1].lower()
         logger.info(f"  Source: local file — {data_path} (format={ext})")
@@ -456,7 +463,7 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
     for i in range(min(len(prompt_ids), len(labels))):
         labels[i] = -100
 
-    n_prompt_tokens   = min(len(prompt_ids), len(labels))
+    n_prompt_tokens = min(len(prompt_ids), len(labels))
     n_response_tokens = len(labels) - n_prompt_tokens
     logger.debug(
         f"tokenize_prompt_response: total={len(full_ids)} tokens "
@@ -532,7 +539,8 @@ def model_sequence_logprob(model, input_ids, attention_mask, labels):
         f"model_sequence_logprob: forward pass — "
         f"input_ids=({batch}, {seq_len}), device={input_ids.device}, use_cache=False."
     )
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    outputs = model(input_ids=input_ids,
+                    attention_mask=attention_mask, use_cache=False)
     logger.debug(
         f"  logits shape: {tuple(outputs.logits.shape)} "
         f"(batch={batch}, seq={seq_len}, vocab={outputs.logits.shape[-1]})."
@@ -634,7 +642,8 @@ def get_iteration_lambda(cfg: SPINConfig, iteration: int) -> float:
                     f"(stronger alignment push on last pass).")
     else:
         lam = cfg.lambda_initial
-        logger.info(f"get_iteration_lambda(iter={iteration}): using lambda_initial={lam}.")
+        logger.info(
+            f"get_iteration_lambda(iter={iteration}): using lambda_initial={lam}.")
     return lam
 
 
@@ -667,18 +676,25 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
     trying to import optional logging integrations (wandb, mlflow, etc.).
     """
     eff_batch = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
-    logger.info("build_training_args() — constructing HuggingFace TrainingArguments...")
+    logger.info(
+        "build_training_args() — constructing HuggingFace TrainingArguments...")
     logger.info(f"  output_dir:                  {iteration_dir}")
     logger.info(f"  logging_dir (TensorBoard):   {logging_dir}")
-    logger.info(f"  num_train_epochs:            {cfg.num_epochs_per_iteration}")
-    logger.info(f"  per_device_train_batch_size: {cfg.per_device_train_batch_size}")
-    logger.info(f"  gradient_accumulation_steps: {cfg.gradient_accumulation_steps}  →  effective batch={eff_batch}")
+    logger.info(
+        f"  num_train_epochs:            {cfg.num_epochs_per_iteration}")
+    logger.info(
+        f"  per_device_train_batch_size: {cfg.per_device_train_batch_size}")
+    logger.info(
+        f"  gradient_accumulation_steps: {cfg.gradient_accumulation_steps}  →  effective batch={eff_batch}")
     logger.info(f"  learning_rate:               {learning_rate:.2e}")
-    logger.info(f"  lr_scheduler_type:           {cfg.lr_scheduler_type}  warmup_steps={cfg.warmup_steps}")
+    logger.info(
+        f"  lr_scheduler_type:           {cfg.lr_scheduler_type}  warmup_steps={cfg.warmup_steps}")
     logger.info(f"  weight_decay:                {cfg.weight_decay}")
     logger.info(f"  max_grad_norm:               {cfg.max_grad_norm}")
-    logger.info(f"  bf16={cfg.bf16}, fp16={cfg.fp16}, gradient_checkpointing={cfg.gradient_checkpointing}")
-    logger.info(f"  save_strategy={cfg.save_strategy}, save_total_limit={cfg.save_total_limit}")
+    logger.info(
+        f"  bf16={cfg.bf16}, fp16={cfg.fp16}, gradient_checkpointing={cfg.gradient_checkpointing}")
+    logger.info(
+        f"  save_strategy={cfg.save_strategy}, save_total_limit={cfg.save_total_limit}")
     logger.info(f"  report_to:                   {cfg.report_to}")
     return TrainingArguments(
         output_dir=iteration_dir,
@@ -753,15 +769,18 @@ def make_trainable(model, cfg: SPINConfig):
     parameters (a tiny fraction of the total) are made trainable.  This halves
     the memory needed for gradients and optimizer states compared to full fine-tuning.
     """
-    logger.info("make_trainable() — converting frozen π_prev into trainable π_θ...")
+    logger.info(
+        "make_trainable() — converting frozen π_prev into trainable π_θ...")
 
     if hasattr(model, "_orig_mod"):
-        logger.info("  Unwrapping torch.compile OptimizedModule before PEFT/LoRA wrapping.")
+        logger.info(
+            "  Unwrapping torch.compile OptimizedModule before PEFT/LoRA wrapping.")
         model = model._orig_mod
 
     if cfg.use_lora:
         target_modules = cfg.lora_target_modules.split(",")
-        logger.info(f"  LoRA mode: freezing all base weights, adding adapters to: {target_modules}")
+        logger.info(
+            f"  LoRA mode: freezing all base weights, adding adapters to: {target_modules}")
         logger.info(f"  LoRA config: r={cfg.lora_r}, alpha={cfg.lora_alpha}, "
                     f"dropout={cfg.lora_dropout}, scale={cfg.lora_alpha / cfg.lora_r:.2f}")
         for p in model.parameters():
@@ -776,13 +795,16 @@ def make_trainable(model, cfg: SPINConfig):
             bias="none",
         )
         model = get_peft_model(model, lora_cfg)
-        logger.info("  PEFT model created — base weights frozen, LoRA adapter params trainable.")
+        logger.info(
+            "  PEFT model created — base weights frozen, LoRA adapter params trainable.")
 
         if cfg.gradient_checkpointing:
             model.enable_input_require_grads()
-            logger.info("  enable_input_require_grads() called (required for grad-ckpt + PEFT).")
+            logger.info(
+                "  enable_input_require_grads() called (required for grad-ckpt + PEFT).")
     else:
-        logger.info("  Full fine-tuning mode: all parameters set to requires_grad=True.")
+        logger.info(
+            "  Full fine-tuning mode: all parameters set to requires_grad=True.")
         for p in model.parameters():
             p.requires_grad = True
 
@@ -906,3 +928,27 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
 
     logger.info(f"Reference log-probs computed for {len(ref_logprobs)} rows.")
     return ref_logprobs
+
+# ── Per-batch file paths ──────────────────────────────────────────────────────
+
+
+def _synth_path(cfg, iteration, k):
+    return os.path.join(cfg.synthetic_cache_dir,
+                        f"iter_{iteration}_batch_{k:06d}_synth.jsonl")
+
+
+def _logprobs_path(cfg, iteration, k):
+    return os.path.join(cfg.synthetic_cache_dir,
+                        f"iter_{iteration}_batch_{k:06d}_logprobs.jsonl")
+
+
+def _batch_train_dir(cfg, iteration, k):
+    return os.path.join(cfg.checkpoints_dir, f"iter_{iteration}", f"batch_{k:06d}")
+
+
+def _batch_done_path(cfg, iteration, k):
+    return os.path.join(_batch_train_dir(cfg, iteration, k), ".done")
+
+
+def _file_valid(path):
+    return os.path.exists(path) and os.path.getsize(path) > 0

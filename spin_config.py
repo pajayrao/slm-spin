@@ -108,7 +108,7 @@ class SPINConfig:
     # Number of prompts decoded in a single GPU batch during synthetic generation.
     # Reduce if generation causes OOM (each beam holds its own KV cache).
     # Range: 1–64; for an 8 GB GPU with max_length=1024, start at 4.
-    generation_batch_size: int = 256
+    generation_batch_size: int = 512
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -173,12 +173,16 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 250000
+    max_data_load: int = 65536
 
-    # How many prompts (rows) to generate synthetic responses for each iteration.
-    # 0 = use the entire dataset. Reduce to limit GPU time spent on generation.
-    # Range: 0 (all) or any positive integer ≤ dataset size.
-    synthetic_examples_per_iteration: int = 65536
+    # Number of dataset rows processed as one atomic checkpoint unit during
+    # synthetic generation and ref-logprob scoring. Each batch is saved to
+    # iter_{i}_batch_{k:06d}.jsonl before the next batch starts, so a crash
+    # loses at most one batch worth of GPU work.
+    # Smaller → more frequent saves, lower restart cost.
+    # Larger  → fewer file writes, but more work lost per crash.
+    # Range: 50–2000. Start at 200 and tune for your restart tolerance.
+    data_batch_size: int = 8192
 
     # If True, synthetic rows from all previous iterations are included in the current
     # training set (growing curriculum). If False, only the current iteration's synthetic
@@ -353,7 +357,6 @@ class SPINConfig:
     #                                to get Triton kernel tuning without the C++ compilation step.
     compile_mode: str = "max-autotune-no-cudagraphs"
 
-
     # compile_dynamic (bool or None): Use dynamic shape tracing.  When this is True, we will up-front attempt
     # to generate a kernel that is as dynamic as possible to avoid recompilations when
     # sizes change.  This may not always work as some operations/optimizations will
@@ -362,7 +365,6 @@ class SPINConfig:
     # By default (None), we automatically detect if dynamism has occurred and compile a more
     # dynamic kernel upon recompile.
     compile_dynamic: bool = True
-
 
     # Require the entire forward graph to compile without breaks (fullgraph=True).
     # More performant when it succeeds, but raises if the model contains graph-break ops.

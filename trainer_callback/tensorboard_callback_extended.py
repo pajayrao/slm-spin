@@ -16,8 +16,6 @@ logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
 
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TensorBoardCallbackExtended
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +115,6 @@ class TensorBoardCallbackExtended(TrainerCallback):
         pynvml.nvmlInit()
         self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
-
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -130,14 +127,16 @@ class TensorBoardCallbackExtended(TrainerCallback):
             return
 
         # Log a text summary of the training config for reference
-        cfg_text = "\n".join(f"    {k}: {v}" for k, v in vars(self.cfg).items())
+        cfg_text = "\n".join(f"    {k}: {v}" for k,
+                             v in vars(self.cfg).items())
         self.writer.add_text("config/spin_config", f"```\n{cfg_text}\n```", 0)
 
         # # GRAPHS tab: trace the model with a tiny dummy input.
         # self._log_model_graph(model)
 
         # PROJECTOR tab: log token embeddings at iteration start
-        self._log_token_embeddings(model, step=0, tag="embeddings/tokens_iter_start")
+        self._log_token_embeddings(
+            model, step=0, tag="embeddings/tokens_iter_start")
 
         # Custom scalars layout: groups related metrics onto shared charts.
         self.writer.add_custom_scalars({
@@ -188,7 +187,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self._spin_lambda_val = float(logs["spin_lambda"])
 
         # logp_gap: positive means π_θ prefers human over synthetic — the goal of SPIN
-        chosen   = logs.get("pi_chosen_logp")
+        chosen = logs.get("pi_chosen_logp")
         rejected = logs.get("pi_rejected_logp")
         if chosen is not None and rejected is not None:
             gap = chosen - rejected
@@ -200,27 +199,29 @@ class TensorBoardCallbackExtended(TrainerCallback):
         if loss is None:
             loss = logs.get("train_loss")
         margin = logs.get("margin_mean")
-        wr     = logs.get("win_rate")
-        kl     = logs.get("kl_from_ref")
-        if loss   is not None:
+        wr = logs.get("win_rate")
+        kl = logs.get("kl_from_ref")
+        if loss is not None:
             self._epoch_losses.append(loss)
             self._final_loss = float(loss)
         if margin is not None:
             self._epoch_margins.append(margin)
             self._final_margin = float(margin)
-        if wr     is not None:
+        if wr is not None:
             self._epoch_win_rates.append(wr)
             self._final_win_rate = float(wr)
-        if kl     is not None:
+        if kl is not None:
             self._final_kl_from_ref = float(kl)
 
         # Perplexity: exp(loss) — more interpretable than raw cross-entropy for LLMs
         if loss is not None:
-            self.writer.add_scalar("train/perplexity", math.exp(min(loss, 20)), step)
+            self.writer.add_scalar(
+                "train/perplexity", math.exp(min(loss, 20)), step)
 
         # Alignment accuracy: 1.0 when margin_mean > 0 (model already prefers human responses)
         if margin is not None:
-            self.writer.add_scalar("train/alignment_accuracy", float(margin > 0), step)
+            self.writer.add_scalar(
+                "train/alignment_accuracy", float(margin > 0), step)
 
         # Throughput: samples per second (one step = per_device_train_batch_size samples)
         if self._step_start_time > 0:
@@ -237,14 +238,18 @@ class TensorBoardCallbackExtended(TrainerCallback):
 
         # ── System memory ────────────────────────────────────────────────────
         if torch.cuda.is_available():
-            self.writer.add_scalar("system/gpu_alloc_mb",    torch.cuda.memory_allocated() / 1024 ** 2, step)
-            self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
-            self.writer.add_scalar("system/cpu_rss_mb", psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2, step)
+            self.writer.add_scalar(
+                "system/gpu_alloc_mb",    torch.cuda.memory_allocated() / 1024 ** 2, step)
+            self.writer.add_scalar(
+                "system/gpu_reserved_mb", torch.cuda.memory_reserved() / 1024 ** 2, step)
+            self.writer.add_scalar(
+                "system/cpu_rss_mb", psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2, step)
 
         # ── GPU utilization % ────────────────────────────────────────────────
         gpu_util = None
         if self._nvml_handle is not None:
-            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle).gpu
+            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(
+                self._nvml_handle).gpu
         if gpu_util is None and torch.cuda.is_available():
             try:
                 gpu_util = torch.cuda.utilization()
@@ -255,10 +260,13 @@ class TensorBoardCallbackExtended(TrainerCallback):
 
         # ── Global gradient norm ─────────────────────────────────────────────
         # Compute in one fused operation with a single GPU sync instead of one .item() per parameter.
-        grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+        grads = [p.grad.detach()
+                 for p in model.parameters() if p.grad is not None]
         if grads:
-            grad_sq_sum = torch.stack([g.float().norm().pow(2) for g in grads]).sum().item()
-            self.writer.add_scalar("train/grad_global_norm", grad_sq_sum ** 0.5, step)
+            grad_sq_sum = torch.stack(
+                [g.float().norm().pow(2) for g in grads]).sum().item()
+            self.writer.add_scalar(
+                "train/grad_global_norm", grad_sq_sum ** 0.5, step)
 
         # ── Per-parameter stats (throttled to parameter_log_interval) ────────
         # HuggingFace Trainer increments global_step before calling on_step_end,
@@ -267,7 +275,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
             return
 
         total_weight_sq = 0.0
-        total_delta_sq  = 0.0
+        total_delta_sq = 0.0
         logged = 0
 
         for name, param in model.named_parameters():
@@ -276,7 +284,7 @@ class TensorBoardCallbackExtended(TrainerCallback):
             if logged >= self.cfg.parameter_log_max_tensors:
                 break
 
-            w   = param.detach().float().cpu()
+            w = param.detach().float().cpu()
             tag = name.replace(".", "/")
             total_weight_sq += w.norm().item() ** 2
 
@@ -285,8 +293,10 @@ class TensorBoardCallbackExtended(TrainerCallback):
                 delta = w - self.initial_params[name]
                 total_delta_sq += delta.norm().item() ** 2
                 if self.cfg.log_parameter_scalars:
-                    self.writer.add_scalar(f"weight_delta/norm/{tag}", delta.norm().item(), step)
-                    self.writer.add_scalar(f"weight_delta/mean/{tag}", delta.mean().item(), step)
+                    self.writer.add_scalar(
+                        f"weight_delta/norm/{tag}", delta.norm().item(), step)
+                    self.writer.add_scalar(
+                        f"weight_delta/mean/{tag}", delta.mean().item(), step)
 
             # Gradient stats for this parameter
             if param.grad is not None:
@@ -294,8 +304,10 @@ class TensorBoardCallbackExtended(TrainerCallback):
                 if self.cfg.log_gradient_histograms:
                     self.writer.add_histogram(f"gradients/{tag}", g, step)
                 if self.cfg.log_parameter_scalars:
-                    self.writer.add_scalar(f"gradients/norm/{tag}",   g.norm().item(),      step)
-                    self.writer.add_scalar(f"gradients/absmax/{tag}", g.abs().max().item(), step)
+                    self.writer.add_scalar(
+                        f"gradients/norm/{tag}",   g.norm().item(),      step)
+                    self.writer.add_scalar(
+                        f"gradients/absmax/{tag}", g.abs().max().item(), step)
                 # Grad-to-weight ratio: detects vanishing/exploding gradients relative to parameter scale
                 self.writer.add_scalar(
                     f"layer_health/grad_weight_ratio/{tag}",
@@ -306,8 +318,10 @@ class TensorBoardCallbackExtended(TrainerCallback):
             logged += 1
 
         # Global aggregates: useful for a single high-level view without per-layer noise
-        self.writer.add_scalar("train/weight_global_norm", total_weight_sq ** 0.5, step)
-        self.writer.add_scalar("train/weight_drift",        total_delta_sq  ** 0.5, step)
+        self.writer.add_scalar("train/weight_global_norm",
+                               total_weight_sq ** 0.5, step)
+        self.writer.add_scalar("train/weight_drift",
+                               total_delta_sq ** 0.5, step)
         self.writer.flush()
 
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -317,9 +331,12 @@ class TensorBoardCallbackExtended(TrainerCallback):
         within a single SPIN iteration.
         """
         epoch = int(state.epoch) if state.epoch is not None else 0
-        loss_mean = (sum(self._epoch_losses) / len(self._epoch_losses)) if self._epoch_losses else float("nan")
-        margin_mean = (sum(self._epoch_margins) / len(self._epoch_margins)) if self._epoch_margins else float("nan")
-        win_rate_mean = (sum(self._epoch_win_rates) / len(self._epoch_win_rates)) if self._epoch_win_rates else float("nan")
+        loss_mean = (sum(self._epoch_losses) / len(self._epoch_losses)
+                     ) if self._epoch_losses else float("nan")
+        margin_mean = (sum(self._epoch_margins) / len(self._epoch_margins)
+                       ) if self._epoch_margins else float("nan")
+        win_rate_mean = (sum(self._epoch_win_rates) / len(self._epoch_win_rates)
+                         ) if self._epoch_win_rates else float("nan")
         logger.info(
             f"Epoch {epoch} complete — loss={loss_mean:.4f}, "
             f"margin={margin_mean:.4f}, win_rate={win_rate_mean:.3f}, "
@@ -327,32 +344,46 @@ class TensorBoardCallbackExtended(TrainerCallback):
         )
 
         if self._epoch_losses:
-            self.writer.add_scalar("epoch/loss_mean",  sum(self._epoch_losses) / len(self._epoch_losses), epoch)
-            self.writer.add_scalar("epoch/loss_min",   min(self._epoch_losses), epoch)
-            self.writer.add_scalar("epoch/loss_max",   max(self._epoch_losses), epoch)
-            self.writer.add_scalar("epoch/loss_final", self._epoch_losses[-1],  epoch)
-            self.writer.add_histogram("epoch/loss_distribution", torch.tensor(self._epoch_losses), epoch)
+            self.writer.add_scalar(
+                "epoch/loss_mean",  sum(self._epoch_losses) / len(self._epoch_losses), epoch)
+            self.writer.add_scalar(
+                "epoch/loss_min",   min(self._epoch_losses), epoch)
+            self.writer.add_scalar(
+                "epoch/loss_max",   max(self._epoch_losses), epoch)
+            self.writer.add_scalar(
+                "epoch/loss_final", self._epoch_losses[-1],  epoch)
+            self.writer.add_histogram(
+                "epoch/loss_distribution", torch.tensor(self._epoch_losses), epoch)
 
         if self._epoch_margins:
-            self.writer.add_scalar("epoch/margin_mean",  sum(self._epoch_margins) / len(self._epoch_margins), epoch)
-            self.writer.add_scalar("epoch/margin_final", self._epoch_margins[-1], epoch)
+            self.writer.add_scalar(
+                "epoch/margin_mean",  sum(self._epoch_margins) / len(self._epoch_margins), epoch)
+            self.writer.add_scalar("epoch/margin_final",
+                                   self._epoch_margins[-1], epoch)
 
         if self._epoch_win_rates:
-            self.writer.add_scalar("epoch/win_rate_mean",  sum(self._epoch_win_rates) / len(self._epoch_win_rates), epoch)
-            self.writer.add_scalar("epoch/win_rate_final", self._epoch_win_rates[-1], epoch)
+            self.writer.add_scalar(
+                "epoch/win_rate_mean",  sum(self._epoch_win_rates) / len(self._epoch_win_rates), epoch)
+            self.writer.add_scalar(
+                "epoch/win_rate_final", self._epoch_win_rates[-1], epoch)
 
         if self._epoch_gaps:
-            self.writer.add_scalar("epoch/logp_gap_mean",  sum(self._epoch_gaps) / len(self._epoch_gaps), epoch)
-            self.writer.add_scalar("epoch/logp_gap_final", self._epoch_gaps[-1], epoch)
+            self.writer.add_scalar(
+                "epoch/logp_gap_mean",  sum(self._epoch_gaps) / len(self._epoch_gaps), epoch)
+            self.writer.add_scalar(
+                "epoch/logp_gap_final", self._epoch_gaps[-1], epoch)
 
         # PR CURVES tab: Precision-Recall curve for alignment accuracy.
         # Each data point is one logged batch. Label = 1 when the batch had positive
         # alignment (margin_mean > 0); score = sigmoid(margin_mean) as confidence.
         # The curve shows how reliably the model's margin score predicts alignment.
         if self.cfg.log_pr_curves and len(self._epoch_margins) > 1:
-            labels = torch.tensor([1.0 if m > 0 else 0.0 for m in self._epoch_margins])
-            scores = torch.sigmoid(torch.tensor(self._epoch_margins, dtype=torch.float32))
-            self.writer.add_pr_curve("train/alignment_pr_curve", labels, scores, epoch)
+            labels = torch.tensor(
+                [1.0 if m > 0 else 0.0 for m in self._epoch_margins])
+            scores = torch.sigmoid(torch.tensor(
+                self._epoch_margins, dtype=torch.float32))
+            self.writer.add_pr_curve(
+                "train/alignment_pr_curve", labels, scores, epoch)
 
         # Reset accumulators for the next epoch
         self._epoch_losses.clear()
@@ -372,11 +403,13 @@ class TensorBoardCallbackExtended(TrainerCallback):
         )
         if model is not None and self.initial_params:
             total_delta_sq = sum(
-                (param.detach().float().cpu() - self.initial_params[name]).norm().item() ** 2
+                (param.detach().float().cpu() -
+                 self.initial_params[name]).norm().item() ** 2
                 for name, param in model.named_parameters()
                 if param.requires_grad and name in self.initial_params
             )
-            self.writer.add_scalar("iteration_summary/total_weight_drift", total_delta_sq ** 0.5, state.global_step)
+            self.writer.add_scalar(
+                "iteration_summary/total_weight_drift", total_delta_sq ** 0.5, state.global_step)
 
         # Scan log_history in reverse for the last step that actually contains training metrics.
         # The final entry is often a timing summary (train_runtime, etc.) without loss values.
@@ -391,18 +424,21 @@ class TensorBoardCallbackExtended(TrainerCallback):
             val = last_metrics.get(key)
             if val is not None:
                 canonical = key if key != "train_loss" else "loss"
-                self.writer.add_scalar(f"iteration_summary/final_{canonical}", val, state.global_step)
+                self.writer.add_scalar(
+                    f"iteration_summary/final_{canonical}", val, state.global_step)
 
         if "pi_chosen_logp" in last_metrics and "pi_rejected_logp" in last_metrics:
             self.writer.add_scalar(
                 "iteration_summary/final_logp_gap",
-                last_metrics["pi_chosen_logp"] - last_metrics["pi_rejected_logp"],
+                last_metrics["pi_chosen_logp"] -
+                last_metrics["pi_rejected_logp"],
                 state.global_step,
             )
 
         # PROJECTOR tab: snapshot token embeddings at iteration end.
         if model is not None:
-            self._log_token_embeddings(model, step=state.global_step, tag="embeddings/tokens_iter_end")
+            self._log_token_embeddings(
+                model, step=state.global_step, tag="embeddings/tokens_iter_end")
 
         # HParams plugin: links hyperparameters to final metrics for cross-run comparison.
         # spin_iteration and spin_lambda vary across runs, making the Parallel Coordinates
@@ -420,13 +456,13 @@ class TensorBoardCallbackExtended(TrainerCallback):
         # metrics (margin_mean, logp_gap, etc.), so we cannot rely on last_metrics here.
         hparam_metrics: dict = {}
         if not math.isnan(self._final_loss):
-            hparam_metrics["hparam/final_loss"]        = self._final_loss
+            hparam_metrics["hparam/final_loss"] = self._final_loss
         if not math.isnan(self._final_margin):
-            hparam_metrics["hparam/final_margin"]      = self._final_margin
+            hparam_metrics["hparam/final_margin"] = self._final_margin
         if not math.isnan(self._final_win_rate):
-            hparam_metrics["hparam/final_win_rate"]    = self._final_win_rate
+            hparam_metrics["hparam/final_win_rate"] = self._final_win_rate
         if not math.isnan(self._final_logp_gap):
-            hparam_metrics["hparam/final_logp_gap"]    = self._final_logp_gap
+            hparam_metrics["hparam/final_logp_gap"] = self._final_logp_gap
         if not math.isnan(self._final_kl_from_ref):
             hparam_metrics["hparam/final_kl_from_ref"] = self._final_kl_from_ref
 
@@ -448,10 +484,8 @@ class TensorBoardCallbackExtended(TrainerCallback):
             for k, v in hparam_metrics.items():
                 hw.add_scalar(k, v, global_step=0)
 
-
         self.writer.flush()
         self.writer.close()
-
 
     def _log_token_embeddings(self, model, step: int, tag: str):
         """Extract and log the token embedding matrix (PROJECTOR tab)."""
@@ -466,7 +500,8 @@ class TensorBoardCallbackExtended(TrainerCallback):
                 or getattr(getattr(inner, "embeddings", object()), "word_embeddings", None)
             )
             if embed_layer is None:
-                logger.warning("Could not find embedding layer; PROJECTOR skipped.")
+                logger.warning(
+                    "Could not find embedding layer; PROJECTOR skipped.")
                 return
 
             embed = embed_layer.weight.detach().float().cpu()
@@ -483,8 +518,10 @@ class TensorBoardCallbackExtended(TrainerCallback):
             else:
                 metadata = [str(i) for i in range(n)]
 
-            self.writer.add_embedding(embed_subset, metadata=metadata, global_step=step, tag=tag)
-            logger.info(f"Token embeddings ({n} tokens) logged to TensorBoard PROJECTOR tab (tag={tag}).")
+            self.writer.add_embedding(
+                embed_subset, metadata=metadata, global_step=step, tag=tag)
+            logger.info(
+                f"Token embeddings ({n} tokens) logged to TensorBoard PROJECTOR tab (tag={tag}).")
         except Exception as e:
             logger.warning(f"Could not log token embeddings: {e}")
 

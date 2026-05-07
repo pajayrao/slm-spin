@@ -12,7 +12,6 @@ logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
 
 
-
 class TorchProfilerCallback(TrainerCallback):
     """
     Runs the PyTorch profiler during training and exports rich diagnostics.
@@ -80,7 +79,8 @@ class TorchProfilerCallback(TrainerCallback):
             activities.append(ProfilerActivity.CUDA)
 
         if not activities:
-            logger.warning("[Profiler] enabled but no valid activities selected.")
+            logger.warning(
+                "[Profiler] enabled but no valid activities selected.")
             return
 
         # Include SPIN iteration in dir name so multiple iterations don't overwrite
@@ -138,12 +138,15 @@ class TorchProfilerCallback(TrainerCallback):
         self.prof.__exit__(None, None, None)
 
         if not scheduled_fired:
-            fallback_path = os.path.join(self._run_dir, "trace_fallback.pt.trace.json")
+            fallback_path = os.path.join(
+                self._run_dir, "trace_fallback.pt.trace.json")
             try:
                 self.prof.export_chrome_trace(fallback_path)
-                logger.info(f"[Profiler] Schedule never fired (training too short). Fallback trace → {fallback_path}")
+                logger.info(
+                    f"[Profiler] Schedule never fired (training too short). Fallback trace → {fallback_path}")
             except Exception as exc:
-                logger.warning(f"[Profiler] Could not export fallback trace: {exc}")
+                logger.warning(
+                    f"[Profiler] Could not export fallback trace: {exc}")
 
         if self.cfg.profile_export_stacks and self.cfg.profile_with_stack:
             self._export_stacks()
@@ -226,4 +229,3 @@ class TorchProfilerCallback(TrainerCallback):
 
         except Exception as exc:
             logger.warning(f"[Profiler] Could not log key averages: {exc}")
-

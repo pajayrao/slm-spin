@@ -7,6 +7,7 @@ from utils import *
 logging.basicConfig(**logging_kwargs)
 logger = logging.getLogger(__name__)
 
+
 class SPINDataset(Dataset):
     def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig, ref_logprobs=None):
         logger.info(f"SPINDataset.__init__() — pre-tokenizing {len(rows)} rows "
@@ -17,8 +18,10 @@ class SPINDataset(Dataset):
         rejected_lens = []
 
         for i, row in enumerate(rows):
-            c = tokenize_prompt_response(tokenizer, row["prompt"], row["response"], cfg)
-            r = tokenize_prompt_response(tokenizer, row["prompt"], row["synthetic_response"], cfg)
+            c = tokenize_prompt_response(
+                tokenizer, row["prompt"], row["response"], cfg)
+            r = tokenize_prompt_response(
+                tokenizer, row["prompt"], row["synthetic_response"], cfg)
             self.chosen.append(c)
             self.rejected.append(r)
             chosen_lens.append(len(c["input_ids"]))
@@ -34,8 +37,10 @@ class SPINDataset(Dataset):
         max_c = max(chosen_lens) if chosen_lens else 0
         max_r = max(rejected_lens) if rejected_lens else 0
         logger.info(f"SPINDataset ready: {len(self.chosen)} examples.")
-        logger.info(f"  Chosen  seq lengths — avg={avg_c:.1f}, max={max_c} tokens.")
-        logger.info(f"  Rejected seq lengths — avg={avg_r:.1f}, max={max_r} tokens.")
+        logger.info(
+            f"  Chosen  seq lengths — avg={avg_c:.1f}, max={max_c} tokens.")
+        logger.info(
+            f"  Rejected seq lengths — avg={avg_r:.1f}, max={max_r} tokens.")
         logger.info(f"  ref_logprobs attached: {ref_logprobs is not None} "
                     f"({'required for SPIN loss' if ref_logprobs is not None else 'absent — logprobs must come from batch'}).")
 

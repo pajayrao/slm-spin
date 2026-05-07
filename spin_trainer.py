@@ -32,16 +32,16 @@ class SPINTrainer(Trainer):
         # NOTE: Used by Trainer during *evaluation* (predict/evaluate), NOT during training.
         # Training uses training_step() below. If you change loss logic here, mirror it there.
 
-        chosen_input_ids      = inputs["chosen_input_ids"]
+        chosen_input_ids = inputs["chosen_input_ids"]
         chosen_attention_mask = inputs["chosen_attention_mask"]
-        chosen_labels         = inputs["chosen_labels"]
+        chosen_labels = inputs["chosen_labels"]
 
-        rejected_input_ids      = inputs["rejected_input_ids"]
+        rejected_input_ids = inputs["rejected_input_ids"]
         rejected_attention_mask = inputs["rejected_attention_mask"]
-        rejected_labels         = inputs["rejected_labels"]
+        rejected_labels = inputs["rejected_labels"]
 
-        bs          = chosen_input_ids.size(0)
-        chosen_len  = chosen_input_ids.size(1)
+        bs = chosen_input_ids.size(0)
+        chosen_len = chosen_input_ids.size(1)
         rejected_len = rejected_input_ids.size(1)
         logger.debug(
             f"compute_loss (eval) — batch_size={bs}, "
@@ -51,7 +51,8 @@ class SPINTrainer(Trainer):
 
         # π_θ(chosen|prompt): how likely the model under training assigns to human responses.
         logger.debug("compute_loss: forward pass → π_θ(chosen|prompt)...")
-        pi_chosen_logp = model_sequence_logprob(model, chosen_input_ids, chosen_attention_mask, chosen_labels)
+        pi_chosen_logp = model_sequence_logprob(
+            model, chosen_input_ids, chosen_attention_mask, chosen_labels)
         logger.debug(
             f"  π_θ(chosen): mean={pi_chosen_logp.mean().item():.4f}, "
             f"min={pi_chosen_logp.min().item():.4f}, max={pi_chosen_logp.max().item():.4f}"
@@ -59,15 +60,17 @@ class SPINTrainer(Trainer):
 
         # π_θ(rejected|prompt): how likely the model assigns to its own old (synthetic) responses.
         logger.debug("compute_loss: forward pass → π_θ(rejected|prompt)...")
-        pi_rejected_logp = model_sequence_logprob(model, rejected_input_ids, rejected_attention_mask, rejected_labels)
+        pi_rejected_logp = model_sequence_logprob(
+            model, rejected_input_ids, rejected_attention_mask, rejected_labels)
         logger.debug(
             f"  π_θ(rejected): mean={pi_rejected_logp.mean().item():.4f}, "
             f"min={pi_rejected_logp.min().item():.4f}, max={pi_rejected_logp.max().item():.4f}"
         )
 
         # Pre-scored under the frozen π_ref; loaded from the batch — no forward pass needed.
-        ref_chosen_logp  = inputs["ref_chosen_logp"].to(pi_chosen_logp.device)
-        ref_rejected_logp = inputs["ref_rejected_logp"].to(pi_rejected_logp.device)
+        ref_chosen_logp = inputs["ref_chosen_logp"].to(pi_chosen_logp.device)
+        ref_rejected_logp = inputs["ref_rejected_logp"].to(
+            pi_rejected_logp.device)
         logger.debug(
             f"  π_ref(chosen):   mean={ref_chosen_logp.mean().item():.4f} (pre-computed, no forward pass)"
         )
@@ -76,7 +79,7 @@ class SPINTrainer(Trainer):
         )
 
         # Advantage per side: how much the current model has shifted vs the reference.
-        chosen_adv   = (pi_chosen_logp   - ref_chosen_logp).mean().item()
+        chosen_adv = (pi_chosen_logp - ref_chosen_logp).mean().item()
         rejected_adv = (pi_rejected_logp - ref_rejected_logp).mean().item()
         logger.debug(
             f"  chosen advantage (π_θ − π_ref):   {chosen_adv:.4f}  "
@@ -88,7 +91,8 @@ class SPINTrainer(Trainer):
         )
 
         # SPIN margin: positive → model now prefers human responses more than π_ref did.
-        raw_margin = (pi_chosen_logp - ref_chosen_logp) - (pi_rejected_logp - ref_rejected_logp)
+        raw_margin = (pi_chosen_logp - ref_chosen_logp) - \
+            (pi_rejected_logp - ref_rejected_logp)
         margin = self.spin_lambda * raw_margin
         logger.debug(
             f"  raw margin (before λ): mean={raw_margin.mean().item():.4f}, "
@@ -145,8 +149,8 @@ class SPINTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        bs           = inputs["chosen_input_ids"].size(0)
-        chosen_len   = inputs["chosen_input_ids"].size(1)
+        bs = inputs["chosen_input_ids"].size(0)
+        chosen_len = inputs["chosen_input_ids"].size(1)
         rejected_len = inputs["rejected_input_ids"].size(1)
         dev = next(model.parameters()).device
 
@@ -155,7 +159,7 @@ class SPINTrainer(Trainer):
             f"chosen_len={chosen_len}, rejected_len={rejected_len}, device={dev}"
         )
 
-        ref_chosen_logp   = inputs["ref_chosen_logp"].to(dev)
+        ref_chosen_logp = inputs["ref_chosen_logp"].to(dev)
         ref_rejected_logp = inputs["ref_rejected_logp"].to(dev)
 
         logger.debug(
@@ -190,7 +194,7 @@ class SPINTrainer(Trainer):
         )
 
         # Advantage per side shows which direction the model is moving relative to π_ref.
-        chosen_adv   = (pi_chosen   - ref_chosen_logp)
+        chosen_adv = (pi_chosen - ref_chosen_logp)
         rejected_adv = (pi_rejected - ref_rejected_logp)
         logger.debug(
             f"  chosen advantage (π_θ−π_ref): mean={chosen_adv.mean().item():.4f} "
@@ -220,22 +224,23 @@ class SPINTrainer(Trainer):
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-        logger.debug(f"  loss ({self.loss_type}): {loss.item():.6f}. Running backward...")
+        logger.debug(
+            f"  loss ({self.loss_type}): {loss.item():.6f}. Running backward...")
         loss.backward()
         logger.debug("  Backward pass complete. Gradients accumulated.")
 
         # Detach all scalars before building log_data to avoid holding the graph.
-        win_rate          = (margin > 0).float().mean().detach().item()
-        margin_mean       = margin.mean().detach().item()
-        margin_std        = margin.std().detach().item() if margin.numel() > 1 else 0.0
-        loss_val          = loss.detach().item()
-        pi_chosen_mean    = pi_chosen.mean().detach().item()
-        pi_rej_mean       = pi_rejected.mean().detach().item()
-        ref_ch_mean       = ref_chosen_logp.mean().item()
-        ref_rej_mean      = ref_rejected_logp.mean().item()
-        chosen_adv_mean   = chosen_adv.mean().detach().item()
+        win_rate = (margin > 0).float().mean().detach().item()
+        margin_mean = margin.mean().detach().item()
+        margin_std = margin.std().detach().item() if margin.numel() > 1 else 0.0
+        loss_val = loss.detach().item()
+        pi_chosen_mean = pi_chosen.mean().detach().item()
+        pi_rej_mean = pi_rejected.mean().detach().item()
+        ref_ch_mean = ref_chosen_logp.mean().item()
+        ref_rej_mean = ref_rejected_logp.mean().item()
+        chosen_adv_mean = chosen_adv.mean().detach().item()
         rejected_adv_mean = rejected_adv.mean().detach().item()
-        kl_val            = (chosen_adv_mean + rejected_adv_mean) / 2.0
+        kl_val = (chosen_adv_mean + rejected_adv_mean) / 2.0
 
         log_data = {
             "loss":              loss_val,
@@ -278,7 +283,8 @@ class SPINTrainer(Trainer):
 class RMSPropSPINTrainer(SPINTrainer):
     def create_optimizer(self):
         if self.optimizer is None:
-            logger.info("RMSPropSPINTrainer.create_optimizer() — building RMSprop optimiser...")
+            logger.info(
+                "RMSPropSPINTrainer.create_optimizer() — building RMSprop optimiser...")
             decay_parameters = self.get_decay_parameter_names(self.model)
             decay_params = [
                 p for n, p in self.model.named_parameters()
@@ -304,7 +310,8 @@ class RMSPropSPINTrainer(SPINTrainer):
                 centered=False,
                 foreach=True,
             )
-            total_trainable = sum(p.numel() for p in decay_params + no_decay_params)
+            total_trainable = sum(p.numel()
+                                  for p in decay_params + no_decay_params)
             logger.info(f"  RMSprop created: lr={self.args.learning_rate:.2e}, alpha=0.99, eps=1e-8, "
                         f"foreach=True. Total trainable params: {total_trainable:,}.")
         return self.optimizer

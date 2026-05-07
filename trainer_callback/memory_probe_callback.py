@@ -44,12 +44,15 @@ class MemoryProbeCallback(TrainerCallback):
             return
         rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
         self.writer.add_scalar("system/cpu_rss_mb", rss_mb, step)
-        self.writer.add_scalar("system/gpu_alloc_mb",    torch.cuda.memory_allocated() / 1024 ** 2, step)
-        self.writer.add_scalar("system/gpu_reserved_mb", torch.cuda.memory_reserved()  / 1024 ** 2, step)
+        self.writer.add_scalar("system/gpu_alloc_mb",
+                               torch.cuda.memory_allocated() / 1024 ** 2, step)
+        self.writer.add_scalar("system/gpu_reserved_mb",
+                               torch.cuda.memory_reserved() / 1024 ** 2, step)
 
     def on_train_begin(self, _args, _state, _control, **_kwargs):
         """Capture baseline memory immediately before the first training step."""
-        logger.info(f"MemoryProbeCallback: started — logging every {self.log_every_n_steps} steps.")
+        logger.info(
+            f"MemoryProbeCallback: started — logging every {self.log_every_n_steps} steps.")
         self._write("train_begin", 0)
 
     def on_step_end(self, _args, state, _control, **_kwargs):
@@ -60,5 +63,6 @@ class MemoryProbeCallback(TrainerCallback):
 
     def on_train_end(self, _args, state, _control, **_kwargs):
         """Capture final memory snapshot after all training steps complete."""
-        logger.info(f"MemoryProbeCallback: training ended at step {state.global_step}.")
+        logger.info(
+            f"MemoryProbeCallback: training ended at step {state.global_step}.")
         self._write("train_end", state.global_step)

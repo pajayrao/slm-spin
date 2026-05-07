@@ -29,7 +29,7 @@ class SPINDataCollator:
             batch["ref_rejected_logp"] = torch.tensor(
                 [f["ref_rejected_logp"] for f in features], dtype=torch.float32)
 
-        chosen_len  = batch["chosen_input_ids"].shape[1]
+        chosen_len = batch["chosen_input_ids"].shape[1]
         rejected_len = batch["rejected_input_ids"].shape[1]
         logger.debug(
             f"SPINDataCollator: batch_size={len(features)}, "
