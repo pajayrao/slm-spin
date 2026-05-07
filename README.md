@@ -18,6 +18,7 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
    - [Utilities — utils.py](#utilities--utilspy)
    - [Callbacks — trainer_callback/](#callbacks--trainer_callback)
 5. [Evaluation — evaluate.py](#evaluation--evaluatepy)
+   - [Programmatic vs Standalone Usage](#programmatic-vs-standalone-usage)
    - [Benchmark Descriptions](#benchmark-descriptions)
    - [Scoring Strategy](#scoring-strategy)
    - [Per-Task Details](#per-task-details)
@@ -398,7 +399,10 @@ negative margins, which keeps gradients flowing even on nearly-aligned examples.
 
 ### Utilities — [utils.py](utils.py)
 
-`utils.py` provides all shared infrastructure:
+`utils.py` provides all shared infrastructure used by both `main.py` (training) and
+`evaluate.py` (evaluation). `evaluate.py` imports everything via `from utils import *`
+and delegates model loading, tokenisation, compilation, directory management, memory
+logging, and JSON I/O to the helpers defined here.
 
 **Model lifecycle:**
 - Loading `AutoModelForCausalLM` with the configured dtype and attention implementation.
@@ -468,39 +472,84 @@ Four callbacks augment training with observability:
 
 ## Evaluation — [evaluate.py](evaluate.py)
 
-`evaluate.py` is a self-contained benchmark harness that evaluates every trained
-checkpoint against six standard LLM benchmarks. It requires no `lm_eval` dependency —
-all scoring is implemented directly using HuggingFace `transformers`.
+`evaluate.py` is a benchmark harness that evaluates every trained checkpoint against
+five standard LLM benchmarks (GSM8k is included in the implementation but disabled by
+default — uncomment its line in `TASKS` to enable it). It requires no `lm_eval`
+dependency — all scoring is implemented directly using HuggingFace `transformers`.
+
+Model loading, tokeniser setup, compilation, memory management, and JSON output all
+delegate to the shared helpers in `utils.py` (imported via `from utils import *`):
+
+| utils.py function | Role in evaluate.py |
+|---|---|
+| `load_causal_lm(path, cfg, trainable=False)` | Load each checkpoint in frozen eval mode |
+| `load_tokenizer(cfg)` | Configure tokeniser (pad token, padding side) from checkpoint path |
+| `maybe_compile_model(model, cfg, label)` | `torch.compile()` the eval model with `fullgraph=False` |
+| `ensure_dir(path)` | Create output and TensorBoard directories |
+| `free_model(model)` | Delete model, run GC, empty CUDA cache between checkpoints |
+| `save_json(path, obj)` | Write per-iteration score files and the final summary |
+| `log_memory(tag)` | Log CPU/GPU memory before and after each model load/free |
+
+### Programmatic vs Standalone Usage
+
+**Standalone** (CLI):
+```bash
+python evaluate.py --checkpoints-dir ./spin_outputs/checkpoints
+```
+`main()` parses CLI flags (defaults derived from `SPINConfig()`), builds a config
+with `dataclasses.replace()`, and calls `run_eval(cfg)`.
+
+**Programmatic** (called from another script):
+```python
+from evaluate import run_eval
+run_eval(cfg)                                  # all iterations, all tasks
+run_eval(cfg, iters=["iter_2", "iter_4"])      # specific iterations
+run_eval(cfg, active_tasks=[...], n_shots={…}) # custom task subset / shot counts
+```
+
+All evaluation settings (`eval_output_dir`, `eval_batch_size`, `eval_limit`, etc.)
+come from `SPINConfig` fields — see [Configuration Reference](#configuration-reference).
 
 ### Overview Flow
 
 ```
-1. Discover iter_* checkpoint directories (sorted by numeric index)
-2. For each iteration:
-   a. Locate the HuggingFace model root inside the checkpoint dir
-   b. Load model + tokenizer (bfloat16, eval mode)
-   c. Optionally compile with torch.compile()
-   d. Run all six benchmarks → per-task scores
-   e. Compute delta vs the previous iteration
-   f. Track running best-average
-   g. Save per-iteration JSON, write TensorBoard row
-   h. Free model from GPU memory
-3. Print formatted comparison table to stdout
-4. Write comparative_summary.txt and comparative_summary.json
-5. Flush and close TensorBoard writer
+run_eval(cfg)
+├── ensure_dir(cfg.eval_output_dir)
+├── ensure_dir(cfg.eval_tensorboard_dir)
+├── Discover iter_* checkpoint directories (sorted by numeric index)
+└── For each iteration:
+    ├── [cache hit] load scores from iter_N.parsed.json
+    └── [cache miss]
+        ├── find_model_path() — probe candidate sub-dirs for config.json
+        ├── load_tokenizer(cfg with tokenizer_name_or_path=checkpoint_path)
+        ├── log_memory(before_load)
+        ├── load_causal_lm(path, cfg, trainable=False).to(cfg.device)
+        ├── log_memory(after_load)
+        ├── maybe_compile_model() with fullgraph=False (safe for model.generate)
+        ├── run_all_benchmarks() → per-task scores
+        ├── log_memory(before_free) → free_model() → log_memory(after_free)
+        └── save_json(iter_N.parsed.json, scores)
+    ├── Compute delta vs previous iteration
+    ├── Track running best-average
+    └── Write TensorBoard row
+├── Print formatted comparison table to stdout
+├── write_summary() → comparative_summary.txt
+├── save_json() → comparative_summary.json
+└── Close TensorBoard writer
 ```
 
 ### Benchmark Descriptions
 
-| Benchmark | Metric | Shots | What it tests |
-|---|---|---|---|
-| **ARC-Challenge** | acc_norm | 25 | Grade-school science questions selected to defeat retrieval and word-co-occurrence methods |
-| **TruthfulQA MC2** | mc2 | 0 | Whether the model outputs truthful statements; multiple correct answers per question |
-| **Winogrande** | acc | 5 | Commonsense pronoun/coreference resolution (large-scale Winograd schema) |
-| **GSM8k** | acc | 5 | Grade-school arithmetic word problems requiring multi-step chain-of-thought reasoning |
-| **HellaSwag** | acc_norm | 10 | Commonsense sentence completion; adversarially selected incorrect endings |
-| **MMLU** | acc | 5 | 57 academic subjects spanning humanities, STEM, social sciences, and professional domains |
+| Benchmark | Metric | Shots | What it tests | Active |
+|---|---|---|---|---|
+| **ARC-Challenge** | acc_norm | 25 | Grade-school science questions selected to defeat retrieval and word-co-occurrence methods | ✅ |
+| **TruthfulQA MC2** | mc2 | 0 | Whether the model outputs truthful statements; multiple correct answers per question | ✅ |
+| **Winogrande** | acc | 5 | Commonsense pronoun/coreference resolution (large-scale Winograd schema) | ✅ |
+| **HellaSwag** | acc_norm | 10 | Commonsense sentence completion; adversarially selected incorrect endings | ✅ |
+| **MMLU** | acc | 5 | 57 academic subjects spanning humanities, STEM, social sciences, and professional domains | ✅ |
+| **GSM8k** | acc | 5 | Grade-school arithmetic word problems requiring multi-step chain-of-thought reasoning | ⬜ disabled by default |
 
+GSM8k is implemented but commented out in the `TASKS` list — uncomment it to enable.
 Shot counts match the Open LLM Leaderboard v1 defaults so results are directly
 comparable to published numbers.
 
@@ -614,10 +663,12 @@ sub-directories inside each `iter_*` folder (`hf_final`, `final_checkpoint`,
 `adapter_config.json`. If none match it walks the entire subtree recursively. This
 handles all checkpoint layouts SPIN may produce.
 
-**Memory management:** Each checkpoint model is deleted and `torch.cuda.empty_cache()`
-is called immediately after its benchmarks complete. Loading and scoring a single
-checkpoint can require 4–16 GB depending on model size; freeing between iterations
-prevents OOM when evaluating many iterations.
+**Memory management:** `free_model()` (from utils.py) deletes the model reference, runs
+garbage collection, and empties the CUDA cache immediately after benchmarks complete.
+`log_memory()` records CPU RSS and GPU allocated/reserved memory before load and after
+free, so memory growth across iterations is visible in the log. Loading and scoring a
+single checkpoint can require 4–16 GB depending on model size; freeing between
+iterations prevents OOM when evaluating many checkpoints in sequence.
 
 **Delta tracking:** Per-task score differences between consecutive iterations are
 computed. `None` is returned for any task that failed in either iteration so that
@@ -726,24 +777,34 @@ list of `{"role": ..., "content": ...}` dicts.
 
 ### Running Evaluation
 
+All CLI defaults are derived from `SPINConfig()`, so they automatically align with the
+training output layout (`./spin_outputs/checkpoints`, `./spin_outputs/eval_results`,
+`./spin_outputs/tensorboard/eval_compare`).
+
 ```bash
-# Evaluate all iter_* checkpoints found in the default directory
+# Evaluate all iter_* checkpoints in the default directory (./spin_outputs/checkpoints)
 python evaluate.py
 
 # Evaluate a specific subset of iterations
 python evaluate.py --iters iter_0 iter_2 iter_4
 
-# Smoke test with 50 examples per task (do not use for real benchmarks)
+# Smoke test — limit examples per task (do NOT use for real benchmarks)
 python evaluate.py --limit 50
 
 # Override shot counts for specific tasks
 python evaluate.py --n-shots arc_challenge=10 gsm8k=3
+
+# Run only a subset of tasks
+python evaluate.py --tasks arc_challenge winogrande mmlu
 
 # Custom checkpoint and output directories
 python evaluate.py \
   --checkpoints-dir ./runs/my_run/checkpoints \
   --output-dir      ./runs/my_run/eval_results \
   --tensorboard-dir ./runs/my_run/tensorboard/eval
+
+# Skip already-evaluated iterations (default); force re-evaluation
+python evaluate.py --no-cache
 ```
 
 ---
@@ -771,8 +832,15 @@ All options live in [spin_config.py](spin_config.py). The most important ones:
 | `max_length` | `512` | Max tokens (prompt + response) during training |
 | `bf16` | `True` | bfloat16 mixed precision (Ampere+ GPU required) |
 | `gradient_checkpointing` | `False` | Recompute activations to save ~10× memory at ~33% compute cost |
-| `output_dir` | `./spin_outputs` | Root directory for all outputs |
-| `synthetic_examples_per_iteration` | *(ignored)* | Deprecated — the batched pipeline always iterates the full dataset |
+| `output_dir` | `./spin_outputs` | Root directory for all training outputs |
+| `eval_output_dir` | `./spin_outputs/eval_results` | Directory for per-iteration JSON score files and the comparative summary |
+| `eval_tensorboard_dir` | `./spin_outputs/tensorboard/eval_compare` | TensorBoard log directory for evaluation metrics |
+| `eval_limit` | `None` | Max examples per task during evaluation — `None` = full dataset; set a small integer for a smoke test |
+| `eval_batch_size` | `8` | GPU forward-pass batch size for log-likelihood scoring during evaluation |
+| `eval_max_seq_len` | `2048` | Maximum token length (context + continuation) fed to the model during evaluation |
+| `eval_gsm8k_max_new_tokens` | `256` | Maximum new tokens generated per response in the GSM8k benchmark |
+| `eval_no_cache` | `False` | Re-evaluate iterations even if a cached `.parsed.json` result exists |
+| `eval_run_after_training` | `True` | Automatically run benchmark evaluation after all training iterations complete |
 
 ### SPIN Loss
 
@@ -907,10 +975,10 @@ Available panels (depending on config flags):
 | File | Description |
 |------|-------------|
 | [main.py](main.py) | Entry point — outer SPIN loop, resume logic, orchestration |
-| [evaluate.py](evaluate.py) | Benchmark evaluation — six tasks, iteration comparison, TensorBoard logging |
-| [spin_config.py](spin_config.py) | `SPINConfig` dataclass — all hyperparameters with inline docs |
+| [evaluate.py](evaluate.py) | Benchmark evaluation — `run_eval(cfg)` drives five tasks, iteration-over-iteration comparison, and TensorBoard logging; delegates model loading, memory management, and I/O to utils.py |
+| [spin_config.py](spin_config.py) | `SPINConfig` dataclass — all training and evaluation hyperparameters with inline docs |
 | [spin_trainer.py](spin_trainer.py) | `SPINTrainer` and `RMSPropSPINTrainer` — loss computation and training step |
 | [spin_dataset.py](spin_dataset.py) | `SPINDataset` — pre-tokenises chosen/rejected pairs |
 | [spin_data_collator.py](spin_data_collator.py) | `SPINDataCollator` — pads and batches chosen/rejected tensors |
-| [utils.py](utils.py) | Model loading, tokenisation, generation, LoRA merge, arg parsing |
+| [utils.py](utils.py) | Shared infrastructure for training and evaluation: model loading, tokenisation, generation, LoRA merge, memory logging, directory/file helpers, arg parsing |
 | [trainer_callback/](trainer_callback/) | TensorBoard, profiler, memory probe, and iteration summary callbacks |

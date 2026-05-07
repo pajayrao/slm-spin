@@ -44,6 +44,8 @@ def load_tokenizer_and_data(cfg):
         split=cfg.train_split,
         data_path=cfg.data_path if cfg.data_path else None,
         limit=cfg.max_data_load if cfg.max_data_load > 0 else None,
+        prompt_field=cfg.prompt_field,
+        response_field=cfg.response_field,
     )
     # Materialise in fixed index order — no shuffling.
     base_rows = [base_ds[i] for i in range(len(base_ds))]
@@ -74,9 +76,9 @@ def _find_start_batch(cfg, iteration, total_batches):
     the resumption point.
     """
     for k in range(total_batches):
-        synth_ok = _file_valid(_synth_path(cfg, iteration, k))
-        logp_ok = _file_valid(_logprobs_path(cfg, iteration, k))
-        train_ok = os.path.exists(_batch_done_path(cfg, iteration, k))
+        synth_ok = file_valid(synth_path(cfg, iteration, k))
+        logp_ok = file_valid(logprobs_path(cfg, iteration, k))
+        train_ok = os.path.exists(batch_done_path(cfg, iteration, k))
         if not (synth_ok and logp_ok and train_ok):
             logger.info(
                 f"  First incomplete batch for iter_{iteration}: k={k} "
@@ -99,7 +101,7 @@ def _init_train_model(prev_model, cfg, iteration, start_batch):
             "  init_train_model: batch 0 — converting prev_model to trainable.")
         return make_trainable(prev_model, cfg)
 
-    last_dir = _batch_train_dir(cfg, iteration, start_batch - 1)
+    last_dir = batch_train_dir(cfg, iteration, start_batch - 1)
     logger.info(
         f"  init_train_model: resuming at batch {start_batch} — "
         f"loading base model from {last_dir}.")
@@ -115,8 +117,8 @@ def _step_synth(prev_model, tokenizer, chunk, cfg, iteration, k):
     exists.  prev_model is moved to GPU for generation then back to CPU so the
     GPU is free for the subsequent training step.
     """
-    path = _synth_path(cfg, iteration, k)
-    if _file_valid(path):
+    path = synth_path(cfg, iteration, k)
+    if file_valid(path):
         rows = load_jsonl(path)
         logger.info(
             f"    [1/3 SKIP] synth: {len(rows)} rows loaded from {path}")
@@ -141,8 +143,8 @@ def _step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k):
     Score (chosen, rejected) pairs under the frozen prev_model.  Skips if the
     output file already exists.  GPU management mirrors _step_synth.
     """
-    path = _logprobs_path(cfg, iteration, k)
-    if _file_valid(path):
+    path = logprobs_path(cfg, iteration, k)
+    if file_valid(path):
         lps = load_jsonl(path)
         logger.info(
             f"    [2/3 SKIP] logprobs: {len(lps)} rows loaded from {path}")
@@ -163,7 +165,7 @@ def _step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k):
 # ── Per-batch step 3: training ────────────────────────────────────────────────
 
 def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
-                iteration, k, total_batches, global_writer):
+                iteration, k, total_batches, summary_callback):
     """
     Train train_model on this batch's data.
 
@@ -181,8 +183,8 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
     Returns the merged (non-LoRA) model so the caller can call make_trainable()
     for the next batch without reloading from disk.
     """
-    batch_dir = _batch_train_dir(cfg, iteration, k)
-    done_path = _batch_done_path(cfg, iteration, k)
+    batch_dir = batch_train_dir(cfg, iteration, k)
+    done_path = batch_done_path(cfg, iteration, k)
     ensure_dir(batch_dir)
 
     if os.path.exists(done_path):
@@ -213,8 +215,15 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
             tokenizer=tokenizer,
             iteration=iteration,
         ),
-        MemoryProbeCallback(writer=global_writer),
+        MemoryProbeCallback(writer=summary_callback.writer),
+        TensorBoardParameterStatsCallback(
+            cfg=cfg,
+            run_name=f"iter_{iteration}_batch_{k:06d}",
+        ),
+        summary_callback,
     ]
+    if cfg.enable_profiler:
+        callbacks.append(TorchProfilerCallback(cfg=cfg, spin_iteration=iteration, tb_writer=summary_callback.writer))
 
     trainer_cls = RMSPropSPINTrainer if cfg.optimizer.lower() == "rmsprop" else SPINTrainer
     trainer = trainer_cls(
@@ -253,7 +262,7 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
 
 # ── Iteration orchestration ───────────────────────────────────────────────────
 
-def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, global_writer):
+def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, summary_callback):
     """
     Run one SPIN iteration by processing the full dataset in data_batch_size chunks.
 
@@ -281,13 +290,17 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, gl
         logger.info(
             f"  All batches already done for iter_{iteration} — nothing to process.")
     else:
+        summary_callback.set_iteration(
+            iteration,
+            spin_lambda=get_iteration_lambda(cfg, iteration),
+            dataset_size=len(base_rows),
+        )
         train_model = _init_train_model(
             prev_model, cfg, iteration, start_batch)
 
         for k in range(start_batch, total_batches):
             chunk = base_rows[k * B: (k + 1) * B]
             lo, hi = k * B, k * B + len(chunk) - 1
-            logger.info(f"")
             logger.info(
                 f"  ┌─ Batch {k + 1}/{total_batches}  "
                 f"(dataset rows {lo}–{hi}, {len(chunk)} rows) ─────────────")
@@ -298,7 +311,7 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, gl
                 prev_model, tokenizer, synth_rows, cfg, iteration, k)
             train_model = _step_train(
                 train_model, synth_rows, ref_lps, tokenizer, cfg,
-                iteration, k, total_batches, global_writer)
+                iteration, k, total_batches, summary_callback)
 
             logger.info(f"  └─ Batch {k + 1}/{total_batches} complete.")
 
@@ -314,11 +327,9 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, gl
         # ── Save final iteration model ─────────────────────────────────────────
         # The model from the last batch is already the merged base model.
         # Copy it to iter_dir so the next iteration's prev_model loads from there.
-        last_batch_dir = _batch_train_dir(cfg, iteration, total_batches - 1)
+        last_batch_dir = batch_train_dir(cfg, iteration, total_batches - 1)
         if last_batch_dir != iter_dir:
             logger.info(f"  Saving final iteration model to {iter_dir}...")
-            trainer_cls = RMSPropSPINTrainer if cfg.optimizer.lower() == "rmsprop" else SPINTrainer
-            # Use save_pretrained directly — no Trainer needed just for saving.
             train_model.save_pretrained(iter_dir)
 
         free_model(train_model)
@@ -359,8 +370,7 @@ def main():
     global_tb_dir = os.path.join(cfg.tensorboard_dir, "global")
     ensure_dir(global_tb_dir)
 
-    from torch.utils.tensorboard import SummaryWriter
-    global_writer = SummaryWriter(log_dir=global_tb_dir)
+    summary_callback = SPINIterationSummaryCallback(log_dir=global_tb_dir, cfg=cfg)
     logger.info(f"Global TensorBoard writer at: {global_tb_dir}")
 
     for iteration in range(start_iteration, cfg.num_iterations):
@@ -384,13 +394,13 @@ def main():
         log_memory(f"after_load_iter{iteration}")
 
         run_iteration(prev_model, tokenizer, base_rows, cfg,
-                      iteration, iter_dir, global_writer)
+                      iteration, iter_dir, summary_callback)
 
         free_model(prev_model)
         logger.info(
             f"╚══ SPIN ITERATION {iteration} COMPLETE ══════════════════════════════════╝")
 
-    global_writer.close()
+    summary_callback.close()
     logger.info("")
     logger.info(
         "╔══════════════════════════════════════════════════════════════╗")

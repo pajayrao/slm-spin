@@ -56,9 +56,6 @@ class SPINConfig:
     # When set, overrides dataset_name. Each record must contain prompt and response fields.
     data_path: Optional[str] = None
 
-    # Internal data handling mode. Currently only "sft" is used; kept for future extensions.
-    data_mode: str = "sft"
-
     # Name of the column in the dataset that contains the user prompt / instruction.
     prompt_field: str = "prompt"
 
@@ -107,7 +104,7 @@ class SPINConfig:
 
     # Number of prompts decoded in a single GPU batch during synthetic generation.
     # Reduce if generation causes OOM (each beam holds its own KV cache).
-    # Range: 1–64; for an 8 GB GPU with max_length=1024, start at 4.
+    # Range: 1–1024; for an 8 GB GPU with max_length=1024, start at 4.
     generation_batch_size: int = 512
 
     # Maximum number of new tokens the model may produce per response.
@@ -181,13 +178,8 @@ class SPINConfig:
     # loses at most one batch worth of GPU work.
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
-    # Range: 50–2000. Start at 200 and tune for your restart tolerance.
+    # Range: 50–10000. Start at 200 and tune for your restart tolerance.
     data_batch_size: int = 8192
-
-    # If True, synthetic rows from all previous iterations are included in the current
-    # training set (growing curriculum). If False, only the current iteration's synthetic
-    # data is used (fixed-size training set). True generally gives better convergence.
-    accumulate_previous_synthetic: bool = False
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -233,12 +225,12 @@ class SPINConfig:
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
     # Range: 1e-7–5e-6. Typical: 5e-7.
-    learning_rate: float = 5e-7
+    learning_rate: float = 5e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 1e-7
+    learning_rate_late: float = 1e-5
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
@@ -322,10 +314,6 @@ class SPINConfig:
     # "tensorboard" — logs to local TensorBoard files (no account required).
     # "none"        — disables all external logging.
     report_to: str = "tensorboard"
-
-    # Force all computation onto CPU. Use only for unit testing / debugging logic —
-    # a full training run on CPU is orders of magnitude slower than on GPU.
-    use_cpu = False,
 
     # Path to a DeepSpeed JSON configuration file for ZeRO-stage memory offloading.
     # None = DeepSpeed disabled. ZeRO-2/3 can enable training models larger than GPU memory
@@ -416,10 +404,6 @@ class SPINConfig:
     # and sampling. Change to run with different randomness while keeping everything else fixed.
     seed: int = 42
 
-    # If True, save each iteration's synthetic prompt/response pairs to a .jsonl file.
-    # Useful for inspecting generation quality and for resuming without re-generating.
-    save_synthetic_jsonl: bool = True
-
     # Directory where per-iteration synthetic JSONL files are saved.
     # One file per iteration: iter_0.jsonl, iter_1.jsonl, …
     synthetic_cache_dir: str = "./spin_outputs/synthetic"
@@ -433,10 +417,6 @@ class SPINConfig:
     # Point the TensorBoard server at this single directory:
     #   tensorboard --logdir ./spin_outputs/tensorboard
     tensorboard_dir: str = "./spin_outputs/tensorboard"
-
-    # When True, scan the current iteration's checkpoint directory for the latest checkpoint
-    # and resume training from it. Useful for recovering from crashes mid-iteration.
-    resume_from_checkpoint: bool = False
 
     # ── TensorBoard profiler ─────────────────────────────────────────────────
 
@@ -560,3 +540,40 @@ class SPINConfig:
     # Disabled by default: large transformer models are slow to trace and often produce
     # unreadable graphs. Enable only for small/debug models or architecture inspection.
     log_model_graph: bool = True
+
+    # ── Evaluation ───────────────────────────────────────────────────────────────
+
+    # Directory for per-iteration JSON eval results and the comparative summary.
+    # Relative to the same root as output_dir.
+    eval_output_dir: str = "./spin_outputs/eval_results"
+
+    # TensorBoard log directory for evaluation metrics (comparison across iterations).
+    eval_tensorboard_dir: str = "./spin_outputs/tensorboard/eval_compare"
+
+    # Max examples per task during evaluation (None = full dataset).
+    # Set to a small integer (e.g. 50) for a quick smoke test; leave None for real benchmarks.
+    eval_limit: Optional[int] = None
+
+    # Number of (context, continuation) rows per GPU forward pass during evaluation.
+    # Increase for larger GPUs or shorter sequences; decrease if OOM during eval.
+    # Range: 4–64. Default 8 is conservative for 8 GB GPUs.
+    eval_batch_size: int = 8
+
+    # Maximum total token length (context + continuation) fed to the model during evaluation.
+    # Sequences longer than this are truncated from the left.
+    eval_max_seq_len: int = 2048
+
+    # Maximum new tokens generated per response in the GSM8k benchmark (generation task).
+    eval_gsm8k_max_new_tokens: int = 256
+
+    # Allow HuggingFace datasets to execute remote code when loading benchmark datasets
+    # (e.g. Winogrande, HellaSwag). Required by most standard benchmark loaders.
+    eval_trust_remote_code_datasets: bool = True
+
+    # Re-evaluate iterations even if a cached JSON result already exists.
+    # False (default) = skip iterations that already have a .parsed.json result file.
+    eval_no_cache: bool = False
+
+    # Automatically run benchmark evaluation after all SPIN training iterations complete.
+    # Set to False to skip evaluation and run it separately with evaluate.py.
+    eval_run_after_training: bool = True

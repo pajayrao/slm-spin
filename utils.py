@@ -213,14 +213,24 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
     raise ValueError(f"Unknown chat_template_mode: {cfg.chat_template_mode}")
 
 
-def normalize_chat_dataset_record(example):
-    """Extract a (prompt, response) pair from a multi-turn chat dataset record.
+def normalize_chat_dataset_record(example, prompt_field="prompt", response_field="response"):
+    """Extract a (prompt, response) pair from a dataset record.
 
-    Reads the first user and first assistant turn from the 'messages' list,
-    tolerating common role-name variants (user/human, assistant/model/gpt/bot).
-    Returns None for records that lack a valid user→assistant exchange so they
-    can be silently skipped by the caller rather than causing downstream errors.
+    Tries two formats in order:
+      1. Flat fields — reads example[prompt_field] and example[response_field] directly.
+         Handles datasets that already have separate prompt and response columns.
+      2. Messages list — reads the first user/assistant turn from a 'messages' list,
+         tolerating common role-name variants (user/human, assistant/model/gpt/bot).
+
+    Returns None for records that yield no valid pair so they can be silently skipped.
     """
+    # Format 1: flat prompt/response fields (e.g. custom JSONL, Alpaca-style datasets).
+    flat_prompt   = example.get(prompt_field, "")
+    flat_response = example.get(response_field, "")
+    if flat_prompt and flat_response:
+        return {"prompt": str(flat_prompt).strip(), "response": str(flat_response).strip()}
+
+    # Format 2: multi-turn messages list (e.g. ShareGPT, UltraChat).
     messages = example.get("messages", [])
     if not messages or len(messages) < 2:
         return None
@@ -247,7 +257,8 @@ def normalize_chat_dataset_record(example):
     return {"prompt": user_prompt, "response": assistant_response}
 
 
-def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="train_sft", data_path=None, limit=None):
+def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="train_sft",
+                             data_path=None, limit=None, prompt_field="prompt", response_field="response"):
     """Load and normalize the base training dataset.
 
     Accepts either a HuggingFace Hub dataset (dataset_name + optional config +
@@ -282,7 +293,7 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
     skipped = 0
 
     for ex in ds:
-        item = normalize_chat_dataset_record(ex)
+        item = normalize_chat_dataset_record(ex, prompt_field=prompt_field, response_field=response_field)
         if item is None:
             skipped += 1
             continue
@@ -373,7 +384,7 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
         f"Loading causal LM from: {model_path} (trainable={trainable}, dtype={cfg.torch_dtype})")
     kwargs = dict(
         trust_remote_code=cfg.trust_remote_code,
-        dtype=str2dtype(cfg.torch_dtype),
+        torch_dtype=str2dtype(cfg.torch_dtype),
     )
     if cfg.attn_implementation:
         kwargs["attn_implementation"] = cfg.attn_implementation
@@ -932,23 +943,23 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
 # ── Per-batch file paths ──────────────────────────────────────────────────────
 
 
-def _synth_path(cfg, iteration, k):
+def synth_path(cfg, iteration, k):
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_synth.jsonl")
 
 
-def _logprobs_path(cfg, iteration, k):
+def logprobs_path(cfg, iteration, k):
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_logprobs.jsonl")
 
 
-def _batch_train_dir(cfg, iteration, k):
+def batch_train_dir(cfg, iteration, k):
     return os.path.join(cfg.checkpoints_dir, f"iter_{iteration}", f"batch_{k:06d}")
 
 
-def _batch_done_path(cfg, iteration, k):
-    return os.path.join(_batch_train_dir(cfg, iteration, k), ".done")
+def batch_done_path(cfg, iteration, k):
+    return os.path.join(batch_train_dir(cfg, iteration, k), ".done")
 
 
-def _file_valid(path):
+def file_valid(path):
     return os.path.exists(path) and os.path.getsize(path) > 0
