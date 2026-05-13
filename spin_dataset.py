@@ -11,6 +11,27 @@ logger = logging.getLogger(__name__)
 
 
 class SPINDataset(Dataset):
+    """PyTorch Dataset that pre-tokenizes chosen/rejected pairs for SPIN training.
+
+    On first construction the rows are tokenized and (optionally) saved to a .pt
+    cache file so subsequent runs with the same batch skip the tokenization step.
+
+    Example (__init__):
+        Input:  rows=[
+                    {"prompt": "What is Python?", "response": "Python is a language.",
+                     "synthetic_response": "Python is a scripting language..."},
+                    {"prompt": "Explain AI.", "response": "AI stands for Artificial Intelligence.",
+                     "synthetic_response": "AI is a computer science field..."},
+                ]
+                ref_logprobs=[
+                    {"ref_chosen_logp": -12.43, "ref_rejected_logp": -18.07},
+                    {"ref_chosen_logp":  -9.82, "ref_rejected_logp": -14.55},
+                ]
+                cache_path="output/synth_cache/iter_0_batch_000000_tokenized.pt"
+
+        Output: SPINDataset with len=2; self.chosen and self.rejected lists of tokenized dicts;
+                .pt cache written for faster restart; logs sequence length stats.
+    """
     def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig,
                  ref_logprobs=None, cache_path: Optional[str] = None):
         if cache_path and os.path.exists(cache_path):
@@ -62,9 +83,32 @@ class SPINDataset(Dataset):
                     f"({'required for SPIN loss' if ref_logprobs is not None else 'absent — logprobs must come from batch'}).")
 
     def __len__(self):
+        """Return the number of training examples in the dataset.
+
+        Example:
+            Input:  dataset constructed from 500 rows
+            Output: 500
+        """
         return len(self.chosen)
 
     def __getitem__(self, idx):
+        """Return the tokenized dict for example at index idx.
+
+        Example:
+            Input:  idx=0  (first example — "What is Python?")
+
+            Output: {
+                "chosen_input_ids":       [1, 1724, 338, 5132, 29973, 5132, 338, ...],  # prompt+human response
+                "chosen_attention_mask":  [1, 1, 1, 1, 1, 1, 1, ...],                  # all 1s (no padding)
+                "chosen_labels":          [-100, -100, -100, -100, -100, 5132, 338, ...], # prompt masked
+                "rejected_input_ids":     [1, 1724, 338, 5132, 29973, 5132, 338, ...],  # prompt+synthetic resp
+                "rejected_attention_mask":[1, 1, 1, 1, 1, 1, 1, ...],
+                "rejected_labels":        [-100, -100, -100, -100, -100, 5132, 338, ...],
+                "length":                 148,  # max(len(chosen_input_ids), len(rejected_input_ids))
+                "ref_chosen_logp":        -12.43,   # only present if ref_logprobs was provided
+                "ref_rejected_logp":      -18.07,
+            }
+        """
         chosen = self.chosen[idx]
         rejected = self.rejected[idx]
         item = {

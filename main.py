@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup(cfg):
+    """Create all required output directories, save the config snapshot, and fix the RNG seed.
+
+    Example:
+        Input:  cfg.output_dir="output/run1",
+                cfg.synthetic_cache_dir="output/run1/synth_cache",
+                cfg.checkpoints_dir="output/run1/checkpoints",
+                cfg.tensorboard_dir="output/run1/tensorboard",
+                cfg.enable_profiler=False,
+                cfg.seed=42
+
+        Output: directories "output/run1/", "output/run1/synth_cache/",
+                "output/run1/checkpoints/", "output/run1/tensorboard/" created;
+                "output/run1/config.json" written with full config dict;
+                RNG seed set to 42; returns None
+    """
     ensure_dir(cfg.output_dir)
     ensure_dir(cfg.synthetic_cache_dir)
     ensure_dir(cfg.checkpoints_dir)
@@ -37,6 +52,31 @@ def setup(cfg):
 
 
 def load_tokenizer_and_data(cfg):
+    """Load the tokenizer and the full base dataset, returning them as a (tokenizer, list) pair.
+
+    The dataset is materialised into a fixed-order Python list so the same rows
+    are presented to every SPIN iteration in a deterministic sequence regardless
+    of any HuggingFace caching or shuffle settings.
+
+    Example:
+        Input:  cfg.model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
+                cfg.dataset_name="HuggingFaceH4/ultrachat_200k",
+                cfg.dataset_config_name=None,
+                cfg.train_split="train_sft",
+                cfg.data_path=None,
+                cfg.max_data_load=5000,
+                cfg.prompt_field="prompt",
+                cfg.response_field="response"
+
+        Output: (
+            <LlamaTokenizer with pad_token=eos_token, truncation_side="left">,
+            [
+                {"prompt": "What is Python?",    "response": "Python is..."},
+                {"prompt": "Explain recursion.",  "response": "A function..."},
+                ...   # 5000 rows in deterministic order
+            ]
+        )
+    """
     tokenizer = load_tokenizer(cfg)
     base_ds = load_base_dataset_fixed(
         dataset_name=cfg.dataset_name if cfg.dataset_name else None,
@@ -57,7 +97,22 @@ def load_tokenizer_and_data(cfg):
 # ── Checkpoint cleanup ────────────────────────────────────────────────────────
 
 def _cleanup_trainer_checkpoints(directory: str):
-    """Delete HF Trainer checkpoint-N subdirs from a directory."""
+    """Delete HF Trainer checkpoint-N subdirs from a directory.
+
+    Example:
+        Input:  directory="output/checkpoints/iter_0/batch_000000"
+                Contents:
+                  output/checkpoints/iter_0/batch_000000/checkpoint-10/   ← HF mid-run checkpoint
+                  output/checkpoints/iter_0/batch_000000/checkpoint-20/   ← HF mid-run checkpoint
+                  output/checkpoints/iter_0/batch_000000/config.json      ← final merged model file
+
+        Output: checkpoint-10/ and checkpoint-20/ deleted;
+                config.json and other model files untouched;
+                returns None
+
+        Input:  directory="output/checkpoints/iter_0/batch_000000"  (no checkpoint-N dirs)
+        Output: None (no-op)
+    """
     if not os.path.isdir(directory):
         return
     for entry in os.scandir(directory):
@@ -69,11 +124,29 @@ def _cleanup_trainer_checkpoints(directory: str):
 # ── Batch resume detection ────────────────────────────────────────────────────
 
 def _find_start_batch(cfg, iteration, total_batches):
-    """
-    Return the index of the first batch where not all 3 steps are complete.
+    """Return the index of the first batch where not all 3 steps are complete.
+
     Complete = synth file valid AND logprobs file valid AND .done sentinel exists.
     Since batches are processed sequentially, the first incomplete batch is always
     the resumption point.
+
+    Example (resume after batch 1 crash):
+        Input:  iteration=0, total_batches=4
+                Disk state:
+                  iter_0_batch_000000_synth.jsonl  ← exists, non-empty
+                  iter_0_batch_000000_logprobs.jsonl ← exists, non-empty
+                  iter_0/batch_000000/.done         ← exists
+                  iter_0_batch_000001_synth.jsonl  ← exists, non-empty
+                  iter_0_batch_000001_logprobs.jsonl ← MISSING (crashed during step 2)
+        Output: 1  (batch 0 complete; batch 1 must restart from step 2)
+
+    Example (all batches done):
+        Input:  iteration=0, total_batches=3, all synth/logprobs/done files exist
+        Output: 3  (equal to total_batches → run_iteration skips all processing)
+
+    Example (fresh iteration, nothing cached):
+        Input:  iteration=1, total_batches=4, no files exist yet
+        Output: 0
     """
     for k in range(total_batches):
         synth_ok = file_valid(synth_path(cfg, iteration, k))
@@ -90,11 +163,25 @@ def _find_start_batch(cfg, iteration, total_batches):
 
 
 def _init_train_model(prev_model, cfg, iteration, start_batch):
-    """
-    Return the initial trainable model for this iteration.
+    """Return the initial trainable model for this iteration.
+
     - start_batch == 0: wrap prev_model with LoRA.
     - start_batch  > 0: load the merged model saved after batch start_batch-1,
                         then wrap with fresh LoRA adapters.
+
+    Example (fresh iteration, no batches done yet):
+        Input:  prev_model=<LlamaForCausalLM frozen, on CPU>,
+                cfg.use_lora=True, iteration=0, start_batch=0
+        Output: <PeftModel wrapping prev_model> with LoRA adapters attached,
+                in train mode, on CPU (caller moves to GPU before training)
+
+    Example (resuming mid-iteration at batch 3):
+        Input:  prev_model=<LlamaForCausalLM frozen>,
+                iteration=1, start_batch=3
+                (batch_train_dir for iteration=1, k=2 contains the merged model from batch 2)
+        Output: <PeftModel> wrapping the merged model loaded from
+                "output/checkpoints/iter_1/batch_000002/", with fresh LoRA adapters
+                (prev_model is NOT used — the newer merged checkpoint is loaded instead)
     """
     if start_batch == 0:
         logger.info(
@@ -112,10 +199,31 @@ def _init_train_model(prev_model, cfg, iteration, start_batch):
 # ── Per-batch step 1: synthetic generation ────────────────────────────────────
 
 def _step_synth(prev_model, tokenizer, chunk, cfg, iteration, k):
-    """
-    Generate synthetic responses for `chunk`.  Skips if the output file already
-    exists.  prev_model is moved to GPU for generation then back to CPU so the
-    GPU is free for the subsequent training step.
+    """Generate synthetic responses for `chunk`.
+
+    Skips if the output file already exists.  prev_model is moved to GPU for
+    generation then back to CPU so the GPU is free for the subsequent training step.
+
+    Example (cache miss — runs generation):
+        Input:  chunk=[
+                    {"prompt": "What is Python?",   "response": "Python is a language."},
+                    {"prompt": "Explain recursion.", "response": "A function calling itself."},
+                ]
+                iteration=0, k=0
+                (synth_path file does not exist yet)
+
+        Output: [
+            {"prompt": "What is Python?",   "response": "Python is a language.",
+             "synthetic_response": "Python is a general-purpose scripting language..."},
+            {"prompt": "Explain recursion.", "response": "A function calling itself.",
+             "synthetic_response": "Recursion is when a function invokes itself..."},
+        ]
+        Side effect: rows saved atomically to
+          "output/synth_cache/iter_0_batch_000000_synth.jsonl"
+
+    Example (cache hit — skips generation):
+        Input:  same arguments, but "iter_0_batch_000000_synth.jsonl" already exists with valid data
+        Output: same 2-row list loaded directly from disk; no model forward pass performed
     """
     path = synth_path(cfg, iteration, k)
     if file_valid(path):
@@ -139,9 +247,29 @@ def _step_synth(prev_model, tokenizer, chunk, cfg, iteration, k):
 # ── Per-batch step 2: ref logprob scoring ─────────────────────────────────────
 
 def _step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k):
-    """
-    Score (chosen, rejected) pairs under the frozen prev_model.  Skips if the
-    output file already exists.  GPU management mirrors _step_synth.
+    """Score (chosen, rejected) pairs under the frozen prev_model.
+
+    Skips if the output file already exists.  GPU management mirrors _step_synth.
+
+    Example (cache miss — runs scoring):
+        Input:  synth_rows=[
+                    {"prompt": "What is Python?", "response": "Python is a language.",
+                     "synthetic_response": "Python is a scripting language..."},
+                    {"prompt": "Explain recursion.", "response": "A function calling itself.",
+                     "synthetic_response": "Recursion is when a function invokes itself..."},
+                ]
+                iteration=0, k=0
+                (logprobs_path file does not exist yet)
+
+        Output: [
+            {"ref_chosen_logp": -12.43, "ref_rejected_logp": -18.07},
+            {"ref_chosen_logp":  -9.82, "ref_rejected_logp": -14.55},
+        ]
+        Side effect: saved to "output/synth_cache/iter_0_batch_000000_logprobs.jsonl"
+
+    Example (cache hit — skips scoring):
+        Input:  same arguments, but "iter_0_batch_000000_logprobs.jsonl" already exists
+        Output: same 2-row list loaded from disk; no model forward pass performed
     """
     path = logprobs_path(cfg, iteration, k)
     if file_valid(path):
@@ -166,8 +294,7 @@ def _step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k):
 
 def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
                 iteration, k, total_batches, summary_callback):
-    """
-    Train train_model on this batch's data.
+    """Train train_model on this batch's data.
 
     If .done already exists (batch was completed in a previous run), the merged
     model is loaded from disk and returned — the caller needs it to initialise
@@ -182,6 +309,27 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
 
     Returns the merged (non-LoRA) model so the caller can call make_trainable()
     for the next batch without reloading from disk.
+
+    Example (normal run, no prior checkpoint):
+        Input:  train_model=<PeftModel (LoRA) wrapping LlamaForCausalLM>,
+                synth_rows=<list of 500 rows with synthetic_response>,
+                ref_lps=<list of 500 dicts with ref_chosen_logp / ref_rejected_logp>,
+                iteration=0, k=0, total_batches=5
+
+        Processing:
+          1. SPINDataset tokenizes all 500 rows (or loads from .pt cache)
+          2. SPINTrainer trains for cfg.num_epochs_per_iteration epochs
+          3. LoRA adapters merged into base model
+          4. Merged model saved to "output/checkpoints/iter_0/batch_000000/"
+          5. ".done" sentinel written
+
+        Output: <LlamaForCausalLM> (plain, no PEFT wrapper) with updated weights
+                ready for make_trainable() to attach new LoRA adapters for batch 1
+
+    Example (batch already done — skip training):
+        Input:  same args, but "output/checkpoints/iter_0/batch_000000/.done" already exists
+        Output: <LlamaForCausalLM> loaded from "output/checkpoints/iter_0/batch_000000/"
+                (no training performed; just load-and-return for the caller's next batch init)
     """
     batch_dir = batch_train_dir(cfg, iteration, k)
     done_path = batch_done_path(cfg, iteration, k)
@@ -264,8 +412,7 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
 # ── Iteration orchestration ───────────────────────────────────────────────────
 
 def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, summary_callback):
-    """
-    Run one SPIN iteration by processing the full dataset in data_batch_size chunks.
+    """Run one SPIN iteration by processing the full dataset in data_batch_size chunks.
 
     Within each chunk (batch) the three steps run in order:
       1. Synthetic generation  — prev_model generates rejected responses.
@@ -277,6 +424,30 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, su
 
     At the end of the iteration the final merged model is copied to iter_dir
     and an iteration-level .done sentinel is written.
+
+    Example:
+        Input:  prev_model=<LlamaForCausalLM 1B, frozen, on CPU>  (π_prev from iter 0 checkpoint),
+                base_rows=<list of 1000 dicts with prompt/response>,
+                cfg.data_batch_size=200,
+                iteration=1,
+                iter_dir="output/checkpoints/iter_1"
+
+        Processing:
+          - total_batches = ceil(1000 / 200) = 5
+          - For each of the 5 batches (200 rows each):
+              step 1: generate synthetic_response for each row
+              step 2: score (chosen, rejected) under prev_model
+              step 3: train a LoRA-wrapped model on those 200 rows; merge; save
+          - Final merged model copied to "output/checkpoints/iter_1/"
+          - Tokenizer saved to "output/checkpoints/iter_1/"
+          - ".done" written to "output/checkpoints/iter_1/.done"
+
+        Output: None; side effects are the saved model files and .done sentinel.
+                The caller loads "output/checkpoints/iter_1" as π_prev for iteration 2.
+
+    Example (all batches already cached — full skip):
+        Input:  same args, but all synth/logprobs/.done files already exist for all 5 batches
+        Output: None; logs "All batches already done for iter_1"; only tokenizer re-saved
     """
     logger.info(f"=== run_iteration() — SPIN iteration {iteration} ===")
 

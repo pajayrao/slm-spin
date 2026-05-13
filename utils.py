@@ -41,6 +41,20 @@ def find_start_iteration(cfg) -> int:
     runs after trainer.save_model() — supports runs completed before .done was added.
     If neither file exists the iteration is treated as incomplete even if the dir
     was created by ensure_dir() before training started.
+
+    Example:
+        Input:  cfg.num_iterations=3, cfg.checkpoints_dir="output/checkpoints"
+                Directory state:
+                  output/checkpoints/iter_0/.done  ← exists
+                  output/checkpoints/iter_1/       ← exists but no .done or tokenizer_config.json
+                  output/checkpoints/iter_2/       ← does not exist
+        Output: 1  (iteration 0 is done; iteration 1 must be re-run)
+
+        Input:  cfg.num_iterations=3, no checkpoints present at all
+        Output: 0  (fresh run)
+
+        Input:  cfg.num_iterations=3, iter_0/.done and iter_1/.done both exist
+        Output: 2  (resume at the last incomplete iteration)
     """
     logger.info(
         "find_start_iteration() — scanning checkpoint dirs for the last completed iteration...")
@@ -68,6 +82,14 @@ def pre_start_cleanup():
     If a previous run was killed, those locks are never released and subsequent
     runs hang forever waiting to acquire them.  Deleting them at process start
     is safe because this process is the only one using this cache directory.
+
+    Example:
+        Input:  ~/.cache/huggingface/datasets/some_dataset/data.lock  ← stale file on disk
+        Output: file is deleted; function returns None and logs
+                "Removed stale lock: ~/.cache/huggingface/datasets/some_dataset/data.lock"
+
+        Input:  no .lock files present anywhere under ~/.cache/huggingface
+        Output: None (no-op, nothing logged)
     """
     hf_cache = os.path.expanduser("~/.cache/huggingface")
     for lock_file in glob.glob(os.path.join(hf_cache, "**", "*.lock"), recursive=True):
@@ -82,7 +104,16 @@ pre_start_cleanup()
 
 
 def ensure_dir(path: str):
-    """Create a directory (and all parents) if it does not already exist."""
+    """Create a directory (and all parents) if it does not already exist.
+
+    Example:
+        Input:  path="output/checkpoints/iter_0"  (no parents exist yet)
+        Output: directories "output/", "output/checkpoints/", and
+                "output/checkpoints/iter_0/" are all created; returns None
+
+        Input:  path="output/checkpoints/iter_0"  (directory already exists)
+        Output: None (no-op, no error raised)
+    """
     os.makedirs(path, exist_ok=True)
 
 
@@ -92,6 +123,17 @@ def log_memory(tag: str):
     Args:
         tag: A short label (e.g. "before_trainer_init") printed alongside the numbers
              so spikes can be correlated with specific code events in the log.
+
+    Example:
+        Input:  tag="before_trainer_init"
+                CPU RSS is 4200 MB, GPU allocated is 8192 MB, GPU reserved is 10240 MB
+        Output: logs "[MEM before_trainer_init] CPU RSS 4200 MB | GPU alloc 8192 MB | GPU reserved 10240 MB"
+                returns None
+
+        Input:  tag="after_load_iter0"  (no CUDA device available)
+                CPU RSS is 2048 MB
+        Output: logs "[MEM after_load_iter0] CPU RSS 2048 MB"
+                returns None
     """
     rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
 
@@ -111,6 +153,19 @@ def str2dtype(name: str):
     bfloat16 is preferred over float16 on CUDA because it preserves the same
     dynamic range as float32 while halving memory, avoiding the overflow/underflow
     issues that float16 can introduce during LLM training.
+
+    Example:
+        Input:  name="bfloat16"
+        Output: torch.bfloat16
+
+        Input:  name="FLOAT32"
+        Output: torch.float32
+
+        Input:  name="float16"
+        Output: torch.float16
+
+        Input:  name="int8"
+        Output: raises ValueError("Unsupported torch_dtype: int8")
     """
     name = name.lower()
     if name == "float16":
@@ -130,6 +185,25 @@ def parse_args() -> SPINConfig:
     exposes it as a CLI flag without touching this function.  Boolean fields
     are accepted as strings ("true"/"false"/"1"/"0") because argparse cannot
     natively handle bool defaults without ambiguity.
+
+    Example:
+        Input:  sys.argv = ["main.py",
+                            "--model_name_or_path", "meta-llama/Llama-3.2-1B-Instruct",
+                            "--data_path", "data/train.jsonl",
+                            "--num_iterations", "3",
+                            "--use_lora", "true",
+                            "--learning_rate", "5e-5"]
+        Output: SPINConfig(
+                    model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
+                    data_path="data/train.jsonl",
+                    num_iterations=3,
+                    use_lora=True,
+                    learning_rate=5e-05,
+                    ... (all other fields set to their defaults)
+                )
+
+        Input:  sys.argv = ["main.py"]  (no flags; all defaults)
+        Output: SPINConfig()  (fully populated with default values from the dataclass)
     """
     parser = argparse.ArgumentParser(description="SPIN training")
 
@@ -169,6 +243,32 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
       "auto"                 — use the tokenizer's built-in chat template when
                                available (covers LLaMA-3, Mistral, Phi-3, etc.),
                                falling back to instruction_response otherwise.
+
+    Example (mode="plain"):
+        Input:  user_prompt="What is the capital of France?", cfg.chat_template_mode="plain"
+        Output: "What is the capital of France?"
+
+    Example (mode="instruction_response"):
+        Input:  user_prompt="What is the capital of France?",
+                cfg.chat_template_mode="instruction_response",
+                cfg.instruction_prefix="### Instruction:\n",
+                cfg.response_prefix="\n### Response:\n"
+        Output: "### Instruction:\nWhat is the capital of France?\n### Response:\n"
+
+    Example (mode="auto", tokenizer has a chat template):
+        Input:  user_prompt="What is the capital of France?",
+                cfg.chat_template_mode="auto",
+                tokenizer is a LLaMA-3 tokenizer with a built-in chat template
+        Output: "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
+                 What is the capital of France?<|eot_id|>
+                 <|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    Example (mode="auto", tokenizer has NO chat template):
+        Input:  user_prompt="What is the capital of France?",
+                cfg.chat_template_mode="auto",
+                tokenizer.chat_template is None,
+                cfg.instruction_prefix="[INST] ", cfg.response_prefix=" [/INST]"
+        Output: "[INST] What is the capital of France? [/INST]"
     """
     if cfg.chat_template_mode == "plain":
         logger.debug(
@@ -223,6 +323,33 @@ def normalize_chat_dataset_record(example, prompt_field="prompt", response_field
          tolerating common role-name variants (user/human, assistant/model/gpt/bot).
 
     Returns None for records that yield no valid pair so they can be silently skipped.
+
+    Example (flat fields):
+        Input:  example={"prompt": "What is Python?", "response": "Python is a programming language."}
+                prompt_field="prompt", response_field="response"
+        Output: {"prompt": "What is Python?", "response": "Python is a programming language."}
+
+    Example (messages list, ShareGPT/UltraChat format):
+        Input:  example={"messages": [
+                    {"role": "user",      "content": "What is Python?"},
+                    {"role": "assistant", "content": "Python is a programming language."}
+                ]}
+        Output: {"prompt": "What is Python?", "response": "Python is a programming language."}
+
+    Example (messages list with alternate role names):
+        Input:  example={"messages": [
+                    {"role": "human", "content": "Explain recursion."},
+                    {"role": "gpt",   "content": "Recursion is when a function calls itself."}
+                ]}
+        Output: {"prompt": "Explain recursion.", "response": "Recursion is when a function calls itself."}
+
+    Example (missing response — skipped):
+        Input:  example={"prompt": "Hello", "response": ""}
+        Output: None  (empty response falls through to messages check; messages absent → None)
+
+    Example (single-turn messages list — skipped):
+        Input:  example={"messages": [{"role": "user", "content": "Hi"}]}
+        Output: None  (len(messages) < 2)
     """
     # Format 1: flat prompt/response fields (e.g. custom JSONL, Alpaca-style datasets).
     flat_prompt   = example.get(prompt_field, "")
@@ -269,6 +396,23 @@ def load_base_dataset_fixed(dataset_name=None, dataset_config_name=None, split="
 
     Returns an HFDataset with columns {"prompt": str, "response": str}.
     Raises ValueError if no valid pairs are found after filtering.
+
+    Example (local JSONL file):
+        Input:  data_path="data/train.jsonl"  (file contains 1200 records, 50 have empty responses)
+                limit=1000
+        Output: HFDataset with 1000 rows, columns=["prompt", "response"]
+                (stops early once 1000 valid pairs collected; logs "50 skipped")
+
+    Example (HuggingFace Hub):
+        Input:  dataset_name="HuggingFaceH4/ultrachat_200k",
+                dataset_config_name=None,
+                split="train_sft",
+                limit=5000
+        Output: HFDataset with 5000 rows, columns=["prompt", "response"]
+
+    Example (no valid pairs):
+        Input:  data_path="empty_dataset.jsonl"  (all records have blank responses)
+        Output: raises ValueError("No valid prompt/response pairs found.")
     """
     logger.info(
         "load_base_dataset_fixed() — loading and normalising training dataset...")
@@ -325,6 +469,20 @@ def load_tokenizer(cfg: SPINConfig):
     so padding doesn't trigger unknown-token errors), and forces left-side
     truncation so the response end (which carries the most training signal)
     is always preserved when sequences exceed max_length.
+
+    Example:
+        Input:  cfg.model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
+                cfg.tokenizer_name_or_path=None,
+                cfg.trust_remote_code=False,
+                cfg.truncation_side="left"
+        Output: AutoTokenizer instance where:
+                  tokenizer.vocab_size == 128256
+                  tokenizer.pad_token  == tokenizer.eos_token  ("<|eot_id|>")
+                  tokenizer.truncation_side == "left"
+                  tokenizer.padding_side    == "left"
+
+        Input:  cfg.tokenizer_name_or_path="my_custom_tokenizer/" (local path)
+        Output: AutoTokenizer loaded from that local path, same pad/truncation setup applied
     """
     tok_name = cfg.tokenizer_name_or_path or cfg.model_name_or_path
     logger.info(f"Loading tokenizer from: {tok_name}")
@@ -345,6 +503,21 @@ def maybe_compile_model(model, cfg: SPINConfig, label: str = "model"):
 
     Falls back gracefully when torch.compile is unavailable (PyTorch < 2.0) or
     when compilation fails, so the caller always gets a usable model back.
+
+    Example (compilation succeeds):
+        Input:  model=<LlamaForCausalLM>, label="train_model",
+                cfg.compile_backend="inductor", cfg.compile_mode="reduce-overhead",
+                cfg.compile_dynamic=False, cfg.compile_fullgraph=False
+        Output: <OptimizedModule wrapping LlamaForCausalLM>
+                (subsequent forward passes are kernel-fused and faster)
+
+    Example (PyTorch < 2.0, torch.compile not available):
+        Input:  model=<LlamaForCausalLM>, cfg as above
+        Output: original <LlamaForCausalLM> unchanged; logs a warning and returns the uncompiled model
+
+    Example (compilation fails due to unsupported op):
+        Input:  model=<CustomModel with unsupported op>, cfg.compile_fullgraph=True
+        Output: original model returned unchanged; logs a warning with the exception message
     """
     if not hasattr(torch, "compile"):
         logger.warning(
@@ -379,6 +552,22 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
     When trainable=True it is returned in train mode ready for make_trainable()
     to apply LoRA or enable full fine-tuning.  Gradient checkpointing is enabled
     here when requested so use_cache is disabled before any weights move to CUDA.
+
+    Example (frozen reference model):
+        Input:  model_path="output/checkpoints/iter_0",
+                cfg.torch_dtype="bfloat16", cfg.attn_implementation="flash_attention_2",
+                cfg.trust_remote_code=False, trainable=False
+        Output: LlamaForCausalLM loaded in bfloat16, eval mode,
+                all p.requires_grad=False, model.config.use_cache=True,
+                ~1B parameters (~2 GB VRAM in bfloat16)
+
+    Example (trainable model with gradient checkpointing):
+        Input:  model_path="meta-llama/Llama-3.2-1B-Instruct",
+                cfg.torch_dtype="bfloat16", cfg.gradient_checkpointing=True,
+                trainable=True
+        Output: LlamaForCausalLM in train mode,
+                gradient_checkpointing=True, model.config.use_cache=False,
+                ready for make_trainable() to attach LoRA adapters
     """
     logger.info(
         f"Loading causal LM from: {model_path} (trainable={trainable}, dtype={cfg.torch_dtype})")
@@ -420,7 +609,21 @@ def load_causal_lm(model_path: str, cfg: SPINConfig, trainable: bool = True):
 # -----------------------------
 
 def build_prompt_text(prompt: str, tokenizer, cfg: SPINConfig) -> str:
-    """Return the formatted prompt string (chat template applied, no response appended)."""
+    """Return the formatted prompt string (chat template applied, no response appended).
+
+    Example:
+        Input:  prompt="What is recursion?",
+                cfg.chat_template_mode="instruction_response",
+                cfg.instruction_prefix="### Instruction:\n",
+                cfg.response_prefix="\n### Response:\n"
+        Output: "### Instruction:\nWhat is recursion?\n### Response:\n"
+
+    Example (LLaMA-3 auto mode):
+        Input:  prompt="What is recursion?", cfg.chat_template_mode="auto",
+                tokenizer=LlamaTokenizer (has built-in chat template)
+        Output: "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
+                 What is recursion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    """
     return maybe_apply_chat_template(tokenizer, prompt, cfg)
 
 
@@ -429,6 +632,26 @@ def build_full_text(prompt: str, response: str, tokenizer, cfg: SPINConfig) -> s
 
     Appends eos_token when cfg.add_eos_to_response is True and the response
     doesn't already end with it, so the model learns to terminate cleanly.
+
+    Example (add_eos_to_response=True):
+        Input:  prompt="What is recursion?",
+                response="Recursion is when a function calls itself.",
+                cfg.chat_template_mode="plain",
+                cfg.add_eos_to_response=True,
+                tokenizer.eos_token="</s>"
+        Output: "What is recursion?Recursion is when a function calls itself.</s>"
+
+    Example (response already ends with eos):
+        Input:  prompt="What is recursion?",
+                response="Recursion is when a function calls itself.</s>",
+                cfg.add_eos_to_response=True,
+                tokenizer.eos_token="</s>"
+        Output: "What is recursion?Recursion is when a function calls itself.</s>"
+                (eos not appended twice)
+
+    Example (add_eos_to_response=False):
+        Input:  prompt="Hi", response="Hello there.", cfg.add_eos_to_response=False
+        Output: "HiHello there."
     """
     txt = build_prompt_text(prompt, tokenizer, cfg) + response
     if cfg.add_eos_to_response and tokenizer.eos_token and not txt.endswith(tokenizer.eos_token):
@@ -445,6 +668,32 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
     masked to -100 in `labels` so the loss is computed only over the response.
 
     Returns a dict with keys: input_ids, attention_mask, labels.
+
+    Example:
+        Input:  prompt="What is Python?",
+                response="Python is a high-level programming language.",
+                cfg.chat_template_mode="plain",
+                cfg.max_prompt_length=128, cfg.max_length=256,
+                cfg.add_eos_to_response=True, tokenizer.eos_token="</s>"
+
+        Suppose the tokenizer encodes:
+          prompt_text → [1, 1724, 338, 5132, 29973]           (5 tokens)
+          full_text   → [1, 1724, 338, 5132, 29973, 5132, ...]  (20 tokens total)
+
+        Output: {
+            "input_ids":      [1, 1724, 338, 5132, 29973, 5132, 338, 263, 1880, 29899,
+                               5563, 8720, 4086, 29889, 2],   # 20 tokens incl. </s>
+            "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                               1, 1, 1, 1, 1],                 # all 1s (no padding)
+            "labels":         [-100, -100, -100, -100, -100,   # 5 prompt tokens masked
+                               5132, 338, 263, 1880, 29899,    # response tokens active
+                               5563, 8720, 4086, 29889, 2]
+        }
+
+    Example (truncation — response is longer than max_length):
+        Input:  cfg.max_length=10, full_text tokenizes to 25 tokens
+        Output: input_ids truncated to the first 10 tokens from the right
+                (cfg.truncation_side="left" → prompt head dropped, response tail kept)
     """
     prompt_text = build_prompt_text(prompt, tokenizer, cfg)
     full_text = build_full_text(prompt, response, tokenizer, cfg)
@@ -493,6 +742,19 @@ def pad_to_max_len(seqs: List[List[int]], pad_value: int) -> torch.Tensor:
     """Right-pad a list of token-id lists to the length of the longest sequence.
 
     Returns a 2-D LongTensor of shape (batch, max_len).
+
+    Example:
+        Input:  seqs=[[1, 2, 3], [4, 5], [6]], pad_value=0
+        Output: tensor([[1, 2, 3],
+                        [4, 5, 0],
+                        [6, 0, 0]], dtype=torch.int64)
+                shape=(3, 3)
+
+    Example (label padding with -100):
+        Input:  seqs=[[-100, 10, 11], [-100, -100, 12, 13]], pad_value=-100
+        Output: tensor([[-100,   10,   11, -100],
+                        [-100, -100,   12,   13]], dtype=torch.int64)
+                shape=(2, 4)
     """
     max_len = max(len(x) for x in seqs)
     out = [x + [pad_value] * (max_len - len(x)) for x in seqs]
@@ -505,6 +767,27 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
     Applies the standard auto-regressive shift (predict token t from tokens 0..t-1),
     masks positions where labels == -100 (i.e. prompt tokens), and sums the
     remaining log-probs.  Returns a 1-D tensor of shape (batch,).
+
+    Example:
+        Input:  logits shape=(2, 5, 32000)   # batch=2, seq_len=5, vocab=32000
+                labels shape=(2, 5)
+                labels=tensor([[-100, -100,  42, 100,  7],
+                                [-100,  55,  99,   3, -100]])
+                (positions with -100 are prompt tokens; others are response tokens)
+
+        Processing:
+          - shift: logits[:,:-1,:] vs labels[:,1:]  → aligned for next-token prediction
+          - log_softmax applied over vocab dimension
+          - gather log-prob of the actual next token at each response position
+          - mask out prompt positions (label == -100)
+          - sum per sequence
+
+        Output: tensor([-4.8231, -3.1054])  # one scalar per sequence in the batch
+                (more negative = lower probability assigned to those response tokens)
+
+    Example (single sequence, all response tokens):
+        Input:  logits shape=(1, 4, 100), labels=tensor([[10, 20, 30, 40]])
+        Output: tensor([-2.4517])  # sum of log-probs for tokens 20, 30, 40 (shifted by 1)
     """
     batch, seq_len, vocab = logits.shape
     logger.debug(
@@ -544,6 +827,23 @@ def model_sequence_logprob(model, input_ids, attention_mask, labels):
 
     use_cache=False prevents KV-cache allocation during log-prob scoring, which
     is unnecessary (no generation) and wastes GPU memory.
+
+    Example:
+        Input:  model=<LlamaForCausalLM on cuda:0>,
+                input_ids     shape=(4, 128) dtype=torch.int64 on cuda:0,
+                attention_mask shape=(4, 128) dtype=torch.int64 on cuda:0,
+                labels        shape=(4, 128), first 20 positions per row are -100 (prompt mask)
+
+        Processing:
+          - model forward pass produces logits shape=(4, 128, 32000)
+          - sequence_logprob_from_logits sums log-probs over response positions
+
+        Output: tensor([-12.43, -9.87, -15.02, -11.56], device="cuda:0")
+                shape=(4,) — one scalar per sequence in the batch
+
+    Example (batch of 1, short sequence):
+        Input:  input_ids shape=(1, 10), labels=[[-100, -100, 5, 8, 12, 3, -100, -100, -100, -100]]
+        Output: tensor([-3.21], device=<same as input>)
     """
     batch, seq_len = input_ids.shape
     logger.debug(
@@ -578,6 +878,30 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
     attention_mask is used to slice off the prompt portion of each output sequence.
 
     Returns a list of dicts with keys: prompt, response (human), synthetic_response.
+
+    Example:
+        Input:  rows=[
+                    {"prompt": "What is Python?",    "response": "Python is a high-level language."},
+                    {"prompt": "Explain recursion.",  "response": "A function that calls itself."},
+                ]
+                cfg.generation_batch_size=2, cfg.generation_max_new_tokens=200,
+                cfg.generation_do_sample=True, cfg.generation_temperature=0.7
+
+        Output: [
+            {
+                "prompt":            "What is Python?",
+                "response":          "Python is a high-level language.",
+                "synthetic_response": "Python is a general-purpose scripting language used widely..."
+            },
+            {
+                "prompt":            "Explain recursion.",
+                "response":          "A function that calls itself.",
+                "synthetic_response": "Recursion refers to the process where a problem is solved..."
+            },
+        ]
+
+    Note: synthetic_response is the model's own generation — it will differ from
+    the human `response` and typically be lower quality early in training.
     """
     model.eval()
     out_rows = []
@@ -645,6 +969,23 @@ def get_iteration_lambda(cfg: SPINConfig, iteration: int) -> float:
     If cfg.final_iteration_lambda_only is set and this is the last iteration,
     returns cfg.lambda_final_iteration so a stronger regularisation can be applied
     on the final alignment pass without affecting earlier training dynamics.
+
+    Example (early iteration, lambda_initial used):
+        Input:  cfg.num_iterations=3, cfg.lambda_initial=0.1,
+                cfg.final_iteration_lambda_only=True, cfg.lambda_final_iteration=0.5,
+                iteration=1
+        Output: 0.1  (not the final iteration, so lambda_initial is used)
+
+    Example (final iteration, special lambda applied):
+        Input:  cfg.num_iterations=3, cfg.lambda_initial=0.1,
+                cfg.final_iteration_lambda_only=True, cfg.lambda_final_iteration=0.5,
+                iteration=2  (last iteration, 0-indexed)
+        Output: 0.5  (lambda_final_iteration used for the last alignment pass)
+
+    Example (final_iteration_lambda_only disabled):
+        Input:  cfg.num_iterations=3, cfg.lambda_initial=0.1,
+                cfg.final_iteration_lambda_only=False, iteration=2
+        Output: 0.1  (lambda_initial always used)
     """
     is_final = (iteration == cfg.num_iterations - 1)
     if cfg.final_iteration_lambda_only and cfg.lambda_final_iteration is not None and is_final:
@@ -665,6 +1006,20 @@ def get_iteration_lr(cfg: SPINConfig, iteration: int) -> float:
     and cfg.learning_rate_late once cfg.late_lr_start_iteration is reached.
     Useful for decaying LR in later iterations when the model is already close
     to alignment and smaller updates prevent overshooting.
+
+    Example (early phase):
+        Input:  cfg.learning_rate=5e-5, cfg.learning_rate_late=1e-5,
+                cfg.late_lr_start_iteration=2, iteration=0
+        Output: 5e-5  (iteration 0 < 2, early phase)
+
+    Example (late phase):
+        Input:  cfg.learning_rate=5e-5, cfg.learning_rate_late=1e-5,
+                cfg.late_lr_start_iteration=2, iteration=2
+        Output: 1e-5  (iteration 2 >= 2, late phase kicks in)
+
+    Example (no late-phase switch — late_lr_start_iteration very large):
+        Input:  cfg.learning_rate=5e-5, cfg.late_lr_start_iteration=999, iteration=5
+        Output: 5e-5
     """
     if iteration >= cfg.late_lr_start_iteration:
         lr = cfg.learning_rate_late
@@ -685,6 +1040,42 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
     consolidated tensorboard_dir rather than inside checkpoints/.
     report_to is set to [] when cfg.report_to == "none" to avoid HuggingFace
     trying to import optional logging integrations (wandb, mlflow, etc.).
+
+    Example:
+        Input:  cfg.num_epochs_per_iteration=1,
+                cfg.per_device_train_batch_size=2,
+                cfg.gradient_accumulation_steps=4,
+                cfg.weight_decay=0.01,
+                cfg.warmup_steps=50,
+                cfg.lr_scheduler_type="cosine",
+                cfg.logging_steps=10,
+                cfg.save_strategy="no",
+                cfg.save_total_limit=1,
+                cfg.bf16=True, cfg.fp16=False,
+                cfg.report_to="none",
+                cfg.gradient_checkpointing=True,
+                cfg.max_grad_norm=1.0,
+                cfg.deepspeed=None,
+                iteration_dir="output/checkpoints/iter_0/batch_000000",
+                learning_rate=5e-5,
+                logging_dir="output/tensorboard/iter_0/batch_000000"
+
+        Output: TrainingArguments(
+                    output_dir="output/checkpoints/iter_0/batch_000000",
+                    num_train_epochs=1,
+                    per_device_train_batch_size=2,
+                    gradient_accumulation_steps=4,   # effective batch = 2×4 = 8
+                    learning_rate=5e-05,
+                    weight_decay=0.01,
+                    warmup_steps=50,
+                    lr_scheduler_type="cosine",
+                    logging_steps=10,
+                    save_strategy="no",
+                    bf16=True, fp16=False,
+                    logging_dir="output/tensorboard/iter_0/batch_000000",
+                    report_to=[],  # "none" → empty list so wandb is not imported
+                    max_grad_norm=1.0,
+                )
     """
     eff_batch = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
     logger.info(
@@ -734,27 +1125,85 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
 
 
 def save_json(path: str, obj: Any):
-    """Serialise obj to a pretty-printed UTF-8 JSON file."""
+    """Serialise obj to a pretty-printed UTF-8 JSON file.
+
+    Example:
+        Input:  path="output/config.json",
+                obj={"model": "llama", "iterations": 3, "lr": 5e-5}
+        Output: file written at output/config.json with contents:
+                {
+                  "model": "llama",
+                  "iterations": 3,
+                  "lr": 5e-05
+                }
+                returns None
+    """
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
 def save_jsonl(path: str, rows: List[Dict[str, Any]]):
-    """Write a list of dicts to a UTF-8 JSONL file, one JSON object per line."""
+    """Write a list of dicts to a UTF-8 JSONL file, one JSON object per line.
+
+    Example:
+        Input:  path="cache/iter_0_batch_000000_synth.jsonl",
+                rows=[
+                    {"prompt": "What is Python?", "response": "A language.", "synthetic_response": "Python is..."},
+                    {"prompt": "Explain AI.",      "response": "AI is...",   "synthetic_response": "Artificial..."},
+                ]
+        Output: file written with two lines:
+                {"prompt": "What is Python?", "response": "A language.", "synthetic_response": "Python is..."}
+                {"prompt": "Explain AI.", "response": "AI is...", "synthetic_response": "Artificial..."}
+                returns None
+    """
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 def atomic_save_jsonl(path: str, rows: List[Dict[str, Any]]):
-    """Write to a .tmp file then atomically rename so a kill mid-write never leaves a corrupt cache."""
+    """Write to a .tmp file then atomically rename so a kill mid-write never leaves a corrupt cache.
+
+    Example:
+        Input:  path="cache/iter_0_batch_000000_synth.jsonl",
+                rows=[{"prompt": "Hi", "synthetic_response": "Hello there."}]
+
+        Processing:
+          1. Write rows to "cache/iter_0_batch_000000_synth.jsonl.tmp"
+          2. os.replace() atomically renames .tmp → .jsonl
+
+        Output: "cache/iter_0_batch_000000_synth.jsonl" exists with correct content;
+                no .tmp file remains; returns None.
+
+        If the process is killed during step 1: the .tmp file is incomplete or absent,
+        but the final .jsonl is either the previous valid version or absent —
+        never a half-written file.
+    """
     tmp = path + ".tmp"
     save_jsonl(tmp, rows)
     os.replace(tmp, path)
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    """Read a JSONL file and return its records as a list of dicts. Skips blank lines."""
+    """Read a JSONL file and return its records as a list of dicts. Skips blank lines.
+
+    Example:
+        Input:  path="cache/iter_0_batch_000000_synth.jsonl"
+                File contents:
+                  {"prompt": "What is Python?", "response": "A language.", "synthetic_response": "Python is..."}
+                  (blank line)
+                  {"prompt": "Explain AI.", "response": "AI is...", "synthetic_response": "Artificial..."}
+
+        Output: [
+            {"prompt": "What is Python?", "response": "A language.", "synthetic_response": "Python is..."},
+            {"prompt": "Explain AI.",      "response": "AI is...",   "synthetic_response": "Artificial..."},
+        ]
+
+    Example (logprobs file):
+        Input:  path="cache/iter_0_batch_000000_logprobs.jsonl"
+                File: {"ref_chosen_logp": -12.43, "ref_rejected_logp": -18.07}
+        Output: [{"ref_chosen_logp": -12.43, "ref_rejected_logp": -18.07}]
+    """
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -765,7 +1214,19 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
 
 
 def _log_trainable_parameters(model):
-    """Log the trainable vs total parameter count and the trainable percentage."""
+    """Log the trainable vs total parameter count and the trainable percentage.
+
+    Example:
+        Input:  model=<PeftModel wrapping LlamaForCausalLM 1B>
+                (LoRA r=16 added to q_proj, k_proj, v_proj, o_proj of 16 layers)
+        Output: logs "Trainable parameters: 8,388,608 / 1,236,862,976 (0.68%)"
+                returns None
+
+    Example:
+        Input:  model=<LlamaForCausalLM 1B> with all parameters trainable (full fine-tune)
+        Output: logs "Trainable parameters: 1,236,862,976 / 1,236,862,976 (100.00%)"
+                returns None
+    """
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     pct = 100.0 * trainable / total if total else 0.0
@@ -779,6 +1240,32 @@ def make_trainable(model, cfg: SPINConfig):
     With use_lora=True the base weights stay frozen; only the LoRA adapter
     parameters (a tiny fraction of the total) are made trainable.  This halves
     the memory needed for gradients and optimizer states compared to full fine-tuning.
+
+    Example (LoRA mode):
+        Input:  model=<LlamaForCausalLM 1B, all params frozen>,
+                cfg.use_lora=True, cfg.lora_r=16, cfg.lora_alpha=32,
+                cfg.lora_dropout=0.05,
+                cfg.lora_target_modules="q_proj,k_proj,v_proj,o_proj",
+                cfg.gradient_checkpointing=True
+
+        Output: <PeftModel wrapping LlamaForCausalLM>
+                - base LLaMA weights remain frozen (requires_grad=False)
+                - 8.4M LoRA adapter params have requires_grad=True (~0.68% of total)
+                - model.training=True
+                - gradient checkpointing enabled
+                - logs "Trainable parameters: 8,388,608 / 1,236,862,976 (0.68%)"
+
+    Example (full fine-tune mode):
+        Input:  model=<LlamaForCausalLM 1B, all params frozen>,
+                cfg.use_lora=False, cfg.gradient_checkpointing=False
+
+        Output: <LlamaForCausalLM> with all 1.2B params set to requires_grad=True,
+                model.training=True
+
+    Example (wrong lora_target_modules — auto-detection kicks in):
+        Input:  cfg.lora_target_modules="query,value" (GPT-2 style names on a LLaMA model)
+        Output: warning logged; auto-detects ["q_proj","k_proj","v_proj","o_proj"] for LLaMA
+                and continues without raising
     """
     logger.info(
         "make_trainable() — converting frozen π_prev into trainable π_θ...")
@@ -884,6 +1371,22 @@ def merge_lora_and_get_base(model, cfg: SPINConfig):
     Handles the case where the model was wrapped by torch.compile: the compiled
     wrapper stores the original module at ._orig_mod, which is unwrapped first so
     PeftModel.merge_and_unload() can operate on the underlying PEFT model.
+
+    Example (LoRA mode):
+        Input:  model=<PeftModel wrapping LlamaForCausalLM> (8.4M LoRA adapter params),
+                cfg.use_lora=True
+        Output: <LlamaForCausalLM> with LoRA deltas folded into the original weight matrices;
+                no longer a PeftModel — can be loaded with AutoModelForCausalLM.from_pretrained()
+                logs "LoRA adapters merged into base model weights."
+
+    Example (torch.compile wrapper):
+        Input:  model=<OptimizedModule._orig_mod=<PeftModel>>, cfg.use_lora=True
+        Output: compile wrapper unwrapped first, then LoRA merged;
+                returns plain <LlamaForCausalLM>
+
+    Example (full fine-tune, no LoRA):
+        Input:  model=<LlamaForCausalLM>, cfg.use_lora=False
+        Output: same <LlamaForCausalLM> returned unchanged (early return, no merge)
     """
     if not cfg.use_lora:
         return model
@@ -904,6 +1407,15 @@ def free_model(model):
     Called between SPIN iterations after trainer.save_model() completes.  Each
     checkpoint can be several GB; freeing before loading the next iteration's model
     prevents OOM when total GPU memory is close to the model size.
+
+    Example:
+        Input:  model=<LlamaForCausalLM 1B on cuda:0>  (~2 GB VRAM allocated)
+        Output: model deleted, gc.collect() run, torch.cuda.empty_cache() called;
+                VRAM drops from ~2 GB back to near-zero; returns None
+
+    Example (no CUDA available):
+        Input:  model=<LlamaForCausalLM on CPU>
+        Output: model deleted, gc.collect() run; no CUDA ops performed; returns None
     """
     try:
         del model
@@ -929,6 +1441,28 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
     padding positions carry label -100 so they are masked out of the log-prob sum.
 
     Returns a list of dicts with keys: ref_chosen_logp, ref_rejected_logp.
+
+    Example:
+        Input:  rows=[
+                    {
+                        "prompt": "What is Python?",
+                        "response": "Python is a high-level language.",
+                        "synthetic_response": "Python is a general-purpose scripting language..."
+                    },
+                    {
+                        "prompt": "Explain recursion.",
+                        "response": "A function that calls itself.",
+                        "synthetic_response": "Recursion is the process where a function..."
+                    },
+                ]
+                cfg.ref_logprob_batch_size=2
+
+        Output: [
+            {"ref_chosen_logp": -12.43, "ref_rejected_logp": -18.07},
+            {"ref_chosen_logp":  -9.82, "ref_rejected_logp": -14.55},
+        ]
+        (chosen human responses typically have higher log-prob than synthetic ones
+         under a good reference model, so ref_chosen_logp > ref_rejected_logp)
     """
     bs = cfg.ref_logprob_batch_size
     pad_id = tokenizer.pad_token_id
@@ -978,27 +1512,69 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
 
 
 def synth_path(cfg, iteration, k):
+    """Return the JSONL path for the synthetic responses of batch k in a given iteration.
+
+    Example:
+        Input:  cfg.synthetic_cache_dir="output/synth_cache", iteration=1, k=3
+        Output: "output/synth_cache/iter_1_batch_000003_synth.jsonl"
+    """
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_synth.jsonl")
 
 
 def logprobs_path(cfg, iteration, k):
+    """Return the JSONL path for the reference log-probs of batch k in a given iteration.
+
+    Example:
+        Input:  cfg.synthetic_cache_dir="output/synth_cache", iteration=0, k=0
+        Output: "output/synth_cache/iter_0_batch_000000_logprobs.jsonl"
+    """
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_logprobs.jsonl")
 
 
 def tokenized_path(cfg, iteration, k):
+    """Return the .pt cache path for pre-tokenized tensors of batch k in a given iteration.
+
+    Example:
+        Input:  cfg.synthetic_cache_dir="output/synth_cache", iteration=2, k=10
+        Output: "output/synth_cache/iter_2_batch_000010_tokenized.pt"
+    """
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_tokenized.pt")
 
 
 def batch_train_dir(cfg, iteration, k):
+    """Return the directory where the merged model is saved after training batch k.
+
+    Example:
+        Input:  cfg.checkpoints_dir="output/checkpoints", iteration=1, k=5
+        Output: "output/checkpoints/iter_1/batch_000005"
+    """
     return os.path.join(cfg.checkpoints_dir, f"iter_{iteration}", f"batch_{k:06d}")
 
 
 def batch_done_path(cfg, iteration, k):
+    """Return the path of the .done sentinel file that marks a fully completed training batch.
+
+    Example:
+        Input:  cfg.checkpoints_dir="output/checkpoints", iteration=0, k=2
+        Output: "output/checkpoints/iter_0/batch_000002/.done"
+    """
     return os.path.join(batch_train_dir(cfg, iteration, k), ".done")
 
 
 def file_valid(path):
+    """Return True if the file exists and is non-empty, False otherwise.
+
+    Example:
+        Input:  path="output/synth_cache/iter_0_batch_000000_synth.jsonl"  (exists, 4 KB)
+        Output: True
+
+        Input:  path="output/synth_cache/iter_0_batch_000000_synth.jsonl"  (does not exist)
+        Output: False
+
+        Input:  path="output/synth_cache/iter_0_batch_000000_synth.jsonl"  (exists but 0 bytes — corrupt write)
+        Output: False
+    """
     return os.path.exists(path) and os.path.getsize(path) > 0

@@ -36,26 +36,50 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
 
 ## What is SPIN?
 
-SPIN — **Self-Play Fine-Tuning** — is an alignment algorithm introduced in the paper
-*"Self-Play Fine-Tuning Converts Weak Language Models to Strong Language Models"*
-(Chen et al., 2024). The core insight is that a language model can improve itself
-**without any new human-labelled data** by playing a two-player game against its own
-previous version.
+SPIN — **Self-Play Fine-Tuning** — is a method for progressively aligning a language
+model using only the dataset it was originally trained on — **no new human labels, no
+reward model, no preference data.** It was introduced in *"Self-Play Fine-Tuning Converts
+Weak Language Models to Strong Language Models"* (Chen et al., 2024).
+
+**The problem it solves.** Standard supervised fine-tuning (SFT) teaches a model to
+assign high probability to human-written responses. But it does not explicitly teach
+the model to prefer those responses *over its own outputs*. A model trained with SFT
+might assign similarly high probability to the human response *and* to its own vague
+or repetitive completions of the same prompt — the training signal contains no contrast
+between good and bad outputs.
+
+**The SPIN mechanism** introduces that contrast through a four-step loop:
+
+1. Freeze a snapshot of the current model (the **opponent**, `π_prev`).
+2. Use `π_prev` to generate a **synthetic response** for every training prompt — these
+   become the *rejected* side of each training pair.
+3. Train the live model (`π_θ`) to assign higher log-probability to the **human**
+   response than to `π_prev`'s synthetic response — scored *relative* to where `π_prev`
+   started, so the model is rewarded for improving beyond its prior self.
+4. Save the trained `π_θ` as the new `π_prev` and repeat.
+
+Each round the synthetic responses become harder to beat because the opponent is
+stronger. This self-competition drives the model toward the human data distribution
+without ever requiring new annotations.
 
 ### The Game-Theoretic View
 
-SPIN frames language model alignment as a two-player zero-sum game:
+SPIN frames alignment as a **two-player zero-sum game**:
 
-- **The opponent** (`π_prev`, the *frozen* model from the last iteration) generates
-  synthetic responses to training prompts. Its goal is to produce completions that look
-  as good as the human responses in the training set.
-- **The main player** (`π_θ`, the *trainable* model) learns to discriminate between the
-  human responses and the opponent's synthetic completions. It wins by assigning higher
-  likelihood to human responses than to synthetic ones.
+- **The opponent** (`π_prev`, the *frozen* checkpoint from the previous iteration)
+  generates synthetic responses for every training prompt. Its "move" is to produce
+  completions that are as close to human quality as it can manage — making it hard for
+  `π_θ` to tell the synthetic from the real.
+- **The main player** (`π_θ`, the *trainable* model) does not debate `π_prev` in any
+  literal sense. Instead, gradient descent updates `π_θ` to assign *higher*
+  log-probability to the human response than to `π_prev`'s synthetic response — for
+  the same prompt. Each gradient step is a "move" by the main player. It "wins" a
+  training example when the human response scores higher than the synthetic by a
+  positive margin (see the margin formula below).
 
-Each iteration produces a stronger main player, which then becomes the opponent for the
-next iteration. This mirrors the self-play loop used to train AlphaGo, but applied to
-language model alignment.
+Each iteration the winning `π_θ` becomes the new frozen opponent, raising the bar for
+the next round. This mirrors the self-play loops used in game-playing agents like
+AlphaGo, applied here to language model alignment.
 
 ### The Mathematical Formulation
 
@@ -117,6 +141,282 @@ Training example (one row from the dataset):
 > recomputed live in the forward pass. This separation means only one model ever needs
 > to reside on the GPU during the training loop, keeping peak memory at roughly 1×
 > model size instead of 2×.
+
+> **What exactly are `ref_chosen_logp` and `ref_rejected_logp`?**
+> These two scalars are the **frozen baseline** — the log-probabilities `π_prev` assigns
+> to both responses *before any training happens in this iteration*. They answer: *"where
+> was the model before we updated it this round?"*
+>
+> - `ref_chosen_logp = log π_prev(y_human | x)` — how confidently the frozen reference
+>   model predicts the human response, token by token. A model that has been aligned for
+>   several iterations assigns a less negative value here because it already expects
+>   high-quality responses. This is **not the training target** — it is the starting line.
+>   `π_θ` is rewarded only for going *further* than this baseline, not merely reaching it.
+>
+> - `ref_rejected_logp = log π_prev(y_synthetic | x)` — how confidently the frozen model
+>   predicts its own generated output. Because `π_prev` produced `y_synthetic` by sampling
+>   from itself, it naturally assigns it relatively high probability. In early iterations,
+>   `ref_rejected_logp` can be close to (or even briefly exceed) `ref_chosen_logp` before
+>   alignment has taken hold.
+>
+> Subtracting these baselines is what separates SPIN from SFT. Without the subtraction,
+> the loss would just push `π_θ` to assign maximum absolute probability to `y_human` in
+> isolation — equivalent to SFT, which can cause mode collapse. By measuring *relative
+> improvement* (how much `π_θ` moved *beyond* `π_prev`'s starting point), the margin
+> penalises a model that inflates probability on both responses equally, and rewards one
+> that selectively improves on the human response more than the synthetic one.
+
+#### Data Flow — SPIN Iterations 0 and 1
+
+The diagrams below trace every computed value across two full SPIN outer iterations —
+where each number originates, what changes between iterations, and how the trained
+model is handed forward to the next round. Optimizer-step detail is included within
+each iteration to show how `π_θ`'s live log-probs shift during training while the
+reference values from disk remain fixed throughout.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SPIN ITERATION 0   (no prior checkpoint — base model plays both roles initially)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  π_prev = base model (frozen, on CPU)
+  π_θ    = exact copy of base model (LoRA adapters unlocked, on GPU)
+
+  TRAINING DATASET (fixed — same rows used in every iteration and every batch):
+    x       = "Explain the water cycle in simple terms."
+    y_human = "Water evaporates from oceans and lakes when heated by the sun..."
+
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 1 — Synthetic Generation   (π_prev = base model, moved to GPU)        │
+ │                                                                              │
+ │  For each prompt x in this data batch:                                       │
+ │    x  →  π_base.generate(do_sample=True, temp=0.9, top_p=0.95)              │
+ │        →  y_syn_0 = "The water cycle refers to the continuous movement..."   │
+ │                      ─────────────────────────────────────────────────────   │
+ │                      Weak output: base model is unaligned.                  │
+ │                      Generic phrasing, may restate the question,            │
+ │                      lacks the precision and structure of y_human.          │
+ │                                                                              │
+ │  Saved to disk (atomic write → rename):                                      │
+ │    iter_0_batch_k_synth.jsonl                                               │
+ │    {"prompt": x, "response": y_human, "synthetic_response": y_syn_0}        │
+ │                                                                              │
+ │  π_prev moved back to CPU.                                                  │
+ └──────────────────────────────────────────────────────────────────────────┬───┘
+                                                                            │
+                                                                            ▼
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 2 — Reference Scoring   (π_prev = base model, moved to GPU again)     │
+ │                                                                              │
+ │  Compute log-probability the base model assigns to each response:            │
+ │                                                                              │
+ │  ref_chosen_logp_0   = log π_base(y_human | x)    =  −145.3                │
+ │                         ─────────────────────────────────────────────────   │
+ │                         Sum of per-token log-probs over y_human given x.    │
+ │                         Large negative number — less negative = higher P.   │
+ │                         This is the BASE MODEL'S view of the human text.    │
+ │                                                                              │
+ │  ref_rejected_logp_0 = log π_base(y_syn_0 | x)   =  −148.7                │
+ │                         ───────────────────────────────────────────────     │
+ │                         The base model's log-prob for its OWN generation.   │
+ │                         More negative than ref_chosen_logp_0 → even the    │
+ │                         unaligned base model already ranks y_human higher.  │
+ │                         Chosen−rejected gap: −145.3 − (−148.7) = 3.4 nats. │
+ │                                                                              │
+ │  Saved to disk:                                                              │
+ │    iter_0_batch_k_logprobs.jsonl                                            │
+ │    {"ref_chosen_logp": −145.3, "ref_rejected_logp": −148.7}                 │
+ │                                                                              │
+ │  π_prev moved back to CPU. These scalars are now the FIXED ANCHOR           │
+ │  for all of Step 3 — they will not change until iteration 1.                │
+ └──────────────────────────────────────────────────────────────────────────┬───┘
+                                                                            │
+                                                                            ▼
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 3 — Training Loop   (π_θ on GPU; only 1 model on GPU at a time)       │
+ │                                                                              │
+ │  SPINTrainer.compute_loss() — called for every mini-batch:                  │
+ │                                                                              │
+ │  Loaded from disk (constant across ALL optimizer steps this iteration):     │
+ │    ref_chosen_logp_0   = −145.3  ◄── iter_0_batch_k_logprobs.jsonl         │
+ │    ref_rejected_logp_0 = −148.7  ◄── iter_0_batch_k_logprobs.jsonl         │
+ │                                                                              │
+ │  ─── Optimizer step 0  (π_θ weights are still an exact copy of π_prev) ─── │
+ │                                                                              │
+ │  Forward pass 1:  x ++ y_human →  π_θ [= base] → log_p = −145.3           │
+ │  Forward pass 2:  x ++ y_syn_0 →  π_θ [= base] → log_p = −148.7           │
+ │                                                                              │
+ │  RI_human = log π_θ(y_human|x) − ref_chosen_logp_0                         │
+ │           =       −145.3       −     (−145.3)       =   0.0                 │
+ │  RI_synth = log π_θ(y_syn_0|x) − ref_rejected_logp_0                       │
+ │           =       −148.7       −     (−148.7)       =   0.0                 │
+ │                                                                              │
+ │  margin = λ × (RI_human − RI_synth) = λ × (0.0 − 0.0) =   0.0             │
+ │  loss   = softplus(−0.0) = log(2) ≈ 0.693                                   │
+ │                                                                              │
+ │  loss.backward() → optimizer.step()                                         │
+ │  π_θ weights shift — it is no longer identical to the base model.           │
+ │                                                                              │
+ │  ─── Optimizer step 1  (π_θ weights have diverged from base model) ─────── │
+ │                                                                              │
+ │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −144.1          │
+ │                                                  ← shifted toward y_human   │
+ │  Forward pass 2:  x ++ y_syn_0 →  π_θ [updated] → log_p = −148.1          │
+ │                                                  ← mild incidental drift    │
+ │                                                                              │
+ │  RI_human = −144.1 − (−145.3) = +1.2   (π_θ now likes y_human 1.2 more)   │
+ │  RI_synth = −148.1 − (−148.7) = +0.6   (π_θ drifted slightly on y_syn_0)  │
+ │                                                                              │
+ │  margin = λ × (1.2 − 0.6) = λ × 0.6  > 0  ✓  model is aligning            │
+ │  loss   = softplus(−0.6λ)  < 0.693           (improving)                   │
+ │                                                                              │
+ │  loss.backward() → optimizer.step() → margin grows further with each step  │
+ │                                                                              │
+ │  … (repeats for num_epochs_per_iteration passes over this data batch) …     │
+ │                                                                              │
+ │  After all optimizer steps across all data batches:                         │
+ │  LoRA adapters merged into base weights → saved as checkpoints/iter_0/     │
+ └──────────────────────────────────────────────────────────────────────────┬───┘
+                                                                            │
+              ╔══════════════════════════════════════════════════════════╗  │
+              ║  CHECKPOINT HANDOFF                                      ║◄─┘
+              ║                                                          ║
+              ║  checkpoints/iter_0/ = trained π_θ                      ║
+              ║                                                          ║
+              ║  Weights have shifted toward y_human and away from the  ║
+              ║  weak synthetic outputs. This model is now better than  ║
+              ║  the base model at producing human-quality responses.    ║
+              ║                                                          ║
+              ║  Next: iter_0 checkpoint becomes π_prev for iteration 1 ║
+              ╚══════════════════════════════════════════════════════════╝
+                                          │
+                                          ▼
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SPIN ITERATION 1   (iter_0 checkpoint becomes the new frozen opponent)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  π_prev = checkpoints/iter_0/ (frozen, on CPU)
+  π_θ    = exact copy of iter_0 checkpoint (LoRA adapters unlocked, on GPU)
+
+  TRAINING DATASET: same x and y_human as iteration 0.
+  EVERYTHING ELSE (y_syn, ref log-probs, on-disk files) recomputed from scratch.
+
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 1 — Synthetic Generation   (π_prev = iter_0 model, moved to GPU)      │
+ │                                                                              │
+ │  Same prompt x, but a STRONGER model generates the synthetic response:       │
+ │    x  →  π_iter0.generate(do_sample=True, temp=0.9, top_p=0.95)             │
+ │        →  y_syn_1 = "When sunlight heats water bodies, molecules gain        │
+ │                      enough energy to escape as vapour, rising into..."      │
+ │                      ─────────────────────────────────────────────────────   │
+ │                      Stronger output: iter_0 model was already aligned once. │
+ │                      Better vocabulary, factual precision, logical structure. │
+ │                      y_syn_1 is harder to distinguish from y_human — the    │
+ │                      opponent is now a tougher competitor.                   │
+ │                                                                              │
+ │  Saved to disk:                                                              │
+ │    iter_1_batch_k_synth.jsonl                                               │
+ │    {"prompt": x, "response": y_human, "synthetic_response": y_syn_1}        │
+ │                                                                              │
+ │  π_prev moved back to CPU.                                                  │
+ └──────────────────────────────────────────────────────────────────────────┬───┘
+                                                                            │
+                                                                            ▼
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 2 — Reference Scoring   (π_prev = iter_0 model, moved to GPU again)   │
+ │                                                                              │
+ │  ref_chosen_logp_1   = log π_iter0(y_human | x)    =  −141.5               │
+ │                         ─────────────────────────────────────────────────   │
+ │                         LESS negative than iter_0's −145.3.                 │
+ │                         The iter_0 model assigns HIGHER probability to      │
+ │                         y_human than the base model did — alignment worked. │
+ │                         This value rises (becomes less negative) every      │
+ │                         iteration as the model gets closer to human text.   │
+ │                                                                              │
+ │  ref_rejected_logp_1 = log π_iter0(y_syn_1 | x)   =  −143.2               │
+ │                         ─────────────────────────────────────────────────   │
+ │                         LESS negative than iter_0's −148.7.                 │
+ │                         y_syn_1 is a stronger completion, so the iter_0    │
+ │                         model considers it more probable than the weak      │
+ │                         y_syn_0 was to the base model.                      │
+ │                                                                              │
+ │                         Chosen−rejected gap: −141.5 − (−143.2) = 1.7 nats  │
+ │                         vs. iteration 0 gap:                   = 3.4 nats   │
+ │                         ─────────────────────────────────────────────────   │
+ │                         Gap narrows each iteration. The synthetic is harder │
+ │                         to beat → training signal becomes subtler.          │
+ │                                                                              │
+ │  Saved to disk:                                                              │
+ │    iter_1_batch_k_logprobs.jsonl                                            │
+ │    {"ref_chosen_logp": −141.5, "ref_rejected_logp": −143.2}                 │
+ │                                                                              │
+ │  These scalars are the new FIXED ANCHOR for all of iter_1 Step 3.          │
+ └──────────────────────────────────────────────────────────────────────────┬───┘
+                                                                            │
+                                                                            ▼
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │  STEP 3 — Training Loop   (π_θ starts at iter_0 weights, not base weights)  │
+ │                                                                              │
+ │  Loaded from disk (constant throughout all iter_1 optimizer steps):         │
+ │    ref_chosen_logp_1   = −141.5  ◄── iter_1_batch_k_logprobs.jsonl         │
+ │    ref_rejected_logp_1 = −143.2  ◄── iter_1_batch_k_logprobs.jsonl         │
+ │                                                                              │
+ │  ─── Optimizer step 0  (π_θ weights are still identical to π_prev=iter_0) ─ │
+ │                                                                              │
+ │  Forward pass 1:  x ++ y_human →  π_θ [= iter_0] → log_p = −141.5         │
+ │  Forward pass 2:  x ++ y_syn_1 →  π_θ [= iter_0] → log_p = −143.2         │
+ │                                                                              │
+ │  RI_human = −141.5 − (−141.5) = 0.0                                         │
+ │  RI_synth = −143.2 − (−143.2) = 0.0                                         │
+ │  margin = 0.0  →  loss = log(2) ≈ 0.693  (same starting loss as iter_0)    │
+ │                                                                              │
+ │  loss.backward() → optimizer.step()                                         │
+ │  π_θ diverges from iter_0 π_prev.                                           │
+ │                                                                              │
+ │  ─── Optimizer step 1  (π_θ weights have moved) ─────────────────────────── │
+ │                                                                              │
+ │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −140.3          │
+ │  Forward pass 2:  x ++ y_syn_1 →  π_θ [updated] → log_p = −142.9          │
+ │                                                                              │
+ │  RI_human = −140.3 − (−141.5) = +1.2  (same improvement magnitude)         │
+ │  RI_synth = −142.9 − (−143.2) = +0.3  (smaller than iter_0's +0.6)         │
+ │                          ─────────────────────────────────────────────────  │
+ │                          y_syn_1 is tightly coupled to human quality →     │
+ │                          π_θ drifts on it less easily. The model cannot     │
+ │                          cheat by inflating both responses together.        │
+ │                                                                              │
+ │  margin = λ × (1.2 − 0.3) = λ × 0.9  > 0  ✓  (larger than iter_0's 0.6)  │
+ │  loss   = softplus(−0.9λ)  < softplus(−0.6λ)    (lower loss = better fit)  │
+ │                                                                              │
+ │  loss.backward() → optimizer.step() → margin continues to grow              │
+ │                                                                              │
+ │  After all optimizer steps across all data batches:                         │
+ │  LoRA adapters merged → saved as checkpoints/iter_1/                       │
+ └──────────────────────────────────────────────────────────────────────────────┘
+
+  checkpoints/iter_1/ is now closer to the human data distribution than iter_0/.
+  Next iteration: iter_1 becomes π_prev and the game gets harder still —
+  converging toward the Nash equilibrium where π_θ ≈ p_data.
+```
+
+**Cross-iteration value summary:**
+
+| Quantity | Iteration 0 | Iteration 1 | Trend |
+|---|---|---|---|
+| `π_prev` source | Base model | `checkpoints/iter_0/` | Gets stronger each round |
+| `y_synthetic` quality | Weak — generic, imprecise | Stronger — resembles `y_human` | Harder to beat each round |
+| `ref_chosen_logp` | −145.3 (base model's view) | −141.5 (iter_0's view) | Rises (less negative) each round |
+| `ref_rejected_logp` | −148.7 | −143.2 | Rises (less negative) each round |
+| Chosen − rejected gap | 3.4 nats | 1.7 nats | Narrows → subtler signal |
+| `π_θ` starting weights | Base model | iter_0 checkpoint | Stronger starting point |
+| `RI_synth` at opt step 1 | +0.6 | +0.3 | Harder to drift on synthetic |
+| `margin` at opt step 1 | λ × 0.6 | λ × 0.9 | Model improves more cleanly |
+
+The `_logprobs.jsonl` values (`ref_chosen_logp`, `ref_rejected_logp`) are the **fixed
+anchor** within each SPIN iteration — they never change across optimizer steps. They
+change only at iteration boundaries, when a new, stronger `π_prev` recomputes them
+from scratch against freshly generated synthetic responses.
 
 #### The Formula — Step by Step
 
@@ -238,6 +538,62 @@ last iteration) balances stability across early iterations with a decisive final
 
 The **loss** converts this margin to a scalar that is minimised by gradient descent.
 Four loss types are available (see [Loss Functions](#spin-loss) below).
+
+#### Margin Dynamics Over Time
+
+The margin operates on three timescales that behave differently:
+
+**Within a single SPIN iteration (optimizer steps 0 → N):**
+
+```
+  optimizer step 0  →  margin = 0.0    π_θ is still an exact copy of π_prev;
+                                        RI_human and RI_synth are both 0.0 by definition.
+  optimizer step 1  →  margin > 0      π_θ has started to prefer y_human over y_syn.
+  optimizer step N  →  margin >> 0     π_θ strongly and consistently prefers y_human.
+```
+
+Margin should **increase** during training. A flat or negative margin after several steps
+signals a problem: learning rate too low, λ too small, data batch too narrow, or the wrong
+loss type for this stage.
+
+**At iteration boundaries (iter i → iter i+1):**
+
+Margin **resets to 0** at the start of every new iteration. This is correct and expected:
+the new `π_prev` is the just-trained `π_θ`, so at step 0 they are identical — both RI
+values are 0 and the margin is 0. The model quality has improved; the margin score has not,
+because it measures improvement *relative to the current `π_prev`*, not in absolute terms.
+
+**At Nash equilibrium (the convergence target):**
+
+As the synthetic responses become indistinguishable from human responses, margin cannot
+grow past ≈ 0 even with many optimizer steps. The loss gradient vanishes — the model has
+matched the human data distribution and the training signal exhausts itself. This is the
+desired endpoint, not a failure mode.
+
+```
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  MARGIN OVER A FULL SPIN RUN  (schematic — not to scale)                    │
+  │                                                                              │
+  │  margin                                                                      │
+  │    ▲                                                                         │
+  │    │    iter 0              iter 1              iter 2  (convergence)        │
+  │    │   ╱‾‾‾‾‾╲            ╱‾‾‾‾‾‾╲            ╱‾‾‾‾‾                        │
+  │    │  ╱        ╲reset    ╱         ╲reset    ╱                               │
+  │  0 ├─●──────────●───────●───────────●───────●──────────────────────────     │
+  │    │  step 0 of  step 0  step 0 of   step 0  margin plateaus near 0;        │
+  │    │  iter 0     of      iter 1       of      gradient vanishes              │
+  │    │             iter 1               iter 2                                 │
+  │                                                                              │
+  │  ● = start of iteration (margin == 0; π_θ is a fresh copy of new π_prev)   │
+  └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Timescale | Expected behaviour | Warning sign |
+|---|---|---|
+| Within an iteration | Margin increases from 0 toward a positive plateau | Flat or negative after many steps |
+| Iteration boundary | Margin resets to 0 — always | Any non-zero starting margin indicates a bug |
+| Across iterations | Per-iteration final margin stays similar or improves; `win_rate` trends up | Falling `win_rate` across iterations |
+| At convergence | Margin cannot grow above ≈ 0 despite training | None — stop here |
 
 ### Why Does This Work?
 
