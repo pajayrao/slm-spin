@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "microsoft/harrier-oss-v1-270m"
+    model_name_or_path: str = "distilbert/distilgpt2"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -105,7 +105,7 @@ class SPINConfig:
     # Number of prompts decoded in a single GPU batch during synthetic generation.
     # Reduce if generation causes OOM (each beam holds its own KV cache).
     # Range: 1–1024; for an 8 GB GPU with max_length=1024, start at 4.
-    generation_batch_size: int = 512
+    generation_batch_size: int = 256
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -144,11 +144,10 @@ class SPINConfig:
     generation_use_cache: bool = True
 
     # Number of rows scored in a single forward pass during compute_ref_logprobs().
-    # The old default was 1 (row-by-row); batching gives roughly batch_size × speedup.
     # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
     # logits tensor = batch × seq_len × vocab_size.
     # even batch=8 allocates 8×512×256K×2B = 2 GB just for logits. For 8 GB GPUs, use 4–8.
-    ref_logprob_batch_size: int = 16
+    ref_logprob_batch_size: int = 64
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -170,7 +169,7 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 65536
+    max_data_load: int = 207865
 
     # Number of dataset rows processed as one atomic checkpoint unit during
     # synthetic generation and ref-logprob scoring. Each batch is saved to
@@ -179,7 +178,7 @@ class SPINConfig:
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
     # Range: 50–10000. Start at 200 and tune for your restart tolerance.
-    data_batch_size: int = 8192
+    data_batch_size: int = 65536
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -214,7 +213,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 16
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -390,13 +389,10 @@ class SPINConfig:
     lora_dropout: float = 0.05
 
     # Comma-separated list of nn.Linear layer name suffixes that receive LoRA adapters.
-    # The default covers all attention projections (q, k, v, o) and MLP projections
-    # (gate, up, down) used in LLaMA-style architectures.
-    # Adjust if using a model with differently named layers.
-    # Reduced to attention projections only (removed gate_proj,up_proj,down_proj).
-    # Attention LoRA is sufficient for alignment; skipping MLP projections reduces
-    # trainable params by ~43%, cutting backward compute and optimizer state accordingly.
-    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
+    # Default matches the default model (distilgpt2 / GPT-2 family: c_attn, c_proj).
+    # For LLaMA/Mistral/Qwen style models use: "q_proj,k_proj,v_proj,o_proj"
+    # make_trainable() will auto-detect the correct names if these aren't found in the model.
+    lora_target_modules: str = "c_attn,c_proj"
 
     # ── Misc ─────────────────────────────────────────────────────────────────
 

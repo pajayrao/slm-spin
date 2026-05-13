@@ -1,5 +1,7 @@
 import logging
-from typing import List, Dict
+import os
+import torch
+from typing import List, Dict, Optional
 from torch.utils.data import Dataset
 from spin_config import *
 from utils import *
@@ -9,26 +11,41 @@ logger = logging.getLogger(__name__)
 
 
 class SPINDataset(Dataset):
-    def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig, ref_logprobs=None):
-        logger.info(f"SPINDataset.__init__() — pre-tokenizing {len(rows)} rows "
-                    f"(max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length})...")
-        self.chosen = []
-        self.rejected = []
-        chosen_lens = []
-        rejected_lens = []
+    def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig,
+                 ref_logprobs=None, cache_path: Optional[str] = None):
+        if cache_path and os.path.exists(cache_path):
+            logger.info(f"SPINDataset.__init__() — loading tokenized cache from {cache_path}...")
+            cached = torch.load(cache_path, weights_only=False)
+            self.chosen = cached["chosen"]
+            self.rejected = cached["rejected"]
+            chosen_lens = [len(c["input_ids"]) for c in self.chosen]
+            rejected_lens = [len(r["input_ids"]) for r in self.rejected]
+        else:
+            logger.info(f"SPINDataset.__init__() — pre-tokenizing {len(rows)} rows "
+                        f"(max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length})...")
+            self.chosen = []
+            self.rejected = []
+            chosen_lens = []
+            rejected_lens = []
 
-        for i, row in enumerate(rows):
-            c = tokenize_prompt_response(
-                tokenizer, row["prompt"], row["response"], cfg)
-            r = tokenize_prompt_response(
-                tokenizer, row["prompt"], row["synthetic_response"], cfg)
-            self.chosen.append(c)
-            self.rejected.append(r)
-            chosen_lens.append(len(c["input_ids"]))
-            rejected_lens.append(len(r["input_ids"]))
+            for i, row in enumerate(rows):
+                c = tokenize_prompt_response(
+                    tokenizer, row["prompt"], row["response"], cfg)
+                r = tokenize_prompt_response(
+                    tokenizer, row["prompt"], row["synthetic_response"], cfg)
+                self.chosen.append(c)
+                self.rejected.append(r)
+                chosen_lens.append(len(c["input_ids"]))
+                rejected_lens.append(len(r["input_ids"]))
 
-            if (i + 1) % 2000 == 0:
-                logger.info(f"  Tokenised {i + 1}/{len(rows)} rows...")
+                if (i + 1) % 2000 == 0:
+                    logger.info(f"  Tokenised {i + 1}/{len(rows)} rows...")
+
+            if cache_path:
+                tmp = cache_path + ".tmp"
+                torch.save({"chosen": self.chosen, "rejected": self.rejected}, tmp)
+                os.replace(tmp, cache_path)
+                logger.info(f"  Tokenized data cached → {cache_path}")
 
         self.ref_logprobs = ref_logprobs
 

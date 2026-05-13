@@ -197,7 +197,8 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
         f"    [3/3 RUN ] train: {len(synth_rows)} rows, "
         f"batch {k + 1}/{total_batches}, iter {iteration}.")
 
-    dataset = SPINDataset(synth_rows, tokenizer, cfg, ref_logprobs=ref_lps)
+    tok_path = tokenized_path(cfg, iteration, k)
+    dataset = SPINDataset(synth_rows, tokenizer, cfg, ref_logprobs=ref_lps, cache_path=tok_path)
     collator = SPINDataCollator(tokenizer)
 
     spin_lambda = get_iteration_lambda(cfg, iteration)

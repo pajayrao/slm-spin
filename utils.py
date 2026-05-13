@@ -790,6 +790,40 @@ def make_trainable(model, cfg: SPINConfig):
 
     if cfg.use_lora:
         target_modules = cfg.lora_target_modules.split(",")
+
+        # Validate that target modules exist in this model; auto-detect if not.
+        model_linear_names = {
+            name.split(".")[-1]
+            for name, mod in model.named_modules()
+            if mod.__class__.__name__ in ("Linear", "Conv1D")
+        }
+        missing = [m for m in target_modules if m not in model_linear_names]
+        if missing:
+            # Well-known architecture fallbacks keyed by suffix sets present in the model.
+            _ARCH_TARGETS = [
+                ({"c_attn", "c_proj"}, ["c_attn", "c_proj"]),        # GPT-2 family
+                ({"q_proj", "v_proj"}, ["q_proj", "k_proj", "v_proj", "o_proj"]),  # LLaMA/Mistral
+                ({"query_key_value"}, ["query_key_value", "dense"]),  # Falcon/BLOOM
+                ({"Wqkv"}, ["Wqkv", "out_proj"]),                     # MPT
+            ]
+            detected = None
+            for required, modules in _ARCH_TARGETS:
+                if required.issubset(model_linear_names):
+                    detected = [m for m in modules if m in model_linear_names]
+                    break
+            if detected:
+                logger.warning(
+                    f"  lora_target_modules {target_modules} not found in model "
+                    f"(available linear layers: {sorted(model_linear_names)}). "
+                    f"Auto-detected targets for this architecture: {detected}")
+                target_modules = detected
+            else:
+                raise ValueError(
+                    f"lora_target_modules {target_modules} not found in model. "
+                    f"Available linear layer names: {sorted(model_linear_names)}. "
+                    f"Set lora_target_modules in your config to match your model architecture."
+                )
+
         logger.info(
             f"  LoRA mode: freezing all base weights, adding adapters to: {target_modules}")
         logger.info(f"  LoRA config: r={cfg.lora_r}, alpha={cfg.lora_alpha}, "
@@ -951,6 +985,11 @@ def synth_path(cfg, iteration, k):
 def logprobs_path(cfg, iteration, k):
     return os.path.join(cfg.synthetic_cache_dir,
                         f"iter_{iteration}_batch_{k:06d}_logprobs.jsonl")
+
+
+def tokenized_path(cfg, iteration, k):
+    return os.path.join(cfg.synthetic_cache_dir,
+                        f"iter_{iteration}_batch_{k:06d}_tokenized.pt")
 
 
 def batch_train_dir(cfg, iteration, k):

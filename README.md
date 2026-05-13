@@ -163,6 +163,9 @@ improved base — the base model accumulates improvements batch by batch.
 
 **Output:** `checkpoints/iter_{i}/batch_{k:06d}/` + `.done` sentinel
 
+A tokenized dataset cache is also written to `synthetic/iter_{i}_batch_{k:06d}_tokenized.pt`
+so that the `SPINDataset` construction cost is paid only once per batch (reused on resume).
+
 ### Dataset Order
 
 The full dataset is iterated in **fixed index order** — no shuffling. This ensures
@@ -252,6 +255,7 @@ trade-offs), RLHF or DPO with preference-labelled data is still superior.
 | `_step_synth(prev_model, tokenizer, chunk, cfg, iteration, k)` | Step 1 — generates and saves synth; skips if file exists |
 | `_step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k)` | Step 2 — scores and saves logprobs; skips if file exists |
 | `_step_train(train_model, synth_rows, ref_lps, tokenizer, cfg, ...)` | Step 3 — trains, merges LoRA, saves model, writes `.done`; skips if `.done` exists |
+| `_cleanup_trainer_checkpoints(directory)` | Deletes HF Trainer `checkpoint-N` subdirs after `save_model()` completes; the merged model supersedes them |
 
 **Memory management within an iteration:**
 - `π_prev` lives on CPU throughout the iteration, moving to GPU only for Steps 1–2
@@ -279,15 +283,16 @@ documentation describing its effect and recommended range. Key sections:
   stronger alignment push.
 - `loss_type` — `"logistic"` (smooth, never saturates, recommended), `"hinge"`,
   `"correlation"`, or `"exponential"`.
-- `accumulate_previous_synthetic` — growing curriculum mode.
 
 **LoRA:**
-- `use_lora=True`, `lora_r=16`, `lora_alpha=32` — LoRA adapters target attention
-  projections only (`q_proj,k_proj,v_proj,o_proj`). MLP projections are excluded to
-  reduce trainable parameter count by ~43%.
+- `use_lora=True`, `lora_r=16`, `lora_alpha=32` — default `lora_target_modules` is
+  `c_attn,c_proj` (GPT-2/TinyStories style). For LLaMA/Mistral/Phi/SmolLM models use
+  `q_proj,k_proj,v_proj,o_proj`. `make_trainable()` auto-detects the correct target
+  layers for all supported architectures when the configured names are not found in
+  the model — no manual override needed when switching between model families.
 
 **Two-phase learning rate:**
-- `learning_rate=5e-7` for early iterations, `learning_rate_late=1e-7` from
+- `learning_rate=5e-5` for early iterations, `learning_rate_late=1e-5` from
   `late_lr_start_iteration` onward. This allows a gentle step-down LR schedule across
   iterations without a per-step scheduler.
 
@@ -525,7 +530,7 @@ run_eval(cfg)
         ├── log_memory(before_load)
         ├── load_causal_lm(path, cfg, trainable=False).to(cfg.device)
         ├── log_memory(after_load)
-        ├── maybe_compile_model() with fullgraph=False (safe for model.generate)
+        ├── maybe_compile_model() with fullgraph=False, mode="default" (safe for model.generate)
         ├── run_all_benchmarks() → per-task scores
         ├── log_memory(before_free) → free_model() → log_memory(after_free)
         └── save_json(iter_N.parsed.json, scores)
@@ -574,11 +579,12 @@ the model sees exactly the tokens it would during free-form generation.
 truncated from the *left* of the context window, preserving the choice tokens intact —
 since those are the tokens being scored.
 
-**Batched scoring:** All choices for a given question are scored in a single forward
-pass (one pass per question, not one pass per choice). Sequences are left-padded to the
-batch maximum length so real tokens are right-aligned and attention patterns are valid.
-For a 4-choice task (ARC, HellaSwag, MMLU) this gives ~4× throughput vs one pass per
-choice.
+**Batched scoring:** `score_examples_batched()` amortises GPU kernel-launch overhead by
+packing `eval_batch_size` (context, continuation) sequences from *multiple questions* into
+a single forward pass — choices from different questions are batched together, not just
+choices from the same question. Sequences are left-padded to the batch maximum length so
+real tokens are right-aligned and attention patterns are valid. This gives higher GPU
+utilisation than one pass per question or per choice.
 
 **acc_norm (length normalisation):** Used for ARC-Challenge and HellaSwag. Before
 selecting the winning choice, each score is divided by the *character length* of the
@@ -751,17 +757,33 @@ PyTorch 2.11.
 
 ```bash
 python main.py \
-  --model_name_or_path microsoft/harrier-oss-v1-0.6b \
+  --model_name_or_path distilbert/distilgpt2 \
   --dataset_name HuggingFaceH4/ultrachat_200k \
   --train_split train_sft \
   --num_iterations 3 \
-  --data_batch_size 2048 \
-  --per_device_train_batch_size 2 \
-  --gradient_accumulation_steps 16 \
+  --data_batch_size 65536 \
+  --per_device_train_batch_size 16 \
+  --gradient_accumulation_steps 32 \
   --output_dir ./runs/my_run
 ```
 
 All `SPINConfig` fields are exposed as CLI flags — pass any field as `--field_name value`.
+
+### Tested and Planned Models
+
+This implementation is being systematically evaluated on the following models in size order:
+
+| Size | Model | Status |
+|------|-------|--------|
+| ~21 M | `roneneldan/TinyStories-1Layer-21M` | Planned |
+| ~33 M | `roneneldan/TinyStories-Instruct-33M` | Planned |
+| 82 M | `distilbert/distilgpt2` | **In progress** |
+| 135 M | `HuggingFaceTB/SmolLM2-135M` | Planned |
+| 270 M | `microsoft/harrier-oss-v1-270m` | 1/5 iterations complete |
+| 600 M | `microsoft/harrier-oss-v1-0.6b` | Planned |
+| 1.3 B | `microsoft/phi-1_5` | Planned |
+
+LoRA target modules are auto-detected per architecture — no config change needed when switching models.
 
 ### Local dataset
 
@@ -797,6 +819,9 @@ python evaluate.py --n-shots arc_challenge=10 gsm8k=3
 # Run only a subset of tasks
 python evaluate.py --tasks arc_challenge winogrande mmlu
 
+# Exclude specific tasks (complement of --tasks; mutually exclusive with it)
+python evaluate.py --skip-tasks hellaswag mmlu
+
 # Custom checkpoint and output directories
 python evaluate.py \
   --checkpoints-dir ./runs/my_run/checkpoints \
@@ -815,20 +840,20 @@ All options live in [spin_config.py](spin_config.py). The most important ones:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `model_name_or_path` | `microsoft/harrier-oss-v1-270m` | HuggingFace Hub ID or local checkpoint path |
+| `model_name_or_path` | `distilbert/distilgpt2` | HuggingFace Hub ID or local checkpoint path |
 | `dataset_name` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset (overridden by `data_path`) |
 | `num_iterations` | `5` | Number of SPIN outer loops |
-| `data_batch_size` | `16384` | Rows per checkpoint batch — each batch runs all 3 steps atomically; smaller = more frequent crash-recovery saves |
+| `data_batch_size` | `65536` | Rows per checkpoint batch — each batch runs all 3 steps atomically; smaller = more frequent crash-recovery saves |
 | `lambda_initial` | `0.1` | SPIN loss scale λ for all but the last iteration |
 | `lambda_final_iteration` | `5.0` | λ for the final iteration (stronger alignment push) |
 | `loss_type` | `logistic` | `logistic` \| `hinge` \| `correlation` \| `exponential` |
 | `use_lora` | `True` | Enable LoRA (strongly recommended on small GPUs) |
 | `lora_r` | `16` | LoRA rank |
 | `optimizer` | `rmsprop` | `rmsprop` (less memory) \| `adamw` |
-| `per_device_train_batch_size` | `8` | Reduce to `1` on an 8 GB GPU |
+| `per_device_train_batch_size` | `16` | Reduce to `1` on an 8 GB GPU |
 | `gradient_accumulation_steps` | `32` | Compensate for small batch size. Must satisfy `data_batch_size ≥ per_device_train_batch_size × gradient_accumulation_steps` |
-| `learning_rate` | `5e-7` | Peak LR for early iterations |
-| `learning_rate_late` | `1e-7` | LR from `late_lr_start_iteration` onward |
+| `learning_rate` | `5e-5` | Peak LR for early iterations |
+| `learning_rate_late` | `1e-5` | LR from `late_lr_start_iteration` onward |
 | `max_length` | `512` | Max tokens (prompt + response) during training |
 | `bf16` | `True` | bfloat16 mixed precision (Ampere+ GPU required) |
 | `gradient_checkpointing` | `False` | Recompute activations to save ~10× memory at ~33% compute cost |
@@ -880,10 +905,12 @@ synthetic one. The `loss_type` maps this margin to a scalar:
 spin_outputs/
 ├── config.json                           # Snapshot of SPINConfig for this run
 ├── synthetic/
-│   ├── iter_0_batch_000000_synth.jsonl   # Step 1 output: synthetic responses for batch 0
-│   ├── iter_0_batch_000000_logprobs.jsonl# Step 2 output: ref log-probs for batch 0
+│   ├── iter_0_batch_000000_synth.jsonl    # Step 1 output: synthetic responses for batch 0
+│   ├── iter_0_batch_000000_logprobs.jsonl # Step 2 output: ref log-probs for batch 0
+│   ├── iter_0_batch_000000_tokenized.pt   # Step 3 cache: pre-tokenized dataset for batch 0
 │   ├── iter_0_batch_000001_synth.jsonl
 │   ├── iter_0_batch_000001_logprobs.jsonl
+│   ├── iter_0_batch_000001_tokenized.pt
 │   └── ...
 ├── checkpoints/
 │   ├── iter_0/
