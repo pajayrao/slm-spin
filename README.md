@@ -134,37 +134,30 @@ Training example (one row from the dataset):
 | `log π_θ(y_human \| x)` | How likely is it that the **trainable** π_θ would produce the **human** response right now? | Forward pass 1 inside `SPINTrainer.compute_loss()` | **Step 3** — recomputed every mini-batch; gradients flow through this |
 | `log π_θ(y_synthetic \| x)` | How likely is it that the **trainable** π_θ would produce the **synthetic** response right now? | Forward pass 2 inside `SPINTrainer.compute_loss()` | **Step 3** — recomputed every mini-batch; gradients flow through this |
 
-> **Why are the `π_prev` values pre-stored but `π_θ` values recomputed live?**
-> `π_prev` is frozen — its weights never change within an iteration, so its outputs are
-> deterministic and only need to be computed once (Step 2). `π_θ` is actively being
-> updated by gradient descent, so its log-probs change after every step and must be
-> recomputed live in the forward pass. This separation means only one model ever needs
-> to reside on the GPU during the training loop, keeping peak memory at roughly 1×
-> model size instead of 2×.
 
-> **What exactly are `ref_chosen_logp` and `ref_rejected_logp`?**
-> These two scalars are the **frozen baseline** — the log-probabilities `π_prev` assigns
-> to both responses *before any training happens in this iteration*. They answer: *"where
-> was the model before we updated it this round?"*
->
-> - `ref_chosen_logp = log π_prev(y_human | x)` — how confidently the frozen reference
->   model predicts the human response, token by token. A model that has been aligned for
->   several iterations assigns a less negative value here because it already expects
->   high-quality responses. This is **not the training target** — it is the starting line.
->   `π_θ` is rewarded only for going *further* than this baseline, not merely reaching it.
->
-> - `ref_rejected_logp = log π_prev(y_synthetic | x)` — how confidently the frozen model
->   predicts its own generated output. Because `π_prev` produced `y_synthetic` by sampling
->   from itself, it naturally assigns it relatively high probability. In early iterations,
->   `ref_rejected_logp` can be close to (or even briefly exceed) `ref_chosen_logp` before
->   alignment has taken hold.
->
-> Subtracting these baselines is what separates SPIN from SFT. Without the subtraction,
-> the loss would just push `π_θ` to assign maximum absolute probability to `y_human` in
-> isolation — equivalent to SFT, which can cause mode collapse. By measuring *relative
-> improvement* (how much `π_θ` moved *beyond* `π_prev`'s starting point), the margin
-> penalises a model that inflates probability on both responses equally, and rewards one
-> that selectively improves on the human response more than the synthetic one.
+**`ref_chosen_logp` and `ref_rejected_logp`**
+These two scalars are the **frozen baseline** — the log-probabilities `π_prev` assigns
+to both responses *before any training happens in this iteration*. They answer: *"where
+was the model before we updated it this round?"*
+
+- `ref_chosen_logp = log π_prev(y_human | x)` — how confidently the frozen reference
+  model predicts the human response, token by token. A model that has been aligned for
+  several iterations assigns a less negative value here because it already expects
+  high-quality responses. This is **not the training target** — it is the starting line.
+  `π_θ` is rewarded only for going *further* than this baseline, not merely reaching it.
+
+- `ref_rejected_logp = log π_prev(y_synthetic | x)` — how confidently the frozen model
+  predicts its own generated output. Because `π_prev` produced `y_synthetic` by sampling
+  from itself, it naturally assigns it relatively high probability. In early iterations,
+  `ref_rejected_logp` can be close to (or even briefly exceed) `ref_chosen_logp` before
+  alignment has taken hold.
+
+Subtracting these baselines is what separates SPIN from SFT. Without the subtraction,
+the loss would just push `π_θ` to assign maximum absolute probability to `y_human` in
+isolation — equivalent to SFT, which can cause mode collapse. By measuring *relative
+improvement* (how much `π_θ` moved *beyond* `π_prev`'s starting point), the margin
+penalises a model that inflates probability on both responses equally, and rewards one
+that selectively improves on the human response more than the synthetic one.
 
 #### Data Flow — SPIN Iterations 0 and 1
 
@@ -732,6 +725,537 @@ SPIN does not use human preference rankings (A is better than B). It can only le
 from the single dimension of *human vs model* quality. For fine-grained preference
 alignment (e.g. teaching specific stylistic preferences, safety behaviour, or complex
 trade-offs), RLHF or DPO with preference-labelled data is still superior.
+
+### Other LLM Training Techniques
+
+The table below places SPIN within the broader landscape of techniques used to train
+and align language models. They are grouped by the type of signal they require.
+
+#### Overview
+
+| Technique | Signal required | Reward model? | Iterative? | Primary goal |
+|-----------|----------------|---------------|-----------|--------------|
+| **Pre-training** | Unlabelled text | No | No | General language modelling |
+| **Continued pre-training** | Domain text | No | No | Domain adaptation |
+| **SFT / Instruction tuning** | (prompt, response) pairs | No | No | Follow instructions |
+| **SPIN** *(this repo)* | Same SFT dataset | No | Yes | Close gap to human data |
+| **RLHF + PPO** | Human preference rankings | Yes | Yes | Fine-grained alignment |
+| **DPO** | Preference pairs (chosen > rejected) | No (implicit) | No | Preference alignment without RL |
+| **IPO** | Preference pairs | No | No | Avoid DPO overfitting |
+| **KTO** | Binary signals (good / bad) | No | No | Alignment from unpaired feedback |
+| **ORPO** | Preference pairs | No | No | Combined SFT + preference in one loss |
+| **SimPO** | Preference pairs | No | No | Reference-free preference optimisation |
+| **GRPO** | Verifiable rewards (math, code) | Optional | Yes | Reasoning via group-relative rewards |
+| **RLAIF** | AI-generated preference labels | No (AI critic) | Optional | Scalable alignment without human raters |
+| **Constitutional AI** | AI self-critique + revision | No | Yes | Safety and helpfulness via principles |
+| **Distillation** | Teacher model outputs | No | No | Compress larger model into smaller one |
+
+---
+
+#### Pre-training
+
+**What it does:** Pre-training teaches the model the statistical structure of human
+language by having it predict the next word in billions of sentences drawn from the
+internet, books, and code. The model starts with random weights and receives no
+human guidance — it simply sees a stream of text and is penalised whenever it assigns
+low probability to the actual next token. Over trillions of such predictions the model
+is forced to internalise grammar, facts, reasoning patterns, and writing styles in
+order to keep its error low. By the end, it can continue any text plausibly, but it
+has no concept of following instructions or behaving safely — it will equally
+fluently complete a recipe, a phishing email, or a calculus proof.
+
+The training signal is **next-token prediction** (also called causal language
+modelling). Given all previous tokens in a sequence, the model outputs a probability
+distribution over its vocabulary and is trained to assign maximum probability to the
+token that actually came next:
+
+```
+L_PT = − Σ_t log P(token_t | token_0…token_{t-1})
+```
+
+Pre-training is compute-intensive (thousands of GPU-days for 7B+ models) and requires
+no annotation. The result is a model that can continue text but has no instruction-
+following or safety behaviour. All subsequent techniques fine-tune a pre-trained base.
+
+---
+
+#### Continued Pre-training (CPT)
+
+**What it does:** A general-purpose base model has seen a little of everything but is
+not particularly expert at anything. CPT re-runs the same next-token-prediction
+training loop — without any new type of supervision — but feeds the model a curated
+corpus of domain-specific text (e.g. medical literature, legal contracts, Python
+repositories). Because the model already understands language, it converges quickly to
+the domain's vocabulary, conventions, and reasoning patterns. The result is a model
+that retains its general capabilities but produces far more accurate and idiomatic
+outputs within the target domain. CPT is almost always followed by SFT to add
+instruction-following behaviour.
+
+The training objective is identical to pre-training (next-token prediction); only the
+data distribution changes. A general base model is used as the starting point rather
+than random weights, so far fewer tokens are needed to achieve domain adaptation.
+
+---
+
+#### Supervised Fine-Tuning (SFT) and Instruction Tuning
+
+**What it does:** A pre-trained model can predict text but does not know how to answer
+questions, follow instructions, or behave helpfully. SFT bridges this gap by showing
+the model thousands of worked examples: a human writes a prompt and a high-quality
+response, and the model is trained to reproduce that response given the prompt. The
+loss function is still next-token prediction, but now it is computed only over the
+response tokens — the prompt tokens are masked out so the model learns to generate
+answers, not re-generate the question. After SFT the model has shifted from
+"continues any text" to "answers questions and follows instructions in the style of
+the training demonstrations".
+
+**Instruction tuning** is SFT applied specifically to instruction-following datasets
+(e.g. FLAN, Alpaca, UltraChat) — the mechanics are identical but the data is
+structured as `(instruction, response)` pairs covering diverse task types. The two
+terms are used interchangeably.
+
+The loss penalises the model for every token in the response where its predicted
+probability was not highest on the ground-truth token:
+
+```
+L_SFT = − Σ_t log P(token_t | prompt, response_tokens_0…t-1)
+```
+
+Only response positions contribute to the gradient (prompt positions are masked with
+`-100` in the labels tensor). This is the training regime implemented in
+[spin_dataset.py](spin_dataset.py) for the human-response side of each SPIN example.
+
+---
+
+#### RLHF + PPO
+
+**What it does:** SFT teaches the model to imitate demonstrations, but imitation has
+a ceiling — the model cannot learn to be *better than* the training examples, only to
+reproduce their style. RLHF breaks through that ceiling by letting the model explore
+freely and then rewarding it for outputs that humans actually prefer. Human raters
+compare pairs of responses (`A vs B`) and record which one is better. A separate
+**reward model** is trained on these rankings so it can score any new response with a
+single number. The **policy model** (the LLM being aligned) is then trained with
+Proximal Policy Optimization (PPO) — a reinforcement learning algorithm — to generate
+responses that maximise the reward model's score. A KL-divergence penalty keeps the
+policy from drifting so far from the SFT checkpoint that it produces incoherent text
+purely to fool the reward model (reward hacking).
+
+The result is a model that can optimise for subtle human preferences — tone, safety,
+helpfulness, refusal of harmful requests — that no fixed demonstration dataset could
+fully capture. GPT-4, Claude, and Gemini all use variants of this pipeline.
+
+Reinforcement Learning from Human Feedback, introduced by OpenAI (InstructGPT, 2022).
+The pipeline has three stages:
+
+1. **SFT** — fine-tune the base model on demonstration data to obtain a well-behaved
+   starting policy.
+2. **Reward model training** — collect human preference rankings (`A > B` for the same
+   prompt) and train a separate reward model `r(prompt, response) → scalar` that
+   learns to assign higher scores to responses humans prefer.
+3. **PPO** — use Proximal Policy Optimisation (an RL algorithm) to update the policy
+   model to maximise the reward model's score, subject to a KL-divergence penalty
+   against the SFT model to prevent reward hacking.
+
+```
+L_PPO = E[r(x, y)] − β · KL(π_θ || π_SFT)
+```
+
+The PPO clip ratio bounds how large a single policy update can be, trading off
+sample efficiency for stability. In practice RLHF training requires careful balancing
+of reward scale, KL weight β, and clip ratio — small misconfigurations produce
+incoherent or sycophantic outputs.
+
+**Advantages:** Can optimise for arbitrary reward signals; has produced the most
+aligned models to date (GPT-4, Claude, Gemini all use variants).
+
+**Disadvantages:** Requires a reward model (expensive to train), two models in memory
+during RL, is notoriously unstable (sensitive to PPO clip ratio, KL penalty β, and
+reward model quality), and prone to reward hacking if the reward model is imperfect.
+
+---
+
+#### DPO — Direct Preference Optimization
+
+**What it does:** DPO solves the same problem as RLHF — teaching the model to prefer
+better responses — but sidesteps the reward model and RL loop entirely. The key
+insight is that the optimal RLHF policy has a closed-form relationship to any reward
+function: if you know what policy RLHF would converge to, you can write the reward
+implicitly in terms of the policy's own log-probabilities. DPO substitutes this
+implicit reward into the preference-ranking loss (the Bradley-Terry model), simplifying
+everything into a single regression objective that trains the policy directly.
+
+In practice, you give the model a dataset of preference pairs — for the same prompt,
+a preferred response `y_w` and a dispreferred response `y_l`. DPO's loss increases the
+probability the model assigns to `y_w` relative to a frozen reference model, while
+simultaneously decreasing the probability it assigns to `y_l`. The frozen reference
+model (the SFT checkpoint) acts as an implicit KL penalty, preventing the model from
+drifting too far. No reward model is trained, no RL updates are performed, and only
+one model is needed in memory at training time (the reference model's log-probs can be
+pre-computed and stored, mirroring the approach used by SPIN).
+
+DPO (Rafailov et al., 2023) re-derives the RLHF objective in closed form, eliminating
+the need for a separate reward model or RL training loop. The optimal RLHF policy
+implies an implicit reward:
+
+```
+r*(x, y) = β · log [π*(y|x) / π_ref(y|x)] + β · log Z(x)
+```
+
+Substituting this into the Bradley-Terry preference model and simplifying yields the
+DPO loss directly in terms of the policy:
+
+```
+L_DPO = −log σ( β · [log π_θ(y_w|x) − log π_ref(y_w|x)]
+                   − β · [log π_θ(y_l|x) − log π_ref(y_l|x)] )
+```
+
+where `y_w` is the preferred (winning) response and `y_l` is the dispreferred
+(losing) response. A frozen reference model `π_ref` (the SFT checkpoint) anchors
+the KL penalty implicitly.
+
+**Relationship to SPIN:** The DPO loss and the SPIN logistic loss are structurally
+similar. The key differences are:
+
+| | DPO | SPIN |
+|---|---|---|
+| `y_l` source | Human-labelled dispreferred response | Model-generated synthetic response |
+| `y_w` source | Human-labelled preferred response | Ground-truth human response |
+| `π_ref` | Fixed SFT checkpoint (never updated) | Updated each iteration (`π_prev`) |
+| Iterative? | No — single training pass | Yes — multi-round |
+| Annotation | Requires preference pairs | Only requires SFT-style data |
+
+**Advantages over RLHF:** No reward model, no RL instability, single training stage.
+
+**Disadvantages:** Requires preference-labelled data (`A > B` pairs); performance is
+sensitive to the distribution of the reference model; can overfit to the preference
+format without generalising.
+
+---
+
+#### IPO — Identity Preference Optimization
+
+**What it does:** IPO is a direct fix for a specific failure mode in DPO. Once DPO
+has learned to separate `y_w` from `y_l` by a large margin, the sigmoid loss saturates
+— its gradient approaches zero — so the model stops receiving a meaningful training
+signal. Without gradient pressure, the model's weight updates become noisy and it may
+drift toward deterministic outputs (always outputting the single highest-probability
+token), which reduces diversity and causes it to fail on prompts that require nuanced
+or varied responses.
+
+IPO replaces DPO's saturating sigmoid loss with a squared-error loss that has a fixed
+target margin of `1/2β`. Regardless of how large the current margin already is, the
+squared-error term produces a non-zero gradient pushing the margin toward exactly the
+target — not toward infinity. This keeps training well-behaved throughout and prevents
+the model from collapsing to a near-deterministic policy.
+
+IPO (Azar et al., 2023) addresses an overfitting failure mode in DPO: because DPO
+uses a logistic (sigmoid) loss, the gradient approaches zero as the margin between
+`y_w` and `y_l` grows large. The model can assign near-infinite log-probability ratio
+to the preferred response while still minimising the loss — equivalent to deterministic
+mode collapse.
+
+IPO replaces the logistic loss with a squared-error loss that penalises any margin
+beyond 1/2:
+
+```
+L_IPO = ( [log π_θ(y_w|x)/π_ref(y_w|x)] − [log π_θ(y_l|x)/π_ref(y_l|x)] − 1/2β )²
+```
+
+This gives a non-vanishing gradient even when the model already separates the two
+responses well, preventing deterministic collapse.
+
+---
+
+#### KTO — Kahneman-Tversky Optimization
+
+**What it does:** DPO and its variants all require preference *pairs* — for every
+training example you need two responses to the same prompt and a label saying which is
+better. This means you cannot use datasets that contain only good examples (e.g. a
+curated answer corpus) or only bad examples (e.g. a toxicity dataset) independently.
+KTO removes this constraint by treating each response in isolation: every example is
+simply stamped `desirable` (the model should be more likely to produce this) or
+`undesirable` (the model should be less likely to produce this), with no pairing
+between them.
+
+The loss is shaped by Kahneman and Tversky's prospect theory from behavioural
+economics, which observes that humans feel losses more acutely than equivalent gains.
+KTO mirrors this asymmetry: it penalises the model more for moving toward undesirable
+outputs than it rewards it for moving toward desirable ones. A per-prompt KL term
+(computed against a reference batch from the training data) serves as a baseline,
+analogous to a value function in RL, so the model is rewarded or penalised relative
+to what it would normally produce for that prompt rather than in absolute terms.
+
+KTO (Ethayarajh et al., 2024) uses **unpaired binary signals**: each example is simply
+labelled `desirable` or `undesirable` independently, with no pairing required.
+
+```
+L_KTO = 1 − σ( z_ref(x) − β · KL(π_θ(y|x) || π_ref(y|x)) )   if y is desirable
+       1 − σ( β · KL(π_θ(y|x) || π_ref(y|x)) − z_ref(x) )     if y is undesirable
+```
+
+where `z_ref(x)` is a per-prompt baseline estimated from a reference batch.
+
+**Key advantage:** Works with unpaired positive-only or negative-only examples — any
+dataset where responses are tagged as good or bad, without needing a ranked pair.
+
+---
+
+#### ORPO — Odds Ratio Preference Optimization
+
+**What it does:** DPO requires a frozen reference model to anchor the KL penalty,
+which means you need either a second model in memory or pre-computed reference
+log-probabilities stored on disk. ORPO eliminates the reference model entirely by
+building the preference signal into the SFT loss itself.
+
+For each training example, ORPO runs a single forward pass that sees both the
+preferred response `y_w` and the dispreferred response `y_l`. Two terms are combined:
+a standard SFT cross-entropy loss that rewards the model for generating `y_w`, and an
+odds-ratio term that compares how many times more likely the model is to produce `y_w`
+versus `y_l`. Because the odds ratio is computed purely from the current model's
+outputs — with no reference to a frozen checkpoint — the model acts as its own
+implicit baseline. The higher the odds ratio, the smaller the loss; the loss is large
+when the model is nearly equally likely to produce either response.
+
+This design lets you train a base model directly to an instruction-following,
+preference-aligned state in a single stage, without first running a separate SFT
+phase.
+
+ORPO (Hong et al., 2024) formalises this as:
+
+```
+L_ORPO = L_SFT + λ · L_OR
+L_OR   = −log σ( log [odds_θ(y_w|x) / odds_θ(y_l|x)] )
+odds_θ(y|x) = P_θ(y|x) / (1 − P_θ(y|x))
+```
+
+The SFT term maximises log-probability on the preferred response; the odds-ratio term
+simultaneously penalises the dispreferred response — both computed from the same
+forward pass without a reference model.
+
+**Key advantage:** ~33% less memory than DPO (no reference model forward pass); trains
+in a single stage from the base model directly to an aligned model.
+
+---
+
+#### SimPO — Simple Preference Optimization
+
+**What it does:** SimPO starts from the same goal as DPO — push the model toward
+preferred responses and away from dispreferred ones — but removes two components that
+add complexity without consistently improving results: the frozen reference model and
+the KL penalty term.
+
+Without a reference model, SimPO scores each response by its average per-token
+log-probability under the current model: a response's total log-probability divided by
+its length. This length normalisation is crucial. DPO's raw log-probability sum is
+biased toward shorter responses, because every additional token in a long response
+adds another (negative) log-probability term to the sum — a shorter response
+trivially wins even if it is worse quality. By dividing by response length, SimPO
+makes the score comparable across responses of different lengths.
+
+A configurable target margin `γ` sets the minimum gap the model must maintain between
+its scores for `y_w` and `y_l` before the loss reaches zero. This margin acts like a
+confidence threshold: the model is not just penalised for getting the preference wrong,
+it is penalised until it has a clear, definitive preference — preventing shallow
+alignment where the preferred response barely edges out the dispreferred one.
+
+SimPO (Meng et al., 2024) formalises this as:
+
+```
+L_SimPO = −log σ( β/|y_w| · log π_θ(y_w|x) − β/|y_l| · log π_θ(y_l|x) − γ )
+```
+
+where `|y|` is the response length and `γ > 0` is a target margin.
+
+**Key advantages:** No reference model; no KL penalty divergence; competitive with
+DPO-family methods on instruction-following benchmarks at lower computational cost.
+
+---
+
+#### GRPO — Group Relative Policy Optimization
+
+**What it does:** For tasks like mathematics and programming, you do not need a human
+to say which of two answers is better — you can check automatically: does the code
+run? does the final answer equal the ground truth? GRPO exploits this by letting the
+model generate a *group* of `G` independent responses to the same prompt (typically
+8–16 samples), then scoring each one with a verifiable reward function. It uses the
+group's own statistics as the baseline: a response that scored above the group average
+is treated as a "win" and is reinforced; one that scored below the average is
+penalised. No human labels, no reward model, and no comparison between separate
+prompts are required.
+
+The training signal is computed entirely within each group. If six out of eight
+sampled responses solved the problem correctly and two did not, the two failures
+receive a negative advantage (pushed away from) and the six successes receive a
+positive advantage (pushed toward). A KL penalty against a reference model prevents
+the policy from collapsing to deterministic output by always sampling the same
+response — diversity within the group is essential for the training signal to exist.
+
+GRPO also naturally trains the model to produce chain-of-thought reasoning: by
+rewarding responses that arrive at correct answers and penalising those that do not,
+the model discovers that showing working (reasoning steps) reliably leads to better
+final answers. This is the mechanism behind DeepSeek-R1's reasoning capability.
+
+GRPO (DeepSeek-R1, 2024) formalises this as:
+
+```
+A_i = (r_i − mean(r)) / std(r)
+L_GRPO = − Σ_i A_i · log π_θ(y_i|x) + β · KL(π_θ || π_ref)
+```
+
+Training pushes the model toward responses that scored above the group mean and away
+from those that scored below — without ever constructing explicit `(y_w, y_l)` pairs.
+
+**Key advantage:** No human labelling required for domains with verifiable rewards.
+GRPO is the core training objective behind DeepSeek-R1's chain-of-thought reasoning.
+
+**Relationship to SPIN:** Both are iterative and self-improving. SPIN uses the
+previous iteration's model to generate the rejected side; GRPO uses within-batch
+group statistics as the baseline. GRPO requires a verifiable reward signal; SPIN only
+requires ground-truth human responses.
+
+---
+
+#### RLAIF — Reinforcement Learning from AI Feedback
+
+**What it does:** RLHF's biggest bottleneck is human annotation: trained human raters
+are slow, expensive, and cannot practically label millions of response pairs. RLAIF
+replaces human raters with a large, capable AI model (the "critic" or "judge") that
+can read two responses to the same prompt and output a preference label — at machine
+speed and arbitrary scale.
+
+The pipeline is structurally identical to RLHF. For each training prompt, the policy
+model generates two candidate responses. The AI critic reads both and decides which is
+better, often outputting a short reasoning chain before its verdict. These
+AI-generated preferences are accumulated into a preference dataset, which is used
+either to train a reward model (then PPO) or fed directly into DPO. Because the critic
+runs autonomously, millions of preference labels can be generated overnight.
+
+The central tradeoff is that the model being trained learns to satisfy the critic, not
+actual humans. If the critic has systematic biases — preferring longer responses,
+certain political framings, or confident-sounding language regardless of accuracy —
+the trained model will inherit those biases. RLAIF is therefore most reliable when the
+critic model is substantially more capable than the model being trained, so the critic
+can make genuine quality judgements rather than superficial pattern matches.
+
+RLAIF (Lee et al., 2023; Bai et al., 2022 — Constitutional AI) mirrors RLHF:
+
+1. For each prompt, sample two responses from the policy model.
+2. Ask a large critic model (e.g. Claude, GPT-4) to choose the better response and
+   explain its reasoning.
+3. Use the AI-generated preferences to train a reward model (or feed directly into DPO).
+4. Fine-tune the policy model with PPO or DPO using this reward signal.
+
+**Key advantage:** Scales to millions of examples without human rater bottlenecks.
+
+**Key disadvantage:** The policy model can overfit to the biases of the AI critic,
+inheriting its blind spots (style preferences, sycophancy, political biases) rather
+than learning human values directly.
+
+---
+
+#### Constitutional AI (CAI)
+
+**What it does:** Standard RLAIF lets the AI critic judge responses freely, which
+means the alignment criteria live implicitly inside the critic's weights — they are
+opaque, hard to audit, and impossible to change without retraining the critic. CAI
+makes the alignment criteria *explicit* by writing them down as a human-readable list
+of principles (the "constitution"): for example, "prefer responses that are helpful",
+"prefer responses that avoid discriminatory content", "prefer responses that are honest
+even when the answer is uncertain".
+
+The training pipeline runs in two stages. In the **supervised stage**, the model is
+shown its own initial response to a potentially harmful or unhelpful prompt and is
+asked to critique that response against each constitutional principle in turn, then
+revise it. The chain of (critique, revision) pairs is iterated until the response
+satisfies all principles. The final revised response becomes supervised fine-tuning
+data, teaching the model to self-correct toward the constitutional ideals.
+
+In the **RL stage**, a separate AI feedback model — guided by the same constitution —
+compares response pairs and generates preference labels. These labels train a reward
+model, which is then used in PPO to further align the policy. Because both stages
+reference the same written constitution, the alignment criteria are auditable: if the
+model behaves incorrectly in production, practitioners can read the constitution to
+understand why, and edit a principle to change future behaviour without rebuilding
+the entire pipeline.
+
+Constitutional AI (Anthropic, 2022) is a specific RLAIF variant. The two stages are:
+
+1. **Supervised stage** — the model generates a response, critiques it against each
+   constitutional principle in sequence, and revises it. The final revised response
+   becomes SFT training data.
+2. **RL stage (RLAIF)** — a separate AI feedback model scores response pairs according
+   to the same constitution; these scores train a preference model used in PPO.
+
+**Key advantage:** Makes the alignment criteria legible and modifiable — changing the
+constitution changes the model's behaviour without retraining from scratch.
+
+---
+
+#### Knowledge Distillation
+
+**What it does:** A large, expensive model (the "teacher") already contains vast
+knowledge, but it is too slow or too memory-hungry to deploy. Distillation trains a
+smaller, cheaper model (the "student") to reproduce the teacher's outputs — not just
+its final answers, but the full probability distribution it assigns to every possible
+next token. This richer signal teaches the student about the teacher's uncertainty
+and near-misses, not just its top choice.
+
+Consider a question with the correct answer "Paris". A one-hot training label says
+only "Paris is right, everything else is equally wrong". The teacher's output
+distribution might say "Paris: 82%, Lyon: 4%, Marseille: 2%, …", which tells the
+student that French cities are plausible — a signal invisible in the hard label. By
+minimising the divergence between its distribution and the teacher's, the student
+learns a compressed but faithful approximation of the teacher's knowledge.
+
+There are two main variants depending on whether the teacher's internal probability
+distribution is accessible:
+
+**Logit distillation** — the student minimises KL divergence between its output
+distribution and the teacher's full probability distribution over the vocabulary:
+
+```
+L_KD = KL( p_teacher(·|x) || p_student(·|x) )
+```
+
+This requires access to the teacher's raw logits (available when both models run
+locally). Soft targets carry richer information than one-hot labels because the
+teacher assigns small but nonzero probability to semantically related tokens — a
+signal that is completely invisible in hard labels.
+
+**Sequence-level distillation** — the teacher generates complete response strings and
+the student is trained on these synthetic responses via SFT (next-token prediction).
+This is simpler and scales to any teacher, including API-only models where logits are
+not exposed. A large fraction of open-source instruction models (Alpaca, Vicuna, Orca)
+are distilled this way from GPT-3.5/GPT-4 — their training data is the teacher's
+generated text, not human demonstrations.
+
+**Relationship to SPIN:** SPIN can be viewed as a form of self-distillation where the
+teacher is the model from the previous iteration rather than a separate larger model.
+The synthetic responses generated by `π_prev` play the role of teacher outputs.
+Unlike cross-model distillation, no external model is required — the student improves
+by repeatedly competing against its own prior self.
+
+---
+
+#### Technique Selection Guide
+
+```
+Do you have human-annotated preference pairs (A > B)?
+  ├── Yes → DPO / IPO / SimPO  (no reward model; stable; recommended default)
+  │         RLHF + PPO          (if budget allows; strongest alignment signal)
+  └── No
+       ├── Do you have binary good/bad signals (unpaired)?
+       │     └── Yes → KTO
+       ├── Do you want SFT + preference in one pass?
+       │     └── Yes → ORPO
+       ├── Can correctness be verified automatically (math, code)?
+       │     └── Yes → GRPO
+       ├── Do you only have SFT-style (prompt, response) data?
+       │     └── Yes → SPIN  (iterative self-improvement; no new data needed)
+       └── Do you want to compress a larger model?
+             └── Yes → Distillation (logit or sequence-level)
+```
 
 ---
 
