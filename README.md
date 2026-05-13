@@ -7,30 +7,60 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
 ## Table of Contents
 
 1. [What is SPIN?](#what-is-spin)
-2. [How SPIN Works — Step by Step](#how-spin-works--step-by-step)
-3. [SPIN vs Standard Fine-Tuning](#spin-vs-standard-fine-tuning)
-4. [Implementation Deep-Dive](#implementation-deep-dive)
-   - [Outer Loop — main.py](#outer-loop--mainpy)
-   - [Configuration — spin_config.py](#configuration--spin_configpy)
-   - [Dataset — spin_dataset.py](#dataset--spin_datasetpy)
-   - [Data Collator — spin_data_collator.py](#data-collator--spin_data_collatorpy)
-   - [Trainer and Loss — spin_trainer.py](#trainer-and-loss--spin_trainerpy)
-   - [Utilities — utils.py](#utilities--utilspy)
-   - [Callbacks — trainer_callback/](#callbacks--trainer_callback)
-5. [Evaluation — evaluate.py](#evaluation--evaluatepy)
-   - [Programmatic vs Standalone Usage](#programmatic-vs-standalone-usage)
-   - [Benchmark Descriptions](#benchmark-descriptions)
-   - [Scoring Strategy](#scoring-strategy)
-   - [Per-Task Details](#per-task-details)
-   - [Evaluation Loop and Output](#evaluation-loop-and-output)
-6. [Installation](#installation)
-7. [Quick Start](#quick-start)
-8. [Configuration Reference](#configuration-reference)
-9. [Memory Tips for Small GPUs](#memory-tips-for-small-gpus-16-gb)
-10. [Output Structure](#output-structure)
-11. [Resuming After a Crash](#resuming-after-a-crash)
-12. [TensorBoard](#tensorboard-training)
-13. [Project Structure](#project-structure)
+2. [Installation](#installation)
+3. [Quick Start](#quick-start)
+   - [Tested and Planned Models](#tested-and-planned-models)
+   - [Local Dataset](#local-dataset)
+   - [Running Evaluation](#running-evaluation)
+4. [Configuration Reference](#configuration-reference)
+   - [SPIN Loss](#spin-loss)
+5. [Memory Tips for Small GPUs](#memory-tips-for-small-gpus--16-gb)
+6. [Output Structure](#output-structure)
+7. [Resuming After a Crash](#resuming-after-a-crash)
+8. [TensorBoard](#tensorboard-training)
+9. [Project Structure](#project-structure)
+10. [Implementation Deep-Dive](#implementation-deep-dive)
+    - [Outer Loop — main.py](#outer-loop--mainpy)
+    - [Configuration — spin_config.py](#configuration--spin_configpy)
+    - [Dataset — spin_dataset.py](#dataset--spin_datasetpy)
+    - [Data Collator — spin_data_collator.py](#data-collator--spin_data_collatorpy)
+    - [Trainer and Loss — spin_trainer.py](#trainer-and-loss--spin_trainerpy)
+    - [Utilities — utils.py](#utilities--utilspy)
+    - [Callbacks — trainer_callback/](#callbacks--trainer_callback)
+11. [Evaluation — evaluate.py](#evaluation--evaluatepy)
+    - [Programmatic vs Standalone Usage](#programmatic-vs-standalone-usage)
+    - [Benchmark Descriptions](#benchmark-descriptions)
+    - [Scoring Strategy](#scoring-strategy)
+    - [Per-Task Details](#per-task-details)
+    - [Evaluation Loop and Output](#evaluation-loop-and-output)
+12. [Detailed Explanation](#detailed-explanation)
+    - [The Game-Theoretic View](#the-game-theoretic-view)
+    - [The Mathematical Formulation](#the-mathematical-formulation)
+    - [Why Does This Work?](#why-does-this-work)
+13. [How SPIN Works — Step by Step](#how-spin-works--step-by-step)
+    - [The Inner Batch Loop](#the-inner-batch-loop)
+    - [Dataset Order](#dataset-order)
+    - [Iteration Completion](#iteration-completion)
+    - [Crash-Safe Resumption](#crash-safe-resumption)
+14. [SPIN vs Standard Fine-Tuning](#spin-vs-standard-fine-tuning)
+    - [Key Advantage: Self-Improvement Without New Data](#key-advantage-self-improvement-without-new-data)
+    - [Key Advantage: Reference Regularization](#key-advantage-reference-regularization)
+    - [Key Limitation vs RLHF/DPO](#key-limitation-vs-rlhfdpo)
+    - [Other LLM Training Techniques](#other-llm-training-techniques)
+      - [Pre-training](#pre-training)
+      - [Continued Pre-training (CPT)](#continued-pre-training-cpt)
+      - [Supervised Fine-Tuning (SFT) and Instruction Tuning](#supervised-fine-tuning-sft-and-instruction-tuning)
+      - [RLHF + PPO](#rlhf--ppo)
+      - [DPO — Direct Preference Optimization](#dpo--direct-preference-optimization)
+      - [IPO — Identity Preference Optimization](#ipo--identity-preference-optimization)
+      - [KTO — Kahneman-Tversky Optimization](#kto--kahneman-tversky-optimization)
+      - [ORPO — Odds Ratio Preference Optimization](#orpo--odds-ratio-preference-optimization)
+      - [SimPO — Simple Preference Optimization](#simpo--simple-preference-optimization)
+      - [GRPO — Group Relative Policy Optimization](#grpo--group-relative-policy-optimization)
+      - [RLAIF — Reinforcement Learning from AI Feedback](#rlaif--reinforcement-learning-from-ai-feedback)
+      - [Constitutional AI (CAI)](#constitutional-ai-cai)
+      - [Knowledge Distillation](#knowledge-distillation)
+      - [Technique Selection Guide](#technique-selection-guide)
 
 ---
 
@@ -61,6 +91,805 @@ between good and bad outputs.
 Each round the synthetic responses become harder to beat because the opponent is
 stronger. This self-competition drives the model toward the human data distribution
 without ever requiring new annotations.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Key runtime dependencies: `transformers`, `peft`, `torch`, `datasets`, `accelerate`,
+`tensorboard`.
+
+A CUDA-capable GPU is required for practical training. The code targets CUDA 13.0 /
+PyTorch 2.11.
+
+---
+
+## Quick Start
+
+```bash
+python main.py \
+  --model_name_or_path distilbert/distilgpt2 \
+  --dataset_name HuggingFaceH4/ultrachat_200k \
+  --train_split train_sft \
+  --num_iterations 3 \
+  --data_batch_size 65536 \
+  --per_device_train_batch_size 16 \
+  --gradient_accumulation_steps 32 \
+  --output_dir ./runs/my_run
+```
+
+All `SPINConfig` fields are exposed as CLI flags — pass any field as `--field_name value`.
+
+### Tested and Planned Models
+
+This implementation is being systematically evaluated on the following models in size order:
+
+| Size | Model | Status |
+|------|-------|--------|
+| ~21 M | `roneneldan/TinyStories-1Layer-21M` | Planned |
+| ~33 M | `roneneldan/TinyStories-Instruct-33M` | Planned |
+| 82 M | `distilbert/distilgpt2` | **In progress** |
+| 135 M | `HuggingFaceTB/SmolLM2-135M` | Planned |
+| 270 M | `microsoft/harrier-oss-v1-270m` | 1/5 iterations complete |
+| 600 M | `microsoft/harrier-oss-v1-0.6b` | Planned |
+| 1.3 B | `microsoft/phi-1_5` | Planned |
+
+LoRA target modules are auto-detected per architecture — no config change needed when switching models.
+
+### Local dataset
+
+```bash
+python main.py \
+  --data_path ./my_data.jsonl \
+  --model_name_or_path /path/to/local/model \
+  --num_iterations 3
+```
+
+JSONL files must contain records with `prompt` and `response` keys, **or** a `messages`
+list of `{"role": ..., "content": ...}` dicts.
+
+### Running Evaluation
+
+All CLI defaults are derived from `SPINConfig()`, so they automatically align with the
+training output layout (`./spin_outputs/checkpoints`, `./spin_outputs/eval_results`,
+`./spin_outputs/tensorboard/eval_compare`).
+
+```bash
+# Evaluate all iter_* checkpoints in the default directory (./spin_outputs/checkpoints)
+python evaluate.py
+
+# Evaluate a specific subset of iterations
+python evaluate.py --iters iter_0 iter_2 iter_4
+
+# Smoke test — limit examples per task (do NOT use for real benchmarks)
+python evaluate.py --limit 50
+
+# Override shot counts for specific tasks
+python evaluate.py --n-shots arc_challenge=10 gsm8k=3
+
+# Run only a subset of tasks
+python evaluate.py --tasks arc_challenge winogrande mmlu
+
+# Exclude specific tasks (complement of --tasks; mutually exclusive with it)
+python evaluate.py --skip-tasks hellaswag mmlu
+
+# Custom checkpoint and output directories
+python evaluate.py \
+  --checkpoints-dir ./runs/my_run/checkpoints \
+  --output-dir      ./runs/my_run/eval_results \
+  --tensorboard-dir ./runs/my_run/tensorboard/eval
+
+# Skip already-evaluated iterations (default); force re-evaluation
+python evaluate.py --no-cache
+```
+
+---
+
+## Configuration Reference
+
+All options live in [spin_config.py](spin_config.py). The most important ones:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `model_name_or_path` | `distilbert/distilgpt2` | HuggingFace Hub ID or local checkpoint path |
+| `dataset_name` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset (overridden by `data_path`) |
+| `num_iterations` | `5` | Number of SPIN outer loops |
+| `data_batch_size` | `65536` | Rows per checkpoint batch — each batch runs all 3 steps atomically; smaller = more frequent crash-recovery saves |
+| `lambda_initial` | `0.1` | SPIN loss scale λ for all but the last iteration |
+| `lambda_final_iteration` | `5.0` | λ for the final iteration (stronger alignment push) |
+| `loss_type` | `logistic` | `logistic` \| `hinge` \| `correlation` \| `exponential` |
+| `use_lora` | `True` | Enable LoRA (strongly recommended on small GPUs) |
+| `lora_r` | `16` | LoRA rank |
+| `optimizer` | `rmsprop` | `rmsprop` (less memory) \| `adamw` |
+| `per_device_train_batch_size` | `16` | Reduce to `1` on an 8 GB GPU |
+| `gradient_accumulation_steps` | `32` | Compensate for small batch size. Must satisfy `data_batch_size ≥ per_device_train_batch_size × gradient_accumulation_steps` |
+| `learning_rate` | `5e-5` | Peak LR for early iterations |
+| `learning_rate_late` | `1e-5` | LR from `late_lr_start_iteration` onward |
+| `max_length` | `512` | Max tokens (prompt + response) during training |
+| `bf16` | `True` | bfloat16 mixed precision (Ampere+ GPU required) |
+| `gradient_checkpointing` | `False` | Recompute activations to save ~10× memory at ~33% compute cost |
+| `output_dir` | `./spin_outputs` | Root directory for all training outputs |
+| `eval_output_dir` | `./spin_outputs/eval_results` | Directory for per-iteration JSON score files and the comparative summary |
+| `eval_tensorboard_dir` | `./spin_outputs/tensorboard/eval_compare` | TensorBoard log directory for evaluation metrics |
+| `eval_limit` | `None` | Max examples per task during evaluation — `None` = full dataset; set a small integer for a smoke test |
+| `eval_batch_size` | `8` | GPU forward-pass batch size for log-likelihood scoring during evaluation |
+| `eval_max_seq_len` | `2048` | Maximum token length (context + continuation) fed to the model during evaluation |
+| `eval_gsm8k_max_new_tokens` | `256` | Maximum new tokens generated per response in the GSM8k benchmark |
+| `eval_no_cache` | `False` | Re-evaluate iterations even if a cached `.parsed.json` result exists |
+| `eval_run_after_training` | `True` | Automatically run benchmark evaluation after all training iterations complete |
+
+### SPIN Loss
+
+The loss operates on a margin per training example:
+
+```
+margin = λ × [(log π_θ(chosen) − log π_ref(chosen)) − (log π_θ(rejected) − log π_ref(rejected))]
+```
+
+A positive margin means the model has improved more on the human response than on the
+synthetic one. The `loss_type` maps this margin to a scalar:
+
+| `loss_type` | Formula | Notes |
+|---|---|---|
+| `logistic` | `softplus(−margin)` | Smooth, never saturates — recommended |
+| `hinge` | `relu(1 − margin)` | Zero loss once margin > 1 |
+| `correlation` | `1 − margin` | Constant gradient, easiest to tune |
+| `exponential` | `exp(−margin)` | Aggressive on negative margins; can be unstable |
+
+---
+
+## Memory Tips for Small GPUs (≤ 16 GB)
+
+- Set `--use_lora True` (default) — cuts gradient/optimizer memory by ~10–100×.
+- Lower `--per_device_train_batch_size 1` and raise `--gradient_accumulation_steps 64`.
+- Enable `--gradient_checkpointing True` — trades ~33% compute for ~10× less activation memory.
+- Use `--optimizer rmsprop` — saves ~2 GB vs AdamW on a 1 B-parameter model.
+- Reduce `--max_length 512` and `--max_prompt_length 256`.
+- Set `--generation_batch_size 4` — each beam holds its own KV cache during generation.
+- Set `--bf16 True` (default on Ampere+) or `--fp16 True` on older GPUs.
+
+---
+
+## Output Structure
+
+```
+spin_outputs/
+├── config.json                           # Snapshot of SPINConfig for this run
+├── synthetic/
+│   ├── iter_0_batch_000000_synth.jsonl    # Step 1 output: synthetic responses for batch 0
+│   ├── iter_0_batch_000000_logprobs.jsonl # Step 2 output: ref log-probs for batch 0
+│   ├── iter_0_batch_000000_tokenized.pt   # Step 3 cache: pre-tokenized dataset for batch 0
+│   ├── iter_0_batch_000001_synth.jsonl
+│   ├── iter_0_batch_000001_logprobs.jsonl
+│   ├── iter_0_batch_000001_tokenized.pt
+│   └── ...
+├── checkpoints/
+│   ├── iter_0/
+│   │   ├── batch_000000/                 # Step 3 output: merged model after batch 0
+│   │   │   ├── config.json
+│   │   │   ├── model.safetensors
+│   │   │   └── .done                     # Sentinel: all 3 steps done for this batch
+│   │   ├── batch_000001/
+│   │   │   └── ...
+│   │   ├── config.json                   # Final iteration model (copy of last batch)
+│   │   ├── model.safetensors
+│   │   ├── tokenizer_config.json
+│   │   └── .done                         # Iteration-level sentinel
+│   └── iter_1/
+│       └── ...
+├── eval_results/
+│   ├── iter_0.parsed.json
+│   ├── comparative_summary.txt
+│   └── comparative_summary.json
+└── tensorboard/
+    ├── global/                           # Memory + cross-iteration signals
+    ├── iter_0/
+    │   ├── batch_000000/                 # Per-batch TensorBoard logs
+    │   ├── batch_000001/
+    │   └── ...
+    ├── param_stats/
+    ├── profile/
+    └── eval_compare/
+```
+
+**Disk usage note:** Each batch checkpoint in `checkpoints/iter_i/batch_k/` holds a
+full merged model. For a 270 M parameter model in bfloat16 this is ~540 MB per batch.
+With many small batches this can grow large. Delete old batch checkpoints after
+confirming the iteration completed (the iteration-level `.done` is the safe signal).
+
+The final model is at `checkpoints/iter_{num_iterations-1}/`.
+
+---
+
+## Resuming After a Crash
+
+No flags are needed. On restart, the script automatically resumes at the finest
+granularity possible:
+
+**Iteration level** — `find_start_iteration()` scans `checkpoints/iter_*/`
+in reverse for an iteration-level `.done` sentinel. Completed iterations are skipped
+entirely.
+
+**Batch level** — within the current iteration, `_find_start_batch()` scans batches
+0 → N in order and returns the first batch where any step is incomplete. Each step
+is re-checked individually:
+
+| What's missing | Action |
+|---|---|
+| `_synth.jsonl` absent or empty | Re-run Step 1 (synthetic generation) |
+| `_logprobs.jsonl` absent or empty | Re-run Step 2 (logprob scoring) |
+| batch `.done` absent | Re-run Step 3 (training); within training, `get_last_checkpoint()` resumes from a partial HF Trainer checkpoint if one exists |
+
+Because each step writes its output atomically (write-to-temp → rename), a kill
+mid-write leaves the previous valid file intact — no corruption, no re-running
+earlier steps.
+
+---
+
+## TensorBoard (training)
+
+```bash
+tensorboard --logdir ./spin_outputs/tensorboard
+```
+
+The `global/` run plots metrics across all iterations on a single x-axis. Individual
+`iter_N/` runs show per-step detail for each iteration.
+
+The `global/` run plots memory metrics. Per-batch training metrics land under
+`iter_N/batch_K/` — each data batch gets its own TensorBoard sub-run.
+
+Available panels (depending on config flags):
+
+- **Scalars** — loss, margin mean/std, win rate, log-probs, KL from ref, learning rate
+- **PR Curves** — alignment accuracy per epoch
+- **Projector** — token embedding shift across iterations (PCA / UMAP / t-SNE)
+- **Histograms** — per-layer weight and gradient distributions
+- **Trace** and **Memory** — PyTorch profiler output
+
+---
+
+## Project Structure
+
+| File | Description |
+|------|-------------|
+| [main.py](main.py) | Entry point — outer SPIN loop, resume logic, orchestration |
+| [evaluate.py](evaluate.py) | Benchmark evaluation — `run_eval(cfg)` drives five tasks, iteration-over-iteration comparison, and TensorBoard logging; delegates model loading, memory management, and I/O to utils.py |
+| [spin_config.py](spin_config.py) | `SPINConfig` dataclass — all training and evaluation hyperparameters with inline docs |
+| [spin_trainer.py](spin_trainer.py) | `SPINTrainer` and `RMSPropSPINTrainer` — loss computation and training step |
+| [spin_dataset.py](spin_dataset.py) | `SPINDataset` — pre-tokenises chosen/rejected pairs |
+| [spin_data_collator.py](spin_data_collator.py) | `SPINDataCollator` — pads and batches chosen/rejected tensors |
+| [utils.py](utils.py) | Shared infrastructure for training and evaluation: model loading, tokenisation, generation, LoRA merge, memory logging, directory/file helpers, arg parsing |
+| [trainer_callback/](trainer_callback/) | TensorBoard, profiler, memory probe, and iteration summary callbacks |
+
+
+---
+
+## Implementation Deep-Dive
+
+### Outer Loop — [main.py](main.py)
+
+`main.py` is the entry point and implements the outer SPIN loop. Its responsibilities:
+
+1. **Parse config** — argparse flags are dynamically generated from the `SPINConfig`
+   dataclass fields so every hyperparameter is exposed as a CLI flag without maintaining
+   a separate argparse setup.
+2. **Setup** — Creates output directories and saves a `config.json` snapshot.
+3. **Load tokenizer and base dataset** — The dataset is fully materialised into a Python
+   list of `{prompt, response}` dicts in **fixed index order** (no shuffling) and reused
+   across all iterations.
+4. **Detect resume point** — `find_start_iteration()` scans `.done` sentinels to skip
+   already-complete iterations; `_find_start_batch()` scans per-batch sentinels to skip
+   already-complete batches within the current iteration.
+5. **Run the iteration loop** — For each iteration: loads `π_prev` from disk to CPU as a
+   frozen reference model, then runs the inner batch loop (Steps 1–3 per batch).
+6. **Global TensorBoard** — A `SummaryWriter` at `tensorboard/global/` captures
+   cross-iteration memory and training signals.
+
+**Key functions:**
+
+| Function | Role |
+|---|---|
+| `_find_start_batch(cfg, iteration, total_batches)` | Scans batch files in order; returns first k where synth, logprobs, or `.done` is missing |
+| `_init_train_model(prev_model, cfg, iteration, start_batch)` | Returns trainable model: wraps prev_model for batch 0, or loads merged checkpoint from batch k−1 for resume |
+| `_step_synth(prev_model, tokenizer, chunk, cfg, iteration, k)` | Step 1 — generates and saves synth; skips if file exists |
+| `_step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k)` | Step 2 — scores and saves logprobs; skips if file exists |
+| `_step_train(train_model, synth_rows, ref_lps, tokenizer, cfg, ...)` | Step 3 — trains, merges LoRA, saves model, writes `.done`; skips if `.done` exists |
+| `_cleanup_trainer_checkpoints(directory)` | Deletes HF Trainer `checkpoint-N` subdirs after `save_model()` completes; the merged model supersedes them |
+
+**Memory management within an iteration:**
+- `π_prev` lives on CPU throughout the iteration, moving to GPU only for Steps 1–2
+  of each batch, then back to CPU. This frees the GPU for the training step.
+- `train_model` stays in GPU memory between batches — no disk reload between batches
+  in the normal (non-resume) case.
+- After each batch's training, LoRA is merged into base weights, and `make_trainable()`
+  re-applies fresh adapters for the next batch.
+
+### Configuration — [spin_config.py](spin_config.py)
+
+All hyperparameters live in the `SPINConfig` dataclass. Every field carries inline
+documentation describing its effect and recommended range. Key sections:
+
+**Model and dtype:**
+- `model_name_or_path` — HuggingFace Hub ID or local path.
+- `torch_dtype` — `"bfloat16"` (default, recommended on Ampere+ GPUs), `"float16"`,
+  or `"float32"`.
+- `attn_implementation` — `"sdpa"` (default, free on PyTorch 2.0+) or
+  `"flash_attention_2"` (requires the `flash-attn` package, 2–4× faster).
+
+**SPIN-specific:**
+- `lambda_initial` (default 0.1) — scales the margin for all iterations except the last.
+- `lambda_final_iteration` (default 5.0) — larger λ for the final iteration applies a
+  stronger alignment push.
+- `loss_type` — `"logistic"` (smooth, never saturates, recommended), `"hinge"`,
+  `"correlation"`, or `"exponential"`.
+
+**LoRA:**
+- `use_lora=True`, `lora_r=16`, `lora_alpha=32` — default `lora_target_modules` is
+  `c_attn,c_proj` (GPT-2/TinyStories style). For LLaMA/Mistral/Phi/SmolLM models use
+  `q_proj,k_proj,v_proj,o_proj`. `make_trainable()` auto-detects the correct target
+  layers for all supported architectures when the configured names are not found in
+  the model — no manual override needed when switching between model families.
+
+**Two-phase learning rate:**
+- `learning_rate=5e-5` for early iterations, `learning_rate_late=1e-5` from
+  `late_lr_start_iteration` onward. This allows a gentle step-down LR schedule across
+  iterations without a per-step scheduler.
+
+**torch.compile:**
+- `compile_model=True` with `compile_backend="inductor"` and
+  `compile_mode="max-autotune-no-cudagraphs"` (the `no-cudagraphs` variant avoids a
+  C++ OpenMP dependency on Windows while still enabling Triton kernel tuning).
+- `compile_ref_model=False` — the reference model is not compiled because
+  `model.generate()` uses a Python while-loop that causes graph breaks, so
+  `compile_fullgraph=True` would silently fall back to eager mode anyway.
+
+### Dataset — [spin_dataset.py](spin_dataset.py)
+
+`SPINDataset` is a standard PyTorch `Dataset` that pre-tokenises all training rows at
+construction time. For each row it tokenises both the chosen (human) and rejected
+(synthetic) sequences and stores the results.
+
+Tokenisation performs several careful steps:
+
+1. **Format the prompt** — applies the chat template (tokenizer's built-in template,
+   `instruction_response` manual wrapping, or plain passthrough) depending on
+   `chat_template_mode`.
+2. **Tokenize together** — the prompt and response are concatenated *before*
+   tokenisation to avoid "boundary artifacts" — tokenisers can split subwords
+   differently when strings are encoded in isolation vs concatenated.
+3. **Mask prompt tokens** — labels for prompt token positions are set to `-100` so the
+   loss is computed only over the response tokens, not the conditioning context.
+
+```python
+# Resulting dict for one sequence:
+{
+    "input_ids":       [101, 234, 567, ...],   # full prompt+response token ids
+    "attention_mask":  [1, 1, 1, ...],
+    "labels":          [-100, -100, 567, ...]  # -100 masks prompt positions from loss
+}
+```
+
+The dataset also stores a `length` key (the maximum of chosen/rejected lengths) used by
+HuggingFace's `LengthGroupedSampler` to sort batches by length, minimising padding
+overhead. If reference log-probs are provided (always during training), each item also
+carries `ref_chosen_logp` and `ref_rejected_logp` as scalars.
+
+### Data Collator — [spin_data_collator.py](spin_data_collator.py)
+
+`SPINDataCollator` receives a list of dataset items (one per example in the batch) and
+pads them into batched tensors:
+
+- `chosen_input_ids` / `rejected_input_ids` — right-padded to the longest sequence
+  in the batch with `pad_token_id`.
+- `chosen_attention_mask` / `rejected_attention_mask` — right-padded with `0`.
+- `chosen_labels` / `rejected_labels` — right-padded with `-100` so padded positions
+  are automatically excluded from the loss.
+- `ref_chosen_logp` / `ref_rejected_logp` — stacked into a `(batch,)` float32 tensor.
+
+The chosen and rejected sequences are padded *independently* (they may have very
+different lengths). This is critical for the memory-efficient two-pass forward during
+training — each pass only needs to allocate memory for its own sequence length.
+
+### Trainer and Loss — [spin_trainer.py](spin_trainer.py)
+
+`SPINTrainer` extends HuggingFace's `Trainer` and overrides the training step.
+
+#### Training Step
+
+This is the hot path — called once per micro-batch:
+
+1. The reference log-probs (`ref_chosen_logp`, `ref_rejected_logp`) are loaded from the
+   batch as pre-computed scalars — no model forward pass is needed.
+2. **Forward pass 1** — runs the trainable model on the chosen (human) sequence to get
+   `log π_θ(y_human | x)`.
+3. **Forward pass 2** — runs the trainable model on the rejected (synthetic) sequence to
+   get `log π_θ(y_synthetic | x)`.
+4. **Margin** — computed as `(π_θ(chosen) − ref_chosen_logp) − (π_θ(rejected) − ref_rejected_logp)`,
+   then scaled by λ.
+5. **Loss** — the configured loss function is applied to the margin and backpropagation runs.
+
+**Why two separate forward passes instead of one?**
+Batching chosen and rejected together would require a batch of size `2 × batch_size`
+with both sequence types, forcing peak activation memory to equal `chosen_len +
+rejected_len`. Running them sequentially caps peak memory at `max(chosen_len,
+rejected_len)` — up to 2× less for long sequences.
+
+Per-step metrics logged: `loss`, `margin_mean`, `margin_std`, `win_rate`
+(fraction of examples where `margin > 0`), `pi_chosen_logp`, `pi_rejected_logp`,
+`ref_chosen_logp`, `ref_rejected_logp`, `kl_from_ref`, `learning_rate`.
+
+#### RMSProp Variant
+
+`RMSPropSPINTrainer` subclasses `SPINTrainer` and overrides the optimizer creation to
+use RMSprop instead of AdamW. RMSprop maintains one optimizer-state tensor per
+parameter (running mean of squared gradients) versus AdamW's two (first + second
+moment), saving approximately 2 GB of GPU memory per 1B-parameter model. The
+`foreach=True` flag enables fused kernel implementations for the update step,
+recovering some of the speed cost.
+
+#### SPIN Loss
+
+The loss operates on a per-example `margin` (after λ scaling):
+
+| `loss_type` | Formula | Gradient behaviour |
+|---|---|---|
+| `logistic` | `softplus(−margin)` = `log(1 + exp(−margin))` | Smooth; always non-zero gradient; asymptotes to 0 from above as margin→∞ |
+| `hinge` | `relu(1 − margin)` | Zero gradient when `margin > 1`; hard boundary |
+| `correlation` | `1 − margin` | Constant gradient regardless of margin |
+| `exponential` | `exp(−margin)` | Very aggressive gradient for negative margins; can cause instability |
+
+`logistic` is the default and recommended setting — it never fully stops penalising
+negative margins, which keeps gradients flowing even on nearly-aligned examples.
+
+### Utilities — [utils.py](utils.py)
+
+`utils.py` provides all shared infrastructure used by both `main.py` (training) and
+`evaluate.py` (evaluation). `evaluate.py` imports everything via `from utils import *`
+and delegates model loading, tokenisation, compilation, directory management, memory
+logging, and JSON I/O to the helpers defined here.
+
+**Model lifecycle:**
+- Loading `AutoModelForCausalLM` with the configured dtype and attention implementation.
+  When loading as the frozen reference model, `eval()` mode is set and all parameter
+  gradients are disabled. When loading as the trainable model, gradient checkpointing
+  is optionally enabled.
+- Converting from frozen reference to trainable: base weights are frozen and PEFT LoRA
+  adapters are inserted via `get_peft_model()`, or all parameters are unfrozen for full
+  fine-tuning.
+- After training, LoRA adapters are merged back into the base weights via
+  `merge_and_unload()` before saving.
+- Between iterations the model is deleted, garbage collection runs, and the CUDA cache
+  is emptied to free GPU memory.
+
+**Log-probability computation:**
+- A forward pass through the model produces logits of shape `(batch, seq_len, vocab)`.
+- The standard autoregressive shift is applied: logits at position `t` predict token
+  `t+1`.
+- Prompt positions (where `labels == -100`) are masked out.
+- Per-token log-probabilities are gathered and summed over response tokens to produce
+  one scalar per sequence.
+- `use_cache=False` prevents unnecessary KV-cache allocation during scoring.
+
+**Generation:**
+- Prompts are batched and fed to `model.generate()`. The attention mask's row sums give
+  the actual prompt lengths (handling left-padded batches), which are used to slice the
+  newly generated tokens from the output sequences.
+
+**Tokenisation:**
+- Three chat-template modes: `"plain"` (raw prompt), `"instruction_response"` (manual
+  prefix/suffix wrapping), and `"auto"` (uses the tokenizer's built-in `chat_template`
+  if available, falls back to `instruction_response`).
+- The prompt and response are always concatenated before tokenisation to avoid
+  subword-boundary artifacts.
+
+**Dataset loading:**
+- Supports HuggingFace Hub datasets and local JSONL/JSON/Parquet files.
+- Multi-turn chat datasets are normalised by extracting the first user/assistant turn,
+  tolerating role-name variants (`user`, `human`, `assistant`, `model`, `gpt`, `bot`).
+- Records missing a valid user→assistant exchange are silently skipped.
+
+**Crash safety:**
+- All JSONL caches are written via a write-to-temp-then-rename strategy so a kill
+  mid-write never leaves a corrupt file.
+- Stale HuggingFace `.lock` files from killed prior runs are cleaned up at process
+  start to prevent deadlocks.
+
+**Training arg helpers:**
+- λ selection: returns `lambda_final_iteration` on the last iteration and
+  `lambda_initial` for all others.
+- LR selection: `learning_rate` for early iterations, `learning_rate_late` from
+  `late_lr_start_iteration` onward.
+
+### Callbacks — [trainer_callback/](trainer_callback/)
+
+Four callbacks augment training with observability:
+
+| Callback | Purpose |
+|---|---|
+| `TensorBoardCallbackExtended` | Per-step scalars (loss, margin, win rate, log-probs, KL, LR), PR curves, embedding projector snapshots, model graph |
+| `TensorBoardParameterStatsCallback` | Per-parameter weight/gradient histograms and scalar statistics (mean, std, L2 norm) every `parameter_log_interval` steps |
+| `TorchProfilerCallback` | PyTorch profiler traces: operator-level GPU/CPU timelines, memory events, FLOP counts, flamegraph stacks |
+| `MemoryProbeCallback` | CPU RSS and GPU allocated/reserved memory at the start/end of each epoch |
+| `SPINIterationSummaryCallback` | Cross-iteration summary written to the global TensorBoard run; tracks dataset size, lambda, win rate trends across iterations |
+
+---
+
+## Evaluation — [evaluate.py](evaluate.py)
+
+`evaluate.py` is a benchmark harness that evaluates every trained checkpoint against
+five standard LLM benchmarks (GSM8k is included in the implementation but disabled by
+default — uncomment its line in `TASKS` to enable it). It requires no `lm_eval`
+dependency — all scoring is implemented directly using HuggingFace `transformers`.
+
+Model loading, tokeniser setup, compilation, memory management, and JSON output all
+delegate to the shared helpers in `utils.py` (imported via `from utils import *`):
+
+| utils.py function | Role in evaluate.py |
+|---|---|
+| `load_causal_lm(path, cfg, trainable=False)` | Load each checkpoint in frozen eval mode |
+| `load_tokenizer(cfg)` | Configure tokeniser (pad token, padding side) from checkpoint path |
+| `maybe_compile_model(model, cfg, label)` | `torch.compile()` the eval model with `fullgraph=False` |
+| `ensure_dir(path)` | Create output and TensorBoard directories |
+| `free_model(model)` | Delete model, run GC, empty CUDA cache between checkpoints |
+| `save_json(path, obj)` | Write per-iteration score files and the final summary |
+| `log_memory(tag)` | Log CPU/GPU memory before and after each model load/free |
+
+### Programmatic vs Standalone Usage
+
+**Standalone** (CLI):
+```bash
+python evaluate.py --checkpoints-dir ./spin_outputs/checkpoints
+```
+`main()` parses CLI flags (defaults derived from `SPINConfig()`), builds a config
+with `dataclasses.replace()`, and calls `run_eval(cfg)`.
+
+**Programmatic** (called from another script):
+```python
+from evaluate import run_eval
+run_eval(cfg)                                  # all iterations, all tasks
+run_eval(cfg, iters=["iter_2", "iter_4"])      # specific iterations
+run_eval(cfg, active_tasks=[...], n_shots={…}) # custom task subset / shot counts
+```
+
+All evaluation settings (`eval_output_dir`, `eval_batch_size`, `eval_limit`, etc.)
+come from `SPINConfig` fields — see [Configuration Reference](#configuration-reference).
+
+### Overview Flow
+
+```
+run_eval(cfg)
+├── ensure_dir(cfg.eval_output_dir)
+├── ensure_dir(cfg.eval_tensorboard_dir)
+├── Discover iter_* checkpoint directories (sorted by numeric index)
+└── For each iteration:
+    ├── [cache hit] load scores from iter_N.parsed.json
+    └── [cache miss]
+        ├── find_model_path() — probe candidate sub-dirs for config.json
+        ├── load_tokenizer(cfg with tokenizer_name_or_path=checkpoint_path)
+        ├── log_memory(before_load)
+        ├── load_causal_lm(path, cfg, trainable=False).to(cfg.device)
+        ├── log_memory(after_load)
+        ├── maybe_compile_model() with fullgraph=False, mode="default" (safe for model.generate)
+        ├── run_all_benchmarks() → per-task scores
+        ├── log_memory(before_free) → free_model() → log_memory(after_free)
+        └── save_json(iter_N.parsed.json, scores)
+    ├── Compute delta vs previous iteration
+    ├── Track running best-average
+    └── Write TensorBoard row
+├── Print formatted comparison table to stdout
+├── write_summary() → comparative_summary.txt
+├── save_json() → comparative_summary.json
+└── Close TensorBoard writer
+```
+
+### Benchmark Descriptions
+
+| Benchmark | Metric | Shots | What it tests | Active |
+|---|---|---|---|---|
+| **ARC-Challenge** | acc_norm | 25 | Grade-school science questions selected to defeat retrieval and word-co-occurrence methods | ✅ |
+| **TruthfulQA MC2** | mc2 | 0 | Whether the model outputs truthful statements; multiple correct answers per question | ✅ |
+| **Winogrande** | acc | 5 | Commonsense pronoun/coreference resolution (large-scale Winograd schema) | ✅ |
+| **HellaSwag** | acc_norm | 10 | Commonsense sentence completion; adversarially selected incorrect endings | ✅ |
+| **MMLU** | acc | 5 | 57 academic subjects spanning humanities, STEM, social sciences, and professional domains | ✅ |
+| **GSM8k** | acc | 5 | Grade-school arithmetic word problems requiring multi-step chain-of-thought reasoning | ⬜ disabled by default |
+
+GSM8k is implemented but commented out in the `TASKS` list — uncomment it to enable.
+Shot counts match the Open LLM Leaderboard v1 defaults so results are directly
+comparable to published numbers.
+
+### Scoring Strategy
+
+All multiple-choice benchmarks (ARC, TruthfulQA, Winogrande, HellaSwag, MMLU) use
+**log-likelihood continuation scoring**. For each answer choice, the model scores:
+
+```
+sum_t log P(choice_token_t | context, choice_tokens_0..t-1)
+```
+
+The choice with the highest score wins.
+
+**Key implementation detail — tokenise together, not separately:**
+The context and each choice are always concatenated *before* tokenisation. Tokenisers
+can split subwords differently at a string boundary when the two strings are encoded in
+isolation (the "boundary artifact" problem). Tokenising the full string together ensures
+the model sees exactly the tokens it would during free-form generation.
+
+**Truncation:** When the combined sequence exceeds `MAX_SEQ_LEN=2048` tokens, it is
+truncated from the *left* of the context window, preserving the choice tokens intact —
+since those are the tokens being scored.
+
+**Batched scoring:** `score_examples_batched()` amortises GPU kernel-launch overhead by
+packing `eval_batch_size` (context, continuation) sequences from *multiple questions* into
+a single forward pass — choices from different questions are batched together, not just
+choices from the same question. Sequences are left-padded to the batch maximum length so
+real tokens are right-aligned and attention patterns are valid. This gives higher GPU
+utilisation than one pass per question or per choice.
+
+**acc_norm (length normalisation):** Used for ARC-Challenge and HellaSwag. Before
+selecting the winning choice, each score is divided by the *character length* of the
+choice text. Without normalisation the model would trivially prefer shorter choices
+that accumulate fewer (negative) log-probabilities.
+
+**mc2 (TruthfulQA):** TruthfulQA MC2 has *multiple* correct answers per question.
+Softmax is applied across all choice log-likelihoods to produce a probability
+distribution; the score is the sum of probability mass landing on all correct choices.
+A score of 1.0 means all probability was assigned to true statements.
+
+**GSM8k uses greedy generation** instead of log-likelihood scoring. The model freely
+generates its answer and the final number is extracted — first by looking for the
+canonical `"#### N"` delimiter used in the training data, falling back to the last
+number anywhere in the generated text. Comma stripping makes `"1,234"` and `"1234"`
+compare equal.
+
+### Per-Task Details
+
+#### ARC-Challenge
+
+- **Dataset:** `allenai/ai2_arc` (ARC-Challenge split), test set.
+- **Few-shot format:** `"Question: {question}\nAnswer: {full answer text}"` × 25
+  exemplars from the training split. The full answer text (not just the letter A/B/C/D)
+  is used both in exemplars and as the scored continuation.
+- **Scoring:** acc_norm — length-normalised log-likelihood over all choice texts.
+
+#### TruthfulQA MC2
+
+- **Dataset:** `truthful_qa` (multiple_choice split), validation set.
+- **Format:** `"Q: {question}\nA: {choice}"` (zero-shot only — no reliable few-shot
+  training split exists).
+- **Scoring:** mc2 — softmax over all choice log-likelihoods; sum probability mass on
+  the subset of correct choices.
+
+#### Winogrande
+
+- **Dataset:** `winogrande` (winogrande_xl split), validation set.
+- **Format:** The sentence has a blank `_`. Context = text before the blank. Each option
+  is scored as `"{option}{text after blank}"`.
+- **Example:** *"The trophy doesn't fit in the suitcase because _ is too large."*
+  → Context: *"The trophy doesn't fit in the suitcase because "*, scored continuations:
+  *"the trophy is too large."* vs *"the suitcase is too large."*
+- **Scoring:** acc — raw log-likelihood, no normalisation.
+
+#### GSM8k
+
+- **Dataset:** `gsm8k` (main split), test set.
+- **Few-shot:** 5 hard-coded Chain-of-Thought exemplars teach the model to show its
+  work and end with `"#### <number>"`. These are the canonical exemplars from Wei et
+  al. (2022) and lm_eval.
+- **Scoring:** acc — greedy generation followed by exact numeric string match after
+  extracting the final answer from both the generated text and the ground truth.
+
+#### HellaSwag
+
+- **Dataset:** `Rowan/hellaswag`, validation set.
+- **Preprocessing:** `[bracket]` annotation artefacts and extra whitespace are stripped.
+- **Format:** `"{activity label}: {partial context}"` + `" {ending}"`.
+- **Scoring:** acc_norm — length-normalised log-likelihood over four candidate endings.
+
+#### MMLU
+
+- **Dataset:** `cais/mmlu` (all subjects), test set.
+- **Format:**
+  ```
+  The following is a multiple choice question about {subject}.
+  {question}
+  A. {choice0}  B. {choice1}  C. {choice2}  D. {choice3}
+  Answer:
+  ```
+  The continuation is a single letter ` A`, ` B`, ` C`, or ` D`.
+- **Few-shot:** Per-subject few-shot prefix using up to 5 examples from the `dev` split
+  for the same subject as the test question.
+- **Scoring:** acc — no normalisation (all choices are the same length: one character).
+
+### Evaluation Loop and Output
+
+**Model discovery:** The evaluator probes a prioritised list of candidate
+sub-directories inside each `iter_*` folder (`hf_final`, `final_checkpoint`,
+`checkpoint-final`, `merged`, `model`, the folder itself) looking for `config.json` or
+`adapter_config.json`. If none match it walks the entire subtree recursively. This
+handles all checkpoint layouts SPIN may produce.
+
+**Memory management:** `free_model()` (from utils.py) deletes the model reference, runs
+garbage collection, and empties the CUDA cache immediately after benchmarks complete.
+`log_memory()` records CPU RSS and GPU allocated/reserved memory before load and after
+free, so memory growth across iterations is visible in the log. Loading and scoring a
+single checkpoint can require 4–16 GB depending on model size; freeing between
+iterations prevents OOM when evaluating many checkpoints in sequence.
+
+**Delta tracking:** Per-task score differences between consecutive iterations are
+computed. `None` is returned for any task that failed in either iteration so that
+`0.0` unambiguously means no change (not a missing result).
+
+**Best-iteration tracking:** The running best average across all evaluated iterations
+is tracked and annotated with `★ NEW BEST` in both the CLI output and TensorBoard.
+
+**Output files:**
+```
+eval_results/
+├── iter_0.parsed.json          # Per-task scores for iter_0 (raw fractions × 100)
+├── iter_1.parsed.json
+├── comparative_summary.txt     # TSV table + per-iteration narrative (paste into spreadsheet)
+└── comparative_summary.json    # Full results list with deltas and best-so-far tracking
+```
+
+**CLI output example:**
+```
+============================================================
+ iter_1  →  /path/to/checkpoints/iter_1
+============================================================
+  [Arc] arc_challenge | 25-shot | full ...
+    Arc: 42.15%  (183s)
+  [TruthfulQA] truthfulqa_mc2 | 0-shot | full ...
+    TruthfulQA: 51.30%  (97s)
+  ...
+
+  [iter_1]  avg=46.72%  Δprev_avg=▲+1.40  best_so_far=46.72%  ★ NEW BEST  (712s total)
+  ▲ improved: Arc, TruthfulQA, HellaSwag
+  ▼ declined: Winogrande
+```
+
+**Final comparison table:**
+```
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+| Iteration | Arc  | TruthfulQA | Winogrande | GSM8k | HellaSwag | MMLU  | Avg%  | ΔAvg  | Status |
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+| iter_0   | 40.80 | 50.10      | 62.30     | 18.50 | 71.20     | 46.00 | 48.15 |   NA  |        |
+| iter_1   | 42.15 | 51.30      | 61.90     | 19.20 | 72.40     | 47.30 | 49.04 | ▲+0.89| ★ BEST |
++----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
+```
+
+### Evaluation TensorBoard Panels
+
+```bash
+tensorboard --logdir ./spin_outputs/tensorboard
+```
+
+The evaluation run writes to `tensorboard/eval_compare/`:
+
+| Panel | Tags | Description |
+|---|---|---|
+| **Custom Scalars → Evaluation** | `eval/average`, `eval/best_so_far_average` | Average score and running best across iterations |
+| **Custom Scalars → Evaluation** | `eval/tasks/<name>` | Per-task score for each iteration |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/<name>` | Per-task score change from the preceding iteration |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improvement_rate` | Fraction of tasks that improved (0–1) |
+| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improved_task_count`, `…/declined_task_count` | Count of tasks improved / declined |
+| **Text → eval/scorecard** | — | Markdown table of scores + deltas, one card per iteration |
+| **Text → eval/best_iteration** | — | Note written each time a new best average is reached |
+| **Text → eval/run_config** | — | Shot counts, device, directories — written once at step 0 |
+
+---
+
+
+
+
+---
+
+
+
+
+
+## Detailed Explanation
 
 ### The Game-Theoretic View
 
@@ -1257,789 +2086,3 @@ Do you have human-annotated preference pairs (A > B)?
              └── Yes → Distillation (logit or sequence-level)
 ```
 
----
-
-## Implementation Deep-Dive
-
-### Outer Loop — [main.py](main.py)
-
-`main.py` is the entry point and implements the outer SPIN loop. Its responsibilities:
-
-1. **Parse config** — argparse flags are dynamically generated from the `SPINConfig`
-   dataclass fields so every hyperparameter is exposed as a CLI flag without maintaining
-   a separate argparse setup.
-2. **Setup** — Creates output directories and saves a `config.json` snapshot.
-3. **Load tokenizer and base dataset** — The dataset is fully materialised into a Python
-   list of `{prompt, response}` dicts in **fixed index order** (no shuffling) and reused
-   across all iterations.
-4. **Detect resume point** — `find_start_iteration()` scans `.done` sentinels to skip
-   already-complete iterations; `_find_start_batch()` scans per-batch sentinels to skip
-   already-complete batches within the current iteration.
-5. **Run the iteration loop** — For each iteration: loads `π_prev` from disk to CPU as a
-   frozen reference model, then runs the inner batch loop (Steps 1–3 per batch).
-6. **Global TensorBoard** — A `SummaryWriter` at `tensorboard/global/` captures
-   cross-iteration memory and training signals.
-
-**Key functions:**
-
-| Function | Role |
-|---|---|
-| `_find_start_batch(cfg, iteration, total_batches)` | Scans batch files in order; returns first k where synth, logprobs, or `.done` is missing |
-| `_init_train_model(prev_model, cfg, iteration, start_batch)` | Returns trainable model: wraps prev_model for batch 0, or loads merged checkpoint from batch k−1 for resume |
-| `_step_synth(prev_model, tokenizer, chunk, cfg, iteration, k)` | Step 1 — generates and saves synth; skips if file exists |
-| `_step_logprobs(prev_model, tokenizer, synth_rows, cfg, iteration, k)` | Step 2 — scores and saves logprobs; skips if file exists |
-| `_step_train(train_model, synth_rows, ref_lps, tokenizer, cfg, ...)` | Step 3 — trains, merges LoRA, saves model, writes `.done`; skips if `.done` exists |
-| `_cleanup_trainer_checkpoints(directory)` | Deletes HF Trainer `checkpoint-N` subdirs after `save_model()` completes; the merged model supersedes them |
-
-**Memory management within an iteration:**
-- `π_prev` lives on CPU throughout the iteration, moving to GPU only for Steps 1–2
-  of each batch, then back to CPU. This frees the GPU for the training step.
-- `train_model` stays in GPU memory between batches — no disk reload between batches
-  in the normal (non-resume) case.
-- After each batch's training, LoRA is merged into base weights, and `make_trainable()`
-  re-applies fresh adapters for the next batch.
-
-### Configuration — [spin_config.py](spin_config.py)
-
-All hyperparameters live in the `SPINConfig` dataclass. Every field carries inline
-documentation describing its effect and recommended range. Key sections:
-
-**Model and dtype:**
-- `model_name_or_path` — HuggingFace Hub ID or local path.
-- `torch_dtype` — `"bfloat16"` (default, recommended on Ampere+ GPUs), `"float16"`,
-  or `"float32"`.
-- `attn_implementation` — `"sdpa"` (default, free on PyTorch 2.0+) or
-  `"flash_attention_2"` (requires the `flash-attn` package, 2–4× faster).
-
-**SPIN-specific:**
-- `lambda_initial` (default 0.1) — scales the margin for all iterations except the last.
-- `lambda_final_iteration` (default 5.0) — larger λ for the final iteration applies a
-  stronger alignment push.
-- `loss_type` — `"logistic"` (smooth, never saturates, recommended), `"hinge"`,
-  `"correlation"`, or `"exponential"`.
-
-**LoRA:**
-- `use_lora=True`, `lora_r=16`, `lora_alpha=32` — default `lora_target_modules` is
-  `c_attn,c_proj` (GPT-2/TinyStories style). For LLaMA/Mistral/Phi/SmolLM models use
-  `q_proj,k_proj,v_proj,o_proj`. `make_trainable()` auto-detects the correct target
-  layers for all supported architectures when the configured names are not found in
-  the model — no manual override needed when switching between model families.
-
-**Two-phase learning rate:**
-- `learning_rate=5e-5` for early iterations, `learning_rate_late=1e-5` from
-  `late_lr_start_iteration` onward. This allows a gentle step-down LR schedule across
-  iterations without a per-step scheduler.
-
-**torch.compile:**
-- `compile_model=True` with `compile_backend="inductor"` and
-  `compile_mode="max-autotune-no-cudagraphs"` (the `no-cudagraphs` variant avoids a
-  C++ OpenMP dependency on Windows while still enabling Triton kernel tuning).
-- `compile_ref_model=False` — the reference model is not compiled because
-  `model.generate()` uses a Python while-loop that causes graph breaks, so
-  `compile_fullgraph=True` would silently fall back to eager mode anyway.
-
-### Dataset — [spin_dataset.py](spin_dataset.py)
-
-`SPINDataset` is a standard PyTorch `Dataset` that pre-tokenises all training rows at
-construction time. For each row it tokenises both the chosen (human) and rejected
-(synthetic) sequences and stores the results.
-
-Tokenisation performs several careful steps:
-
-1. **Format the prompt** — applies the chat template (tokenizer's built-in template,
-   `instruction_response` manual wrapping, or plain passthrough) depending on
-   `chat_template_mode`.
-2. **Tokenize together** — the prompt and response are concatenated *before*
-   tokenisation to avoid "boundary artifacts" — tokenisers can split subwords
-   differently when strings are encoded in isolation vs concatenated.
-3. **Mask prompt tokens** — labels for prompt token positions are set to `-100` so the
-   loss is computed only over the response tokens, not the conditioning context.
-
-```python
-# Resulting dict for one sequence:
-{
-    "input_ids":       [101, 234, 567, ...],   # full prompt+response token ids
-    "attention_mask":  [1, 1, 1, ...],
-    "labels":          [-100, -100, 567, ...]  # -100 masks prompt positions from loss
-}
-```
-
-The dataset also stores a `length` key (the maximum of chosen/rejected lengths) used by
-HuggingFace's `LengthGroupedSampler` to sort batches by length, minimising padding
-overhead. If reference log-probs are provided (always during training), each item also
-carries `ref_chosen_logp` and `ref_rejected_logp` as scalars.
-
-### Data Collator — [spin_data_collator.py](spin_data_collator.py)
-
-`SPINDataCollator` receives a list of dataset items (one per example in the batch) and
-pads them into batched tensors:
-
-- `chosen_input_ids` / `rejected_input_ids` — right-padded to the longest sequence
-  in the batch with `pad_token_id`.
-- `chosen_attention_mask` / `rejected_attention_mask` — right-padded with `0`.
-- `chosen_labels` / `rejected_labels` — right-padded with `-100` so padded positions
-  are automatically excluded from the loss.
-- `ref_chosen_logp` / `ref_rejected_logp` — stacked into a `(batch,)` float32 tensor.
-
-The chosen and rejected sequences are padded *independently* (they may have very
-different lengths). This is critical for the memory-efficient two-pass forward during
-training — each pass only needs to allocate memory for its own sequence length.
-
-### Trainer and Loss — [spin_trainer.py](spin_trainer.py)
-
-`SPINTrainer` extends HuggingFace's `Trainer` and overrides the training step.
-
-#### Training Step
-
-This is the hot path — called once per micro-batch:
-
-1. The reference log-probs (`ref_chosen_logp`, `ref_rejected_logp`) are loaded from the
-   batch as pre-computed scalars — no model forward pass is needed.
-2. **Forward pass 1** — runs the trainable model on the chosen (human) sequence to get
-   `log π_θ(y_human | x)`.
-3. **Forward pass 2** — runs the trainable model on the rejected (synthetic) sequence to
-   get `log π_θ(y_synthetic | x)`.
-4. **Margin** — computed as `(π_θ(chosen) − ref_chosen_logp) − (π_θ(rejected) − ref_rejected_logp)`,
-   then scaled by λ.
-5. **Loss** — the configured loss function is applied to the margin and backpropagation runs.
-
-**Why two separate forward passes instead of one?**
-Batching chosen and rejected together would require a batch of size `2 × batch_size`
-with both sequence types, forcing peak activation memory to equal `chosen_len +
-rejected_len`. Running them sequentially caps peak memory at `max(chosen_len,
-rejected_len)` — up to 2× less for long sequences.
-
-Per-step metrics logged: `loss`, `margin_mean`, `margin_std`, `win_rate`
-(fraction of examples where `margin > 0`), `pi_chosen_logp`, `pi_rejected_logp`,
-`ref_chosen_logp`, `ref_rejected_logp`, `kl_from_ref`, `learning_rate`.
-
-#### RMSProp Variant
-
-`RMSPropSPINTrainer` subclasses `SPINTrainer` and overrides the optimizer creation to
-use RMSprop instead of AdamW. RMSprop maintains one optimizer-state tensor per
-parameter (running mean of squared gradients) versus AdamW's two (first + second
-moment), saving approximately 2 GB of GPU memory per 1B-parameter model. The
-`foreach=True` flag enables fused kernel implementations for the update step,
-recovering some of the speed cost.
-
-#### SPIN Loss
-
-The loss operates on a per-example `margin` (after λ scaling):
-
-| `loss_type` | Formula | Gradient behaviour |
-|---|---|---|
-| `logistic` | `softplus(−margin)` = `log(1 + exp(−margin))` | Smooth; always non-zero gradient; asymptotes to 0 from above as margin→∞ |
-| `hinge` | `relu(1 − margin)` | Zero gradient when `margin > 1`; hard boundary |
-| `correlation` | `1 − margin` | Constant gradient regardless of margin |
-| `exponential` | `exp(−margin)` | Very aggressive gradient for negative margins; can cause instability |
-
-`logistic` is the default and recommended setting — it never fully stops penalising
-negative margins, which keeps gradients flowing even on nearly-aligned examples.
-
-### Utilities — [utils.py](utils.py)
-
-`utils.py` provides all shared infrastructure used by both `main.py` (training) and
-`evaluate.py` (evaluation). `evaluate.py` imports everything via `from utils import *`
-and delegates model loading, tokenisation, compilation, directory management, memory
-logging, and JSON I/O to the helpers defined here.
-
-**Model lifecycle:**
-- Loading `AutoModelForCausalLM` with the configured dtype and attention implementation.
-  When loading as the frozen reference model, `eval()` mode is set and all parameter
-  gradients are disabled. When loading as the trainable model, gradient checkpointing
-  is optionally enabled.
-- Converting from frozen reference to trainable: base weights are frozen and PEFT LoRA
-  adapters are inserted via `get_peft_model()`, or all parameters are unfrozen for full
-  fine-tuning.
-- After training, LoRA adapters are merged back into the base weights via
-  `merge_and_unload()` before saving.
-- Between iterations the model is deleted, garbage collection runs, and the CUDA cache
-  is emptied to free GPU memory.
-
-**Log-probability computation:**
-- A forward pass through the model produces logits of shape `(batch, seq_len, vocab)`.
-- The standard autoregressive shift is applied: logits at position `t` predict token
-  `t+1`.
-- Prompt positions (where `labels == -100`) are masked out.
-- Per-token log-probabilities are gathered and summed over response tokens to produce
-  one scalar per sequence.
-- `use_cache=False` prevents unnecessary KV-cache allocation during scoring.
-
-**Generation:**
-- Prompts are batched and fed to `model.generate()`. The attention mask's row sums give
-  the actual prompt lengths (handling left-padded batches), which are used to slice the
-  newly generated tokens from the output sequences.
-
-**Tokenisation:**
-- Three chat-template modes: `"plain"` (raw prompt), `"instruction_response"` (manual
-  prefix/suffix wrapping), and `"auto"` (uses the tokenizer's built-in `chat_template`
-  if available, falls back to `instruction_response`).
-- The prompt and response are always concatenated before tokenisation to avoid
-  subword-boundary artifacts.
-
-**Dataset loading:**
-- Supports HuggingFace Hub datasets and local JSONL/JSON/Parquet files.
-- Multi-turn chat datasets are normalised by extracting the first user/assistant turn,
-  tolerating role-name variants (`user`, `human`, `assistant`, `model`, `gpt`, `bot`).
-- Records missing a valid user→assistant exchange are silently skipped.
-
-**Crash safety:**
-- All JSONL caches are written via a write-to-temp-then-rename strategy so a kill
-  mid-write never leaves a corrupt file.
-- Stale HuggingFace `.lock` files from killed prior runs are cleaned up at process
-  start to prevent deadlocks.
-
-**Training arg helpers:**
-- λ selection: returns `lambda_final_iteration` on the last iteration and
-  `lambda_initial` for all others.
-- LR selection: `learning_rate` for early iterations, `learning_rate_late` from
-  `late_lr_start_iteration` onward.
-
-### Callbacks — [trainer_callback/](trainer_callback/)
-
-Four callbacks augment training with observability:
-
-| Callback | Purpose |
-|---|---|
-| `TensorBoardCallbackExtended` | Per-step scalars (loss, margin, win rate, log-probs, KL, LR), PR curves, embedding projector snapshots, model graph |
-| `TensorBoardParameterStatsCallback` | Per-parameter weight/gradient histograms and scalar statistics (mean, std, L2 norm) every `parameter_log_interval` steps |
-| `TorchProfilerCallback` | PyTorch profiler traces: operator-level GPU/CPU timelines, memory events, FLOP counts, flamegraph stacks |
-| `MemoryProbeCallback` | CPU RSS and GPU allocated/reserved memory at the start/end of each epoch |
-| `SPINIterationSummaryCallback` | Cross-iteration summary written to the global TensorBoard run; tracks dataset size, lambda, win rate trends across iterations |
-
----
-
-## Evaluation — [evaluate.py](evaluate.py)
-
-`evaluate.py` is a benchmark harness that evaluates every trained checkpoint against
-five standard LLM benchmarks (GSM8k is included in the implementation but disabled by
-default — uncomment its line in `TASKS` to enable it). It requires no `lm_eval`
-dependency — all scoring is implemented directly using HuggingFace `transformers`.
-
-Model loading, tokeniser setup, compilation, memory management, and JSON output all
-delegate to the shared helpers in `utils.py` (imported via `from utils import *`):
-
-| utils.py function | Role in evaluate.py |
-|---|---|
-| `load_causal_lm(path, cfg, trainable=False)` | Load each checkpoint in frozen eval mode |
-| `load_tokenizer(cfg)` | Configure tokeniser (pad token, padding side) from checkpoint path |
-| `maybe_compile_model(model, cfg, label)` | `torch.compile()` the eval model with `fullgraph=False` |
-| `ensure_dir(path)` | Create output and TensorBoard directories |
-| `free_model(model)` | Delete model, run GC, empty CUDA cache between checkpoints |
-| `save_json(path, obj)` | Write per-iteration score files and the final summary |
-| `log_memory(tag)` | Log CPU/GPU memory before and after each model load/free |
-
-### Programmatic vs Standalone Usage
-
-**Standalone** (CLI):
-```bash
-python evaluate.py --checkpoints-dir ./spin_outputs/checkpoints
-```
-`main()` parses CLI flags (defaults derived from `SPINConfig()`), builds a config
-with `dataclasses.replace()`, and calls `run_eval(cfg)`.
-
-**Programmatic** (called from another script):
-```python
-from evaluate import run_eval
-run_eval(cfg)                                  # all iterations, all tasks
-run_eval(cfg, iters=["iter_2", "iter_4"])      # specific iterations
-run_eval(cfg, active_tasks=[...], n_shots={…}) # custom task subset / shot counts
-```
-
-All evaluation settings (`eval_output_dir`, `eval_batch_size`, `eval_limit`, etc.)
-come from `SPINConfig` fields — see [Configuration Reference](#configuration-reference).
-
-### Overview Flow
-
-```
-run_eval(cfg)
-├── ensure_dir(cfg.eval_output_dir)
-├── ensure_dir(cfg.eval_tensorboard_dir)
-├── Discover iter_* checkpoint directories (sorted by numeric index)
-└── For each iteration:
-    ├── [cache hit] load scores from iter_N.parsed.json
-    └── [cache miss]
-        ├── find_model_path() — probe candidate sub-dirs for config.json
-        ├── load_tokenizer(cfg with tokenizer_name_or_path=checkpoint_path)
-        ├── log_memory(before_load)
-        ├── load_causal_lm(path, cfg, trainable=False).to(cfg.device)
-        ├── log_memory(after_load)
-        ├── maybe_compile_model() with fullgraph=False, mode="default" (safe for model.generate)
-        ├── run_all_benchmarks() → per-task scores
-        ├── log_memory(before_free) → free_model() → log_memory(after_free)
-        └── save_json(iter_N.parsed.json, scores)
-    ├── Compute delta vs previous iteration
-    ├── Track running best-average
-    └── Write TensorBoard row
-├── Print formatted comparison table to stdout
-├── write_summary() → comparative_summary.txt
-├── save_json() → comparative_summary.json
-└── Close TensorBoard writer
-```
-
-### Benchmark Descriptions
-
-| Benchmark | Metric | Shots | What it tests | Active |
-|---|---|---|---|---|
-| **ARC-Challenge** | acc_norm | 25 | Grade-school science questions selected to defeat retrieval and word-co-occurrence methods | ✅ |
-| **TruthfulQA MC2** | mc2 | 0 | Whether the model outputs truthful statements; multiple correct answers per question | ✅ |
-| **Winogrande** | acc | 5 | Commonsense pronoun/coreference resolution (large-scale Winograd schema) | ✅ |
-| **HellaSwag** | acc_norm | 10 | Commonsense sentence completion; adversarially selected incorrect endings | ✅ |
-| **MMLU** | acc | 5 | 57 academic subjects spanning humanities, STEM, social sciences, and professional domains | ✅ |
-| **GSM8k** | acc | 5 | Grade-school arithmetic word problems requiring multi-step chain-of-thought reasoning | ⬜ disabled by default |
-
-GSM8k is implemented but commented out in the `TASKS` list — uncomment it to enable.
-Shot counts match the Open LLM Leaderboard v1 defaults so results are directly
-comparable to published numbers.
-
-### Scoring Strategy
-
-All multiple-choice benchmarks (ARC, TruthfulQA, Winogrande, HellaSwag, MMLU) use
-**log-likelihood continuation scoring**. For each answer choice, the model scores:
-
-```
-sum_t log P(choice_token_t | context, choice_tokens_0..t-1)
-```
-
-The choice with the highest score wins.
-
-**Key implementation detail — tokenise together, not separately:**
-The context and each choice are always concatenated *before* tokenisation. Tokenisers
-can split subwords differently at a string boundary when the two strings are encoded in
-isolation (the "boundary artifact" problem). Tokenising the full string together ensures
-the model sees exactly the tokens it would during free-form generation.
-
-**Truncation:** When the combined sequence exceeds `MAX_SEQ_LEN=2048` tokens, it is
-truncated from the *left* of the context window, preserving the choice tokens intact —
-since those are the tokens being scored.
-
-**Batched scoring:** `score_examples_batched()` amortises GPU kernel-launch overhead by
-packing `eval_batch_size` (context, continuation) sequences from *multiple questions* into
-a single forward pass — choices from different questions are batched together, not just
-choices from the same question. Sequences are left-padded to the batch maximum length so
-real tokens are right-aligned and attention patterns are valid. This gives higher GPU
-utilisation than one pass per question or per choice.
-
-**acc_norm (length normalisation):** Used for ARC-Challenge and HellaSwag. Before
-selecting the winning choice, each score is divided by the *character length* of the
-choice text. Without normalisation the model would trivially prefer shorter choices
-that accumulate fewer (negative) log-probabilities.
-
-**mc2 (TruthfulQA):** TruthfulQA MC2 has *multiple* correct answers per question.
-Softmax is applied across all choice log-likelihoods to produce a probability
-distribution; the score is the sum of probability mass landing on all correct choices.
-A score of 1.0 means all probability was assigned to true statements.
-
-**GSM8k uses greedy generation** instead of log-likelihood scoring. The model freely
-generates its answer and the final number is extracted — first by looking for the
-canonical `"#### N"` delimiter used in the training data, falling back to the last
-number anywhere in the generated text. Comma stripping makes `"1,234"` and `"1234"`
-compare equal.
-
-### Per-Task Details
-
-#### ARC-Challenge
-
-- **Dataset:** `allenai/ai2_arc` (ARC-Challenge split), test set.
-- **Few-shot format:** `"Question: {question}\nAnswer: {full answer text}"` × 25
-  exemplars from the training split. The full answer text (not just the letter A/B/C/D)
-  is used both in exemplars and as the scored continuation.
-- **Scoring:** acc_norm — length-normalised log-likelihood over all choice texts.
-
-#### TruthfulQA MC2
-
-- **Dataset:** `truthful_qa` (multiple_choice split), validation set.
-- **Format:** `"Q: {question}\nA: {choice}"` (zero-shot only — no reliable few-shot
-  training split exists).
-- **Scoring:** mc2 — softmax over all choice log-likelihoods; sum probability mass on
-  the subset of correct choices.
-
-#### Winogrande
-
-- **Dataset:** `winogrande` (winogrande_xl split), validation set.
-- **Format:** The sentence has a blank `_`. Context = text before the blank. Each option
-  is scored as `"{option}{text after blank}"`.
-- **Example:** *"The trophy doesn't fit in the suitcase because _ is too large."*
-  → Context: *"The trophy doesn't fit in the suitcase because "*, scored continuations:
-  *"the trophy is too large."* vs *"the suitcase is too large."*
-- **Scoring:** acc — raw log-likelihood, no normalisation.
-
-#### GSM8k
-
-- **Dataset:** `gsm8k` (main split), test set.
-- **Few-shot:** 5 hard-coded Chain-of-Thought exemplars teach the model to show its
-  work and end with `"#### <number>"`. These are the canonical exemplars from Wei et
-  al. (2022) and lm_eval.
-- **Scoring:** acc — greedy generation followed by exact numeric string match after
-  extracting the final answer from both the generated text and the ground truth.
-
-#### HellaSwag
-
-- **Dataset:** `Rowan/hellaswag`, validation set.
-- **Preprocessing:** `[bracket]` annotation artefacts and extra whitespace are stripped.
-- **Format:** `"{activity label}: {partial context}"` + `" {ending}"`.
-- **Scoring:** acc_norm — length-normalised log-likelihood over four candidate endings.
-
-#### MMLU
-
-- **Dataset:** `cais/mmlu` (all subjects), test set.
-- **Format:**
-  ```
-  The following is a multiple choice question about {subject}.
-  {question}
-  A. {choice0}  B. {choice1}  C. {choice2}  D. {choice3}
-  Answer:
-  ```
-  The continuation is a single letter ` A`, ` B`, ` C`, or ` D`.
-- **Few-shot:** Per-subject few-shot prefix using up to 5 examples from the `dev` split
-  for the same subject as the test question.
-- **Scoring:** acc — no normalisation (all choices are the same length: one character).
-
-### Evaluation Loop and Output
-
-**Model discovery:** The evaluator probes a prioritised list of candidate
-sub-directories inside each `iter_*` folder (`hf_final`, `final_checkpoint`,
-`checkpoint-final`, `merged`, `model`, the folder itself) looking for `config.json` or
-`adapter_config.json`. If none match it walks the entire subtree recursively. This
-handles all checkpoint layouts SPIN may produce.
-
-**Memory management:** `free_model()` (from utils.py) deletes the model reference, runs
-garbage collection, and empties the CUDA cache immediately after benchmarks complete.
-`log_memory()` records CPU RSS and GPU allocated/reserved memory before load and after
-free, so memory growth across iterations is visible in the log. Loading and scoring a
-single checkpoint can require 4–16 GB depending on model size; freeing between
-iterations prevents OOM when evaluating many checkpoints in sequence.
-
-**Delta tracking:** Per-task score differences between consecutive iterations are
-computed. `None` is returned for any task that failed in either iteration so that
-`0.0` unambiguously means no change (not a missing result).
-
-**Best-iteration tracking:** The running best average across all evaluated iterations
-is tracked and annotated with `★ NEW BEST` in both the CLI output and TensorBoard.
-
-**Output files:**
-```
-eval_results/
-├── iter_0.parsed.json          # Per-task scores for iter_0 (raw fractions × 100)
-├── iter_1.parsed.json
-├── comparative_summary.txt     # TSV table + per-iteration narrative (paste into spreadsheet)
-└── comparative_summary.json    # Full results list with deltas and best-so-far tracking
-```
-
-**CLI output example:**
-```
-============================================================
- iter_1  →  /path/to/checkpoints/iter_1
-============================================================
-  [Arc] arc_challenge | 25-shot | full ...
-    Arc: 42.15%  (183s)
-  [TruthfulQA] truthfulqa_mc2 | 0-shot | full ...
-    TruthfulQA: 51.30%  (97s)
-  ...
-
-  [iter_1]  avg=46.72%  Δprev_avg=▲+1.40  best_so_far=46.72%  ★ NEW BEST  (712s total)
-  ▲ improved: Arc, TruthfulQA, HellaSwag
-  ▼ declined: Winogrande
-```
-
-**Final comparison table:**
-```
-+----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
-| Iteration | Arc  | TruthfulQA | Winogrande | GSM8k | HellaSwag | MMLU  | Avg%  | ΔAvg  | Status |
-+----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
-| iter_0   | 40.80 | 50.10      | 62.30     | 18.50 | 71.20     | 46.00 | 48.15 |   NA  |        |
-| iter_1   | 42.15 | 51.30      | 61.90     | 19.20 | 72.40     | 47.30 | 49.04 | ▲+0.89| ★ BEST |
-+----------+-------+------------+-----------+-------+-----------+-------+-------+-------+--------+
-```
-
-### Evaluation TensorBoard Panels
-
-```bash
-tensorboard --logdir ./spin_outputs/tensorboard
-```
-
-The evaluation run writes to `tensorboard/eval_compare/`:
-
-| Panel | Tags | Description |
-|---|---|---|
-| **Custom Scalars → Evaluation** | `eval/average`, `eval/best_so_far_average` | Average score and running best across iterations |
-| **Custom Scalars → Evaluation** | `eval/tasks/<name>` | Per-task score for each iteration |
-| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/<name>` | Per-task score change from the preceding iteration |
-| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improvement_rate` | Fraction of tasks that improved (0–1) |
-| **Custom Scalars → Delta vs Previous** | `compare_vs_prev/improved_task_count`, `…/declined_task_count` | Count of tasks improved / declined |
-| **Text → eval/scorecard** | — | Markdown table of scores + deltas, one card per iteration |
-| **Text → eval/best_iteration** | — | Note written each time a new best average is reached |
-| **Text → eval/run_config** | — | Shot counts, device, directories — written once at step 0 |
-
----
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
-Key runtime dependencies: `transformers`, `peft`, `torch`, `datasets`, `accelerate`,
-`tensorboard`.
-
-A CUDA-capable GPU is required for practical training. The code targets CUDA 13.0 /
-PyTorch 2.11.
-
----
-
-## Quick Start
-
-```bash
-python main.py \
-  --model_name_or_path distilbert/distilgpt2 \
-  --dataset_name HuggingFaceH4/ultrachat_200k \
-  --train_split train_sft \
-  --num_iterations 3 \
-  --data_batch_size 65536 \
-  --per_device_train_batch_size 16 \
-  --gradient_accumulation_steps 32 \
-  --output_dir ./runs/my_run
-```
-
-All `SPINConfig` fields are exposed as CLI flags — pass any field as `--field_name value`.
-
-### Tested and Planned Models
-
-This implementation is being systematically evaluated on the following models in size order:
-
-| Size | Model | Status |
-|------|-------|--------|
-| ~21 M | `roneneldan/TinyStories-1Layer-21M` | Planned |
-| ~33 M | `roneneldan/TinyStories-Instruct-33M` | Planned |
-| 82 M | `distilbert/distilgpt2` | **In progress** |
-| 135 M | `HuggingFaceTB/SmolLM2-135M` | Planned |
-| 270 M | `microsoft/harrier-oss-v1-270m` | 1/5 iterations complete |
-| 600 M | `microsoft/harrier-oss-v1-0.6b` | Planned |
-| 1.3 B | `microsoft/phi-1_5` | Planned |
-
-LoRA target modules are auto-detected per architecture — no config change needed when switching models.
-
-### Local dataset
-
-```bash
-python main.py \
-  --data_path ./my_data.jsonl \
-  --model_name_or_path /path/to/local/model \
-  --num_iterations 3
-```
-
-JSONL files must contain records with `prompt` and `response` keys, **or** a `messages`
-list of `{"role": ..., "content": ...}` dicts.
-
-### Running Evaluation
-
-All CLI defaults are derived from `SPINConfig()`, so they automatically align with the
-training output layout (`./spin_outputs/checkpoints`, `./spin_outputs/eval_results`,
-`./spin_outputs/tensorboard/eval_compare`).
-
-```bash
-# Evaluate all iter_* checkpoints in the default directory (./spin_outputs/checkpoints)
-python evaluate.py
-
-# Evaluate a specific subset of iterations
-python evaluate.py --iters iter_0 iter_2 iter_4
-
-# Smoke test — limit examples per task (do NOT use for real benchmarks)
-python evaluate.py --limit 50
-
-# Override shot counts for specific tasks
-python evaluate.py --n-shots arc_challenge=10 gsm8k=3
-
-# Run only a subset of tasks
-python evaluate.py --tasks arc_challenge winogrande mmlu
-
-# Exclude specific tasks (complement of --tasks; mutually exclusive with it)
-python evaluate.py --skip-tasks hellaswag mmlu
-
-# Custom checkpoint and output directories
-python evaluate.py \
-  --checkpoints-dir ./runs/my_run/checkpoints \
-  --output-dir      ./runs/my_run/eval_results \
-  --tensorboard-dir ./runs/my_run/tensorboard/eval
-
-# Skip already-evaluated iterations (default); force re-evaluation
-python evaluate.py --no-cache
-```
-
----
-
-## Configuration Reference
-
-All options live in [spin_config.py](spin_config.py). The most important ones:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `model_name_or_path` | `distilbert/distilgpt2` | HuggingFace Hub ID or local checkpoint path |
-| `dataset_name` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset (overridden by `data_path`) |
-| `num_iterations` | `5` | Number of SPIN outer loops |
-| `data_batch_size` | `65536` | Rows per checkpoint batch — each batch runs all 3 steps atomically; smaller = more frequent crash-recovery saves |
-| `lambda_initial` | `0.1` | SPIN loss scale λ for all but the last iteration |
-| `lambda_final_iteration` | `5.0` | λ for the final iteration (stronger alignment push) |
-| `loss_type` | `logistic` | `logistic` \| `hinge` \| `correlation` \| `exponential` |
-| `use_lora` | `True` | Enable LoRA (strongly recommended on small GPUs) |
-| `lora_r` | `16` | LoRA rank |
-| `optimizer` | `rmsprop` | `rmsprop` (less memory) \| `adamw` |
-| `per_device_train_batch_size` | `16` | Reduce to `1` on an 8 GB GPU |
-| `gradient_accumulation_steps` | `32` | Compensate for small batch size. Must satisfy `data_batch_size ≥ per_device_train_batch_size × gradient_accumulation_steps` |
-| `learning_rate` | `5e-5` | Peak LR for early iterations |
-| `learning_rate_late` | `1e-5` | LR from `late_lr_start_iteration` onward |
-| `max_length` | `512` | Max tokens (prompt + response) during training |
-| `bf16` | `True` | bfloat16 mixed precision (Ampere+ GPU required) |
-| `gradient_checkpointing` | `False` | Recompute activations to save ~10× memory at ~33% compute cost |
-| `output_dir` | `./spin_outputs` | Root directory for all training outputs |
-| `eval_output_dir` | `./spin_outputs/eval_results` | Directory for per-iteration JSON score files and the comparative summary |
-| `eval_tensorboard_dir` | `./spin_outputs/tensorboard/eval_compare` | TensorBoard log directory for evaluation metrics |
-| `eval_limit` | `None` | Max examples per task during evaluation — `None` = full dataset; set a small integer for a smoke test |
-| `eval_batch_size` | `8` | GPU forward-pass batch size for log-likelihood scoring during evaluation |
-| `eval_max_seq_len` | `2048` | Maximum token length (context + continuation) fed to the model during evaluation |
-| `eval_gsm8k_max_new_tokens` | `256` | Maximum new tokens generated per response in the GSM8k benchmark |
-| `eval_no_cache` | `False` | Re-evaluate iterations even if a cached `.parsed.json` result exists |
-| `eval_run_after_training` | `True` | Automatically run benchmark evaluation after all training iterations complete |
-
-### SPIN Loss
-
-The loss operates on a margin per training example:
-
-```
-margin = λ × [(log π_θ(chosen) − log π_ref(chosen)) − (log π_θ(rejected) − log π_ref(rejected))]
-```
-
-A positive margin means the model has improved more on the human response than on the
-synthetic one. The `loss_type` maps this margin to a scalar:
-
-| `loss_type` | Formula | Notes |
-|---|---|---|
-| `logistic` | `softplus(−margin)` | Smooth, never saturates — recommended |
-| `hinge` | `relu(1 − margin)` | Zero loss once margin > 1 |
-| `correlation` | `1 − margin` | Constant gradient, easiest to tune |
-| `exponential` | `exp(−margin)` | Aggressive on negative margins; can be unstable |
-
----
-
-## Memory Tips for Small GPUs (≤ 16 GB)
-
-- Set `--use_lora True` (default) — cuts gradient/optimizer memory by ~10–100×.
-- Lower `--per_device_train_batch_size 1` and raise `--gradient_accumulation_steps 64`.
-- Enable `--gradient_checkpointing True` — trades ~33% compute for ~10× less activation memory.
-- Use `--optimizer rmsprop` — saves ~2 GB vs AdamW on a 1 B-parameter model.
-- Reduce `--max_length 512` and `--max_prompt_length 256`.
-- Set `--generation_batch_size 4` — each beam holds its own KV cache during generation.
-- Set `--bf16 True` (default on Ampere+) or `--fp16 True` on older GPUs.
-
----
-
-## Output Structure
-
-```
-spin_outputs/
-├── config.json                           # Snapshot of SPINConfig for this run
-├── synthetic/
-│   ├── iter_0_batch_000000_synth.jsonl    # Step 1 output: synthetic responses for batch 0
-│   ├── iter_0_batch_000000_logprobs.jsonl # Step 2 output: ref log-probs for batch 0
-│   ├── iter_0_batch_000000_tokenized.pt   # Step 3 cache: pre-tokenized dataset for batch 0
-│   ├── iter_0_batch_000001_synth.jsonl
-│   ├── iter_0_batch_000001_logprobs.jsonl
-│   ├── iter_0_batch_000001_tokenized.pt
-│   └── ...
-├── checkpoints/
-│   ├── iter_0/
-│   │   ├── batch_000000/                 # Step 3 output: merged model after batch 0
-│   │   │   ├── config.json
-│   │   │   ├── model.safetensors
-│   │   │   └── .done                     # Sentinel: all 3 steps done for this batch
-│   │   ├── batch_000001/
-│   │   │   └── ...
-│   │   ├── config.json                   # Final iteration model (copy of last batch)
-│   │   ├── model.safetensors
-│   │   ├── tokenizer_config.json
-│   │   └── .done                         # Iteration-level sentinel
-│   └── iter_1/
-│       └── ...
-├── eval_results/
-│   ├── iter_0.parsed.json
-│   ├── comparative_summary.txt
-│   └── comparative_summary.json
-└── tensorboard/
-    ├── global/                           # Memory + cross-iteration signals
-    ├── iter_0/
-    │   ├── batch_000000/                 # Per-batch TensorBoard logs
-    │   ├── batch_000001/
-    │   └── ...
-    ├── param_stats/
-    ├── profile/
-    └── eval_compare/
-```
-
-**Disk usage note:** Each batch checkpoint in `checkpoints/iter_i/batch_k/` holds a
-full merged model. For a 270 M parameter model in bfloat16 this is ~540 MB per batch.
-With many small batches this can grow large. Delete old batch checkpoints after
-confirming the iteration completed (the iteration-level `.done` is the safe signal).
-
-The final model is at `checkpoints/iter_{num_iterations-1}/`.
-
----
-
-## Resuming After a Crash
-
-No flags are needed. On restart, the script automatically resumes at the finest
-granularity possible:
-
-**Iteration level** — `find_start_iteration()` scans `checkpoints/iter_*/`
-in reverse for an iteration-level `.done` sentinel. Completed iterations are skipped
-entirely.
-
-**Batch level** — within the current iteration, `_find_start_batch()` scans batches
-0 → N in order and returns the first batch where any step is incomplete. Each step
-is re-checked individually:
-
-| What's missing | Action |
-|---|---|
-| `_synth.jsonl` absent or empty | Re-run Step 1 (synthetic generation) |
-| `_logprobs.jsonl` absent or empty | Re-run Step 2 (logprob scoring) |
-| batch `.done` absent | Re-run Step 3 (training); within training, `get_last_checkpoint()` resumes from a partial HF Trainer checkpoint if one exists |
-
-Because each step writes its output atomically (write-to-temp → rename), a kill
-mid-write leaves the previous valid file intact — no corruption, no re-running
-earlier steps.
-
----
-
-## TensorBoard (training)
-
-```bash
-tensorboard --logdir ./spin_outputs/tensorboard
-```
-
-The `global/` run plots metrics across all iterations on a single x-axis. Individual
-`iter_N/` runs show per-step detail for each iteration.
-
-The `global/` run plots memory metrics. Per-batch training metrics land under
-`iter_N/batch_K/` — each data batch gets its own TensorBoard sub-run.
-
-Available panels (depending on config flags):
-
-- **Scalars** — loss, margin mean/std, win rate, log-probs, KL from ref, learning rate
-- **PR Curves** — alignment accuracy per epoch
-- **Projector** — token embedding shift across iterations (PCA / UMAP / t-SNE)
-- **Histograms** — per-layer weight and gradient distributions
-- **Trace** and **Memory** — PyTorch profiler output
-
----
-
-## Project Structure
-
-| File | Description |
-|------|-------------|
-| [main.py](main.py) | Entry point — outer SPIN loop, resume logic, orchestration |
-| [evaluate.py](evaluate.py) | Benchmark evaluation — `run_eval(cfg)` drives five tasks, iteration-over-iteration comparison, and TensorBoard logging; delegates model loading, memory management, and I/O to utils.py |
-| [spin_config.py](spin_config.py) | `SPINConfig` dataclass — all training and evaluation hyperparameters with inline docs |
-| [spin_trainer.py](spin_trainer.py) | `SPINTrainer` and `RMSPropSPINTrainer` — loss computation and training step |
-| [spin_dataset.py](spin_dataset.py) | `SPINDataset` — pre-tokenises chosen/rejected pairs |
-| [spin_data_collator.py](spin_data_collator.py) | `SPINDataCollator` — pads and batches chosen/rejected tensors |
-| [utils.py](utils.py) | Shared infrastructure for training and evaluation: model loading, tokenisation, generation, LoRA merge, memory logging, directory/file helpers, arg parsing |
-| [trainer_callback/](trainer_callback/) | TensorBoard, profiler, memory probe, and iteration summary callbacks |
