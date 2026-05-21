@@ -71,7 +71,7 @@ _CHECKPOINT_SUBDIR_CANDIDATES: list[str] = [
 ]
 _MODEL_CONFIG_MARKERS: list[str] = ["config.json", "adapter_config.json"]
 _TRUST_REMOTE_CODE: bool = False
-_TRUST_REMOTE_CODE_DATASETS: bool = True
+_TRUST_REMOTE_CODE_DATASETS: bool = False
 
 # ---------------------------------------------------------------------------
 # Generation (GSM8k)
@@ -259,6 +259,12 @@ def score_continuations_batched(
     pad_id = tokenizer.pad_token_id
     seq_data: list[tuple[list[int], int, int]] = []
 
+    # Step 1: Tokenize each context+continuation pair and locate where the continuation starts.
+    # Tokenize the full string (not separately) to avoid subword boundary artifacts.
+    # cont_start = index of first continuation token inside full_ids.
+    # Example: context="The cat", cont=" sat" → full_ids=[1,450,6635,3290], cont_len=2
+    #          cont_start = 4 - 2 = 2  (tokens at positions 2,3 are the continuation)
+    # If the full sequence exceeds MAX_SEQ_LEN, left-truncate and recalculate cont_start.
     for cont in continuations:
         full_ids: list[int] = tokenizer(context + cont, add_special_tokens=True)["input_ids"]
         cont_raw: list[int] = tokenizer(cont, add_special_tokens=False)["input_ids"]
@@ -272,6 +278,13 @@ def score_continuations_batched(
             cont_start = max(1, len(full_ids) - cont_len)
         seq_data.append((full_ids, cont_start, cont_len))
 
+    # Step 2: Left-pad all sequences to the same length for batched GPU processing.
+    # Real tokens are right-aligned; padding goes on the left with attention_mask=0.
+    # adj_start shifts cont_start right by pad_len to stay aligned after padding.
+    # Example: max_len=5, seq A has 3 tokens → pad_len=2
+    #          padded_ids[A] = [pad, pad, tok0, tok1, tok2]
+    #          attn_mask[A]  = [0,   0,   1,    1,    1  ]
+    #          adj_start[A]  = cont_start + 2
     max_len = max((len(d[0]) for d in seq_data), default=0)
     padded_ids, attn_masks, adj_starts = [], [], []
 
@@ -286,11 +299,20 @@ def score_continuations_batched(
         attn_masks.append([0] * pad_len + [1] * len(full_ids))
         adj_starts.append(cont_start + pad_len)
 
+    # Step 3: Single batched forward pass → log-probabilities over vocab at every position.
+    # log_softmax converts raw logits to normalized log-probs along the vocab dimension.
+    # Shape: (num_continuations, max_len, vocab_size)
     input_ids_t = torch.tensor(padded_ids, dtype=torch.long, device=device)
     attn_mask_t = torch.tensor(attn_masks,  dtype=torch.long, device=device)
     logits      = model(input_ids=input_ids_t, attention_mask=attn_mask_t).logits
     log_probs   = F.log_softmax(logits, dim=-1)
 
+    # Step 4: For each continuation, extract the log-prob of each actual token and sum.
+    # Autoregressive alignment: the prediction for position cs is at log_probs[cs-1],
+    # because the model at step t predicts step t+1.
+    # Example: cont_tok_ids=[3290, 1234], adj_start=2
+    #          pred_lp = log_probs[i, 1:3]       ← positions cs-1 and cs
+    #          score   = pred_lp[0,3290] + pred_lp[1,1234]  ← log p(token) at each step
     scores: list[float] = []
     for i, (full_ids, _, cont_len) in enumerate(seq_data):
         if not full_ids or cont_len == 0:
@@ -323,6 +345,13 @@ def score_examples_batched(
     pad_id = tokenizer.pad_token_id
     output: list[list[float]] = [[0.0] * len(conts) for _, conts in examples]
 
+    # Step 1: Flatten all (context, continuation) pairs from every example into one list.
+    # Each entry records full_ids, cont_start, cont_len plus (ex_idx, cont_idx) so scores
+    # can be written back to the right slot in output after the forward pass.
+    # Example: examples=[("The cat", [" sat", " ran"]), ("A dog", [" barked"])]
+    #          flat = [(full_ids_0, cs_0, cl_0, 0, 0),   ← "The cat sat"
+    #                  (full_ids_1, cs_1, cl_1, 0, 1),   ← "The cat ran"
+    #                  (full_ids_2, cs_2, cl_2, 1, 0)]   ← "A dog barked"
     flat: list[tuple[list[int], int, int, int, int]] = []
     for ex_idx, (context, continuations) in enumerate(examples):
         for cont_idx, cont in enumerate(continuations):
@@ -336,6 +365,11 @@ def score_examples_batched(
                 cont_start = max(1, len(full_ids) - cont_len)
             flat.append((full_ids, cont_start, cont_len, ex_idx, cont_idx))
 
+    # Step 2: Process flat list in GPU-sized chunks (rows_per_batch rows per forward pass).
+    # Within each chunk, left-pad to chunk-max length, run the model once, then gather scores.
+    # Left-padding keeps real tokens right-aligned so attention is computed correctly.
+    # Example: chunk has 3 rows with lengths [6, 4, 5], max_len=6
+    #          row 1 (len 4): padded=[pad,pad,t0,t1,t2,t3], mask=[0,0,1,1,1,1], adj_cs += 2
     for i in range(0, len(flat), rows_per_batch):
         batch = flat[i : i + rows_per_batch]
         max_len = max(len(r[0]) for r in batch)
@@ -347,12 +381,18 @@ def score_examples_batched(
             masks.append([0] * pl + [1] * len(full_ids))
             adj_cs.append(cont_start + pl)
 
+        # Step 3: Single forward pass for the whole chunk → log-probs over vocab.
         ids_t  = torch.tensor(padded, dtype=torch.long, device=device)
         mask_t = torch.tensor(masks,  dtype=torch.long, device=device)
         lp = F.log_softmax(
             model(input_ids=ids_t, attention_mask=mask_t).logits, dim=-1
         )
 
+        # Step 4: Gather per-token log-probs for the continuation slice and sum into a scalar.
+        # Autoregressive offset: prediction for position cs is stored at lp[cs-1].
+        # Write score back to output[ex_idx][cont_idx] so the outer loop gets a 2-D result.
+        # Example: cs=2, cont=[tok_a, tok_b]
+        #          score = lp[j, 1, tok_a] + lp[j, 2, tok_b]
         for j, (full_ids, _, cont_len, ex_idx, cont_idx) in enumerate(batch):
             cs = adj_cs[j]
             alen = min(cont_len, max_len - cs)
@@ -369,10 +409,18 @@ def _pick_best(scores: list[float], choices: list[str], normalize: bool) -> int:
     When normalize=True (acc_norm) each score is divided by character length of
     the choice text to prevent bias toward shorter answers.
     """
+    # Step 1: Optionally normalize each score by the character length of the choice text.
+    # This prevents the model from preferring shorter answers just because fewer tokens
+    # means fewer log-probs to sum (shorter sums are less negative).
+    # Example: scores=[-3.0, -2.1], choices=["Paris", "A large city in France"]
+    #          raw        → pick index 1 (-2.1 > -3.0) ← wrong, length bias
+    #          normalized → [-3.0/5, -2.1/22] = [-0.60, -0.095] → pick index 1 still,
+    #                       but score is now per-character so long/short compete fairly
     if normalize:
         adjusted = [s / max(len(c), 1) for s, c in zip(scores, choices)]
     else:
         adjusted = list(scores)
+    # Step 2: Return the index of the highest (least-negative) adjusted score.
     return int(max(range(len(adjusted)), key=lambda i: adjusted[i]))
 
 
@@ -440,8 +488,21 @@ def eval_truthfulqa_mc2(
     mc2_scores: list[float] = []
     for ex_scores, ex in zip(all_scores, examples):
         labels  = ex["mc2_targets"]["labels"]
+
+        # Step 1: Convert raw log-likelihood scores to a proper probability distribution.
+        # softmax re-normalizes across ALL answer choices (both correct and incorrect),
+        # so the values sum to 1 and are comparable across questions with different
+        # numbers of choices.
+        # Example: ex_scores=[-2.1, -3.4, -1.8, -4.0]  (4 choices)
+        #          probs ≈ [0.31, 0.09, 0.42, 0.04, ...] after softmax (sums to 1.0)
         log_lls = torch.tensor(ex_scores, dtype=torch.float64)
         probs   = torch.softmax(log_lls, dim=0)
+
+        # Step 2: MC2 score = sum of probabilities assigned to the *correct* answers.
+        # labels[i]==1 marks a correct answer; labels[i]==0 marks an incorrect one.
+        # Example: labels=[0,1,1,0], probs=[0.31,0.09,0.42,0.04]
+        #          mc2 = probs[1] + probs[2] = 0.09 + 0.42 = 0.51
+        #          (higher = model assigns more probability mass to truthful answers)
         mc2_scores.append(float(sum(probs[i] for i, lbl in enumerate(labels) if lbl == 1)))
     return float(sum(mc2_scores) / len(mc2_scores))
 
@@ -467,6 +528,17 @@ def eval_winogrande(
             answer_option = ex["option1"] if ex["answer"] == "1" else ex["option2"]
             few_shot_prefix += ex["sentence"].replace("_", answer_option) + "\n\n"
 
+    # Step 1: Split each sentence at the blank ("_") into context and remainder.
+    # Winogrande sentences have exactly one "_" placeholder for a pronoun or noun.
+    # The two candidate options (option1, option2) each fill that blank.
+    # We reconstruct full sentences by inserting each option and appending the rest
+    # of the original sentence after the blank so the model scores the complete text.
+    # Example: sentence="The trophy wouldn't fit in the brown suitcase because _ was too big."
+    #          blank_idx = 46  (index of "_")
+    #          context = "The trophy wouldn't fit in the brown suitcase because "
+    #          rest    = " was too big."
+    #          option1="it", option2="the suitcase"
+    #          continuations = ["it was too big.", "the suitcase was too big."]
     inputs = []
     for ex in test_examples:
         blank_idx = ex["sentence"].index("_")
@@ -476,6 +548,12 @@ def eval_winogrande(
 
     all_scores = score_examples_batched(model, tokenizer, inputs, device, batch_size)
 
+    # Step 2: Pick the higher-scoring option and compare against the ground-truth answer label.
+    # answer is "1" or "2" (string), so we map score comparison to the same string format.
+    # No length normalization here (unlike ARC/HellaSwag) because both options fill the same
+    # blank in the same sentence frame, so their lengths are directly comparable.
+    # Example: s1=-2.1 (score for option1 "it"), s2=-3.4 (score for option2 "the suitcase")
+    #          s1 > s2 → predicted "1"; answer="1" → correct
     correct = sum(
         1 for (s1, s2), ex in zip(all_scores, test_examples)
         if ("1" if s1 > s2 else "2") == ex["answer"]
@@ -507,21 +585,44 @@ def eval_gsm8k(
         test_examples = test_examples[:limit]
     logger.info(f"  GSM8k: {len(test_examples)} test examples.")
 
+    # Step 1: Build a fixed few-shot prefix from hand-curated Q&A pairs.
+    # These examples are prepended to every test prompt to prime the model's output
+    # format, particularly the "####<answer>" pattern that _extract_number looks for.
+    # Example: n_shot=4 → prefix = "Question: ...\nAnswer: ...\n\nQuestion: ...\n..." (4 blocks)
     few_shot_prefix = "".join(
         f"Question: {q}\nAnswer: {a}\n\n"
         for q, a in _GSM8K_FEW_SHOT[:n_shot]
     )
 
+    # Step 2: Reserve prompt token budget so the generation never exceeds MAX_SEQ_LEN.
+    # max_prompt_len caps the tokenized prompt; the model then generates up to
+    # GSM8K_MAX_NEW_TOKENS additional tokens for the answer. Together they stay
+    # within the model's context window.
+    # Example: MAX_SEQ_LEN=2048, GSM8K_MAX_NEW_TOKENS=256 → max_prompt_len=1792
     max_prompt_len = MAX_SEQ_LEN - GSM8K_MAX_NEW_TOKENS
     correct = 0
     for i in tqdm(range(0, len(test_examples), batch_size), desc="GSM8k", leave=False, unit="batch"):
         batch   = test_examples[i : i + batch_size]
+
+        # Step 3: Tokenize prompts with right-padding so batched generation works correctly.
+        # padding=True pads shorter prompts in the batch to the longest one.
+        # truncation=True ensures no prompt exceeds max_prompt_len (drops from the left
+        # implicitly via tokenizer default, keeping the question tail).
+        # Moving to device here because model.generate() requires on-device tensors.
+        # Example: batch of 8 questions → enc["input_ids"] shape (8, max_prompt_len)
         prompts = [few_shot_prefix + f"Question: {ex['question']}\nAnswer:" for ex in batch]
         enc = tokenizer(
             prompts, return_tensors="pt", padding=True,
             truncation=True, max_length=max_prompt_len,
         )
         enc = {k: v.to(device) for k, v in enc.items()}
+
+        # Step 4: Greedy decoding (do_sample=False) to produce deterministic answers.
+        # out shape: (batch, prompt_len + num_generated_tokens) — includes the prompt prefix.
+        # prompt_len is constant across the batch after padding, so we slice [prompt_len:]
+        # to isolate only the newly generated tokens.
+        # Example: enc shape (8, 1792), max_new_tokens=256 → out shape (8, 2048)
+        #          out[j, 1792:] contains the generated answer for example j
         with torch.no_grad():
             out = model.generate(
                 **enc,
@@ -530,6 +631,14 @@ def eval_gsm8k(
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
+
+        # Step 5: Decode generated tokens and compare extracted numbers to ground truth.
+        # _extract_number first looks for the "#### <answer>" chain-of-thought marker,
+        # then falls back to the last number in the string if the marker is absent.
+        # Both generated text and the reference answer go through _extract_number so the
+        # comparison is format-agnostic (commas, leading zeros, etc. are normalized away).
+        # Example: generated="...so the answer is #### 42", answer="#### 42"
+        #          _extract_number(generated)="42", _extract_number(answer)="42" → correct
         prompt_len = enc["input_ids"].shape[1]
         for j, ex in enumerate(batch):
             generated = tokenizer.decode(out[j, prompt_len:], skip_special_tokens=True)
@@ -674,6 +783,12 @@ def run_all_benchmarks(
     logger.info(f"Starting benchmark suite: {len(active_tasks)} tasks, device={device}, limit={limit}")
 
     for task_id, label, _, _, task_limit in active_tasks:
+        # Step 1: Resolve per-task shot count and example limit.
+        # n_shots is a per-task dict; tasks not listed default to 0-shot.
+        # task_limit (from TASKS tuple) takes priority over the global limit so
+        # expensive tasks like MMLU can be capped independently.
+        # Example: task_id="gsm8k", n_shots={"gsm8k":8,"arc_challenge":25}
+        #          n_shot=8, effective_limit=task_limit if set, else global limit
         n_shot = n_shots.get(task_id, 0)
         effective_limit = task_limit if task_limit is not None else limit
         n_examples = f"limit={effective_limit}" if effective_limit else "full"
@@ -681,6 +796,9 @@ def run_all_benchmarks(
         print(f"  [{label}] {task_id} | {n_shot}-shot | {n_examples} ...", flush=True)
         t0 = time.time()
         try:
+            # Step 2: Call the task-specific eval function which returns a fraction in [0,1].
+            # Convert to a percentage rounded to 4 decimal places for consistency across tasks.
+            # Example: score=0.7543 (ARC) → results["ARC-Challenge"] = 75.43
             score = _EVAL_FNS[task_id](
                 model, tokenizer, device,
                 n_shot=n_shot,
@@ -692,10 +810,17 @@ def run_all_benchmarks(
             logger.info(f"  {label} complete: {results[label]:.2f}%  ({elapsed[label]:.0f}s)")
             print(f"    {label}: {results[label]:.2f}%  ({elapsed[label]:.0f}s)", flush=True)
         except Exception as exc:
+            # Step 3: Catch task failures and record None so a single bad task doesn't
+            # abort the entire benchmark suite. None is excluded from the Average.
             elapsed[label] = round(time.time() - t0, 1)
             logger.warning(f"Task {task_id} failed after {elapsed[label]:.0f}s: {exc}")
             results[label] = None
 
+    # Step 4: Compute the macro-average across all tasks that returned a valid score.
+    # None entries (failed tasks) are filtered out before computing the mean so a failure
+    # doesn't pull the average toward 0.
+    # Example: results={"ARC":75.43, "HellaSwag":None, "MMLU":62.10}
+    #          vals=[75.43, 62.10] → Average = mean([75.43, 62.10]) = 68.77
     vals = [v for v in results.values() if v is not None]
     results["Average"] = round(mean(vals), 4) if vals else None
     logger.info(f"Benchmark suite complete. Average: {results['Average']}")
@@ -732,6 +857,8 @@ def fmt_delta(v: float | None) -> str:
 
 
 def iter_num(name: str) -> int:
+    if name == "base_model":
+        return -1
     m = re.search(r"iter_(\d+)", name)
     return int(m.group(1)) if m else _ITER_NUM_SENTINEL
 
@@ -959,6 +1086,7 @@ def run_eval(
     iters: list[str] | None = None,
     active_tasks: list[tuple] | None = None,
     n_shots: dict[str, int] | None = None,
+    include_base_model: bool = True,
 ) -> None:
     """Run benchmark evaluation for all (or specified) SPIN iteration checkpoints.
 
@@ -1027,9 +1155,91 @@ def run_eval(
         device=cfg.device,
         limit=cfg.eval_limit,
         n_shots_resolved=n_shots,
-        n_iters=len(iter_paths),
+        n_iters=len(iter_paths) + (1 if include_base_model else 0),
         active_tasks=active_tasks,
     )
+
+    if include_base_model:
+        base_name      = "base_model"
+        base_json_path = out_dir / f"{base_name}.parsed.json"
+        print(f"\n{'='*60}", flush=True)
+
+        if base_json_path.exists() and not cfg.eval_no_cache:
+            logger.info("========== Loading cached base_model ==========")
+            print(f" base_model  →  [cached] {base_json_path}", flush=True)
+            print(f"{'='*60}", flush=True)
+            base_metrics              = json.loads(base_json_path.read_text())
+            base_elapsed: dict[str, float] = {}
+            base_ok = True
+        else:
+            logger.info("========== Evaluating base_model ==========")
+            print(f" base_model  →  {cfg.model_name_or_path}", flush=True)
+            print(f"{'='*60}", flush=True)
+            base_ok = False
+            base_metrics: dict       = {}
+            base_elapsed             = {}
+            try:
+                load_cfg = dataclasses.replace(cfg, compile_ref_model=False)
+                tokenizer = load_tokenizer(load_cfg)
+                log_memory("before_load_base_model")
+                model = load_causal_lm(cfg.model_name_or_path, load_cfg, trainable=False).to(cfg.device)
+                log_memory("after_load_base_model")
+
+                global MAX_SEQ_LEN
+                model_max = getattr(model.config, "max_position_embeddings", MAX_SEQ_LEN)
+                tok_max   = getattr(tokenizer, "model_max_length", MAX_SEQ_LEN)
+                MAX_SEQ_LEN = min(MAX_SEQ_LEN, model_max, tok_max)
+                logger.info(f"  MAX_SEQ_LEN capped to {MAX_SEQ_LEN} (model={model_max}, tokenizer={tok_max})")
+
+                if cfg.compile_model:
+                    compile_cfg = dataclasses.replace(cfg, compile_fullgraph=False, compile_mode="default")
+                    model = maybe_compile_model(model, compile_cfg, label="eval_base_model")
+
+                base_metrics, base_elapsed = run_all_benchmarks(
+                    model, tokenizer, cfg.device, n_shots, cfg.eval_limit,
+                    batch_size=cfg.eval_batch_size,
+                    active_tasks=active_tasks,
+                )
+                log_memory("before_free_base_model")
+                free_model(model)
+                log_memory("after_free_base_model")
+                save_json(str(base_json_path), base_metrics)
+                logger.info(f"Base model scores saved to: {base_json_path}")
+                base_ok = True
+            except Exception as exc:
+                logger.error(f"Failed to evaluate base model: {exc}")
+
+        if base_ok:
+            base_avg = base_metrics.get("Average")
+            if base_avg is not None and (best_avg is None or base_avg > best_avg):
+                best_avg  = base_avg
+                best_iter = base_name
+
+            base_row = {
+                "iteration":             base_name,
+                "metrics":               base_metrics,
+                "delta_prev":            None,
+                "best_so_far_avg":       best_avg,
+                "best_iteration_so_far": best_iter,
+                "elapsed_seconds":       base_elapsed,
+            }
+            rows.append(base_row)
+            _tb_write_row(tb_writer, base_row)
+            prev_metrics = base_metrics
+
+            is_best_str = " ★ NEW BEST" if best_iter == base_name else ""
+            total_time  = sum(base_elapsed.values())
+            logger.info(
+                f"base_model: avg={fmt(base_avg)}%  "
+                f"best_so_far={fmt(best_avg)}%{is_best_str}  ({total_time:.0f}s)"
+            )
+            print(
+                f"\n  [base_model]  avg={fmt(base_avg)}%  "
+                f"(baseline — no delta)  "
+                f"best_so_far={fmt(best_avg)}%{is_best_str}  "
+                f"({total_time:.0f}s total)",
+                flush=True,
+            )
 
     for iter_path in iter_paths:
         iter_name = iter_path.name
@@ -1061,6 +1271,15 @@ def run_eval(
                 log_memory(f"before_load_{iter_name}")
                 model = load_causal_lm(str(model_path), load_cfg, trainable=False).to(cfg.device)
                 log_memory(f"after_load_{iter_name}")
+
+                # Cap MAX_SEQ_LEN to what this model can actually accept so the
+                # truncation guards in score_continuations_batched / score_examples_batched
+                # fire before PyTorch hits an out-of-bounds positional embedding.
+                global MAX_SEQ_LEN
+                model_max = getattr(model.config, "max_position_embeddings", MAX_SEQ_LEN)
+                tok_max   = getattr(tokenizer, "model_max_length", MAX_SEQ_LEN)
+                MAX_SEQ_LEN = min(MAX_SEQ_LEN, model_max, tok_max)
+                logger.info(f"  MAX_SEQ_LEN capped to {MAX_SEQ_LEN} (model={model_max}, tokenizer={tok_max})")
 
                 if cfg.compile_model:
                     # eval uses model.generate (GSM8k), so fullgraph must be False.
@@ -1222,6 +1441,11 @@ def main() -> None:
     )
     ap.add_argument("--tasks",      nargs="+", default=None, metavar="TASK", help=task_help)
     ap.add_argument("--skip-tasks", nargs="+", default=None, metavar="TASK", help=skip_help)
+    ap.add_argument(
+        "--no-base-model", action="store_true", default=False,
+        help="Skip evaluating the base model before iteration checkpoints. "
+             "By default the base model is evaluated first and used as the delta reference.",
+    )
 
     args = ap.parse_args()
 
@@ -1259,7 +1483,13 @@ def main() -> None:
         eval_no_cache    = args.no_cache,
     )
 
-    run_eval(cfg, iters=args.iters, active_tasks=active_tasks, n_shots=n_shots)
+    run_eval(
+        cfg,
+        iters=args.iters,
+        active_tasks=active_tasks,
+        n_shots=n_shots,
+        include_base_model=not args.no_base_model,
+    )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import os
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -389,7 +390,30 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
     # mid-epoch (e.g. laptop shut down during backward pass).
     resume_ckpt = get_last_checkpoint(batch_dir)
     if resume_ckpt:
-        logger.info(f"    Mid-batch HF checkpoint detected: {resume_ckpt}")
+        # torch.compile wraps the model in OptimizedModule, so HF Trainer's
+        # isinstance(model, PeftModel) check fails and it calls load_sharded_checkpoint
+        # expecting a full-model index file.  PEFT-only checkpoints only contain
+        # adapter_model.safetensors — they cannot be loaded this way.  Delete the
+        # incompatible checkpoint and retrain the batch from scratch.
+        _FULL_MODEL_FILES = [
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ]
+        has_full_model = any(
+            os.path.exists(os.path.join(resume_ckpt, f)) for f in _FULL_MODEL_FILES
+        )
+        if not has_full_model:
+            logger.warning(
+                f"    Checkpoint {resume_ckpt} contains only PEFT adapter weights "
+                f"(no full model index). HF Trainer cannot load it when the model is "
+                f"wrapped by torch.compile — removing checkpoint and retraining batch."
+            )
+            shutil.rmtree(resume_ckpt)
+            resume_ckpt = None
+        else:
+            logger.info(f"    Mid-batch HF checkpoint detected: {resume_ckpt}")
 
     log_memory(f"iter{iteration}_batch{k}_before_train")
     trainer.train(resume_from_checkpoint=resume_ckpt)

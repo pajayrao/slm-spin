@@ -34,6 +34,14 @@ class SPINDataset(Dataset):
     """
     def __init__(self, rows: List[Dict[str, str]], tokenizer, cfg: SPINConfig,
                  ref_logprobs=None, cache_path: Optional[str] = None):
+        # Step 1: Load from disk cache if it exists, skipping re-tokenization.
+        # Tokenizing large datasets is slow (minutes for 50k rows). The cache stores the
+        # already-tokenized chosen/rejected lists as a .pt file so subsequent runs of the
+        # same iteration/batch start immediately.
+        # torch.load with weights_only=False is required because the cache contains plain
+        # Python dicts of lists, not just tensors.
+        # Example: cache_path="output/iter_0_batch_000000_tokenized.pt" already exists
+        #          → skip all tokenization, load in ~1s instead of ~3min
         if cache_path and os.path.exists(cache_path):
             logger.info(f"SPINDataset.__init__() — loading tokenized cache from {cache_path}...")
             cached = torch.load(cache_path, weights_only=False)
@@ -42,6 +50,16 @@ class SPINDataset(Dataset):
             chosen_lens = [len(c["input_ids"]) for c in self.chosen]
             rejected_lens = [len(r["input_ids"]) for r in self.rejected]
         else:
+            # Step 2: Tokenize every (prompt, chosen_response) and (prompt, rejected_response) pair.
+            # tokenize_prompt_response applies chat template formatting, left-truncation to
+            # cfg.max_length, and masks prompt token positions with -100 in labels so the
+            # training loss is computed only on response tokens.
+            # Both chosen and rejected use the same prompt, so the prompt is tokenized twice
+            # per row (once for each side) — this is intentional to avoid boundary artifacts.
+            # Example: row={"prompt":"What is Python?", "response":"Python is a language.",
+            #               "synthetic_response":"Python is a tool."}
+            #          c["input_ids"] = [1,1724,338,...,4902,29889,2]  (prompt+human response)
+            #          r["input_ids"] = [1,1724,338,...,5780,29889,2]  (prompt+synthetic response)
             logger.info(f"SPINDataset.__init__() — pre-tokenizing {len(rows)} rows "
                         f"(max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length})...")
             self.chosen = []
@@ -62,12 +80,23 @@ class SPINDataset(Dataset):
                 if (i + 1) % 2000 == 0:
                     logger.info(f"  Tokenised {i + 1}/{len(rows)} rows...")
 
+            # Step 3: Write the tokenized data to a .pt cache file atomically.
+            # Writing to a .tmp file first and then os.replace() ensures a partially-written
+            # cache is never left on disk — if the process is killed mid-write the .tmp file
+            # is discarded and the original cache (if any) is preserved.
             if cache_path:
                 tmp = cache_path + ".tmp"
                 torch.save({"chosen": self.chosen, "rejected": self.rejected}, tmp)
                 os.replace(tmp, cache_path)
                 logger.info(f"  Tokenized data cached → {cache_path}")
 
+        # Step 4: Attach reference log-probs and compute sequence length statistics.
+        # ref_logprobs is a list of {"ref_chosen_logp": float, "ref_rejected_logp": float}
+        # dicts aligned 1-to-1 with rows. __getitem__ reads from this list to attach
+        # the scalars to each batch item so SPINTrainer can compute the SPIN margin loss.
+        # Length statistics are logged to help diagnose truncation — if avg ≈ max_length,
+        # many sequences are being cut and the model may be missing important response content.
+        # Example: 500 rows, chosen_lens mean=142, max=256 → some sequences hitting the cap.
         self.ref_logprobs = ref_logprobs
 
         avg_c = sum(chosen_lens) / len(chosen_lens) if chosen_lens else 0

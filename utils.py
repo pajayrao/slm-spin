@@ -695,39 +695,49 @@ def tokenize_prompt_response(tokenizer, prompt: str, response: str, cfg: SPINCon
         Output: input_ids truncated to the first 10 tokens from the right
                 (cfg.truncation_side="left" → prompt head dropped, response tail kept)
     """
+    # Step 1: Build the formatted text strings for prompt alone and prompt+response.
+    # Done separately because we need to tokenize both to find where the prompt ends
+    # inside the joint sequence (subword tokenizers can split differently at boundaries
+    # when strings are encoded in isolation, so we don't just concatenate token lists).
     prompt_text = build_prompt_text(prompt, tokenizer, cfg)
     full_text = build_full_text(prompt, response, tokenizer, cfg)
 
-    prompt_ids = tokenizer(
-        prompt_text,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=cfg.max_prompt_length,
-    )["input_ids"]
+    # Step 2: Tokenize without truncation to find the exact prompt/response boundary.
+    # prompt_ids_full gives us the prompt token count before any truncation.
+    # Example: prompt="What is Python?" → prompt_ids_full=[1,1724,338,5132,29973] (5 tokens)
+    #          full_text includes response → full_ids_full has 20 tokens total
+    prompt_ids_full = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    full_ids_full   = tokenizer(full_text,   add_special_tokens=False)["input_ids"]
 
-    full_ids = tokenizer(
-        full_text,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=cfg.max_length,
-    )["input_ids"]
+    # Step 3: Apply left-truncation manually to preserve response tokens over prompt tokens.
+    # We truncate from the left (drop prompt head) rather than the right (drop response tail)
+    # so the model always sees the full response during training.
+    # n_prompt_remaining tracks how many prompt tokens survived after the cut, which
+    # determines how many leading positions to mask to -100 in Step 4.
+    # Example: full_ids_full has 25 tokens, max_length=20 → n_dropped=5
+    #          if prompt had 8 tokens: n_prompt_remaining = max(0, 8-5) = 3
+    #          full_ids = full_ids_full[5:]  (rightmost 20 tokens kept)
+    if len(full_ids_full) > cfg.max_length:
+        n_dropped = len(full_ids_full) - cfg.max_length
+        full_ids = full_ids_full[n_dropped:]
+        n_prompt_remaining = max(0, len(prompt_ids_full) - n_dropped)
+    else:
+        full_ids = full_ids_full
+        n_prompt_remaining = len(prompt_ids_full)
 
-    if len(full_ids) < len(prompt_ids):
-        logger.debug(
-            f"tokenize_prompt_response: full_ids ({len(full_ids)}) shorter than prompt_ids "
-            f"({len(prompt_ids)}) — truncating prompt_ids to match (truncation_side={cfg.truncation_side})."
-        )
-        prompt_ids = prompt_ids[:len(full_ids)]
-
+    # Step 4: Build labels by masking prompt positions with -100.
+    # HuggingFace cross-entropy loss ignores positions where label == -100,
+    # so the loss is computed only on response tokens.
+    # Example: full_ids=[1,1724,338,5132,29973,5132,338,263,...], n_prompt_remaining=5
+    #          labels  =[-100,-100,-100,-100,-100, 5132, 338, 263, ...]
     labels = full_ids.copy()
-    for i in range(min(len(prompt_ids), len(labels))):
+    for i in range(n_prompt_remaining):
         labels[i] = -100
 
-    n_prompt_tokens = min(len(prompt_ids), len(labels))
-    n_response_tokens = len(labels) - n_prompt_tokens
+    n_response_tokens = len(labels) - n_prompt_remaining
     logger.debug(
         f"tokenize_prompt_response: total={len(full_ids)} tokens "
-        f"(prompt={n_prompt_tokens} masked, response={n_response_tokens} active). "
+        f"(prompt={n_prompt_remaining} masked, response={n_response_tokens} active). "
         f"Caps: max_prompt={cfg.max_prompt_length}, max_length={cfg.max_length}."
     )
 
@@ -795,19 +805,46 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
         f"labels=({batch}, {seq_len}) — shifting by 1 for autoregressive alignment."
     )
 
+    # Step 1: Autoregressive shift — align logits[t] with labels[t+1] so each position
+    # predicts the *next* token. Drop the last logit (nothing to predict after it) and
+    # the first label (no logit predicts the very first token).
+    # Example: logits shape (2,5,V), labels=[-100,-100,42,100,7]
+    #          shift_logits shape (2,4,V), shift_labels=[-100,42,100,7]
+    #          → shift_logits[0] now predicts token 42, shift_logits[1] predicts 100, etc.
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
+
+    # Step 2: Convert raw logits to log-probabilities over the vocabulary.
+    # log_softmax normalizes scores so they sum to 1 in probability space (log scale).
+    # Example: logits[t] = [2.1, 0.5, -1.3, ...]  →  log_probs[t] = [-0.42, -2.02, -3.82, ...]
+    #          The highest-scored token gets the least-negative log-prob.
     log_probs = F.log_softmax(shift_logits, dim=-1)
+
+    # Step 3: Pick the log-prob of the token that actually appeared at each position.
+    # torch.gather can't index with -100, so prompt positions are temporarily set to 0
+    # (a valid vocab index) before gathering — their values are zeroed out in Step 4.
+    # Example: shift_labels=[-100,42,100,7], safe_labels=[0,42,100,7]
+    #          token_logps[i] = log_probs[i, safe_labels[i]]
+    #          → one scalar per position: [-X, log_p(42), log_p(100), log_p(7)]
     safe_labels = shift_labels.masked_fill(shift_labels == -100, 0)
     token_logps = torch.gather(
         log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
 
+    # Step 4: Zero out prompt positions (label == -100) so they don't contribute to the sum.
+    # Example: shift_labels=[-100,42,100,7]  →  response_mask=[False,True,True,True]
+    #          token_logps before mask: [-X,    -1.2, -0.8, -2.1]
+    #          token_logps after mask:  [ 0.0,  -1.2, -0.8, -2.1]  ← prompt position zeroed
     response_mask = (shift_labels != -100)
     token_logps = token_logps * response_mask
 
-    # Per-sequence response-token count (non-masked positions = actual response tokens).
+    # Step 5: Sum response-token log-probs and normalize by response length.
+    # Dividing by the number of non-masked tokens gives a per-token average so the SPIN
+    # margin compares quality rather than sequence length — a short response with 3 tokens
+    # and a long one with 30 tokens are now on the same scale.
+    # Example: token_logps=[0.0,-1.2,-0.8,-2.1], resp_lens=3
+    #          seq_logps = (-1.2 + -0.8 + -2.1) / 3 = -1.37
     resp_lens = response_mask.sum(dim=-1)
-    seq_logps = token_logps.sum(dim=-1)
+    seq_logps = token_logps.sum(dim=-1) / resp_lens.clamp(min=1).float()
 
     logger.debug(
         f"  response token counts per sequence: min={resp_lens.min().item()}, "
@@ -815,9 +852,8 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
         f"(prompt positions masked with -100)."
     )
     logger.debug(
-        f"  sequence log-probs: mean={seq_logps.mean().item():.4f}, "
-        f"min={seq_logps.min().item():.4f}, max={seq_logps.max().item():.4f} "
-        f"(sum of per-token log-probs over response tokens only)."
+        f"  sequence log-probs (per-token avg): mean={seq_logps.mean().item():.4f}, "
+        f"min={seq_logps.min().item():.4f}, max={seq_logps.max().item():.4f}."
     )
     return seq_logps
 
@@ -1474,11 +1510,19 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
     for start in range(0, len(rows), bs):
         chunk = rows[start:start + bs]
 
+        # Step 1: Tokenize every (prompt, chosen_response) and (prompt, rejected_response)
+        # pair in the chunk. Each call returns input_ids, attention_mask, and labels
+        # with prompt positions masked to -100.
+        # Example: chunk has 2 rows → chosen_tok and rejected_tok each have 2 dicts.
         chosen_tok = [tokenize_prompt_response(
             tokenizer, r["prompt"], r["response"],           cfg) for r in chunk]
         rejected_tok = [tokenize_prompt_response(
             tokenizer, r["prompt"], r["synthetic_response"], cfg) for r in chunk]
 
+        # Step 2: Right-pad all sequences in the batch to the same length.
+        # Chosen and rejected are padded independently (they may have different max lengths).
+        # pad_value=pad_id for input_ids, 0 for attention_mask (ignore padding), -100 for labels.
+        # Example: chosen lengths=[15,20] → both padded to 20; rejected lengths=[18,12] → both 18.
         chosen_ids = pad_to_max_len(
             [x["input_ids"] for x in chosen_tok],   pad_id).to(model.device)
         chosen_mask = pad_to_max_len(
@@ -1493,11 +1537,16 @@ def compute_ref_logprobs(model, tokenizer, rows: List[Dict[str, str]], cfg: SPIN
         rejected_labels = pad_to_max_len(
             [x["labels"] for x in rejected_tok], -100).to(model.device)
 
+        # Step 3: Forward pass under the frozen reference model (no_grad is set by decorator).
+        # Returns one per-token-average log-prob scalar per sequence.
+        # Example: chosen_logps=[-12.43, -9.82], rejected_logps=[-18.07, -14.55]
         chosen_logps = model_sequence_logprob(
             model, chosen_ids,   chosen_mask,   chosen_labels)
         rejected_logps = model_sequence_logprob(
             model, rejected_ids, rejected_mask, rejected_labels)
 
+        # Step 4: Store the scalar pair for each row so SPINTrainer can compute the
+        # SPIN margin loss during training without a second reference-model forward pass.
         for c_lp, r_lp in zip(chosen_logps.tolist(), rejected_logps.tolist()):
             ref_logprobs.append(
                 {"ref_chosen_logp": c_lp, "ref_rejected_logp": r_lp})

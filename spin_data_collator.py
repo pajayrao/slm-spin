@@ -63,6 +63,18 @@ class SPINDataCollator:
             Input:  features without "ref_chosen_logp" / "ref_rejected_logp" keys
             Output: same dict but without the ref_chosen_logp and ref_rejected_logp entries
         """
+        # Step 1: Right-pad chosen and rejected sequences independently to their own batch-max length.
+        # Chosen and rejected are padded separately because they typically have different lengths
+        # (human responses vs synthetic responses can differ substantially). Padding them together
+        # to a single max would waste memory and GPU compute on padding tokens.
+        # pad_to_max_len returns a LongTensor of shape (batch, max_len_for_that_side).
+        # Padding values:
+        #   input_ids      → self.pad_id  (a real vocab token the model ignores via attention_mask)
+        #   attention_mask → 0            (tells the model to ignore padded positions)
+        #   labels         → -100         (HuggingFace cross-entropy ignores -100 positions)
+        # Example: chosen lengths=[80, 95], rejected lengths=[110, 85]
+        #          chosen padded to 95 (example 0 gets 15 pad tokens appended)
+        #          rejected padded to 110 (example 1 gets 25 pad tokens appended)
         batch = {}
         for prefix in ["chosen", "rejected"]:
             batch[f"{prefix}_input_ids"] = pad_to_max_len(
@@ -71,6 +83,14 @@ class SPINDataCollator:
                 [f[f"{prefix}_attention_mask"] for f in features], 0)
             batch[f"{prefix}_labels"] = pad_to_max_len(
                 [f[f"{prefix}_labels"] for f in features], -100)
+
+        # Step 2: Stack pre-computed reference log-probs into a float32 tensor if present.
+        # These are Python floats stored per-example in the dataset; torch.tensor converts them
+        # to a 1-D (batch,) tensor so SPINTrainer can move them to GPU in one .to(device) call.
+        # float32 is sufficient precision for log-prob scalars used in the margin computation.
+        # Absent when the dataset was built without a reference model (e.g. first-iteration debug).
+        # Example: [{"ref_chosen_logp": -12.43, ...}, {"ref_chosen_logp": -9.82, ...}]
+        #          → ref_chosen_logp = tensor([-12.43, -9.82], dtype=torch.float32)
         if "ref_chosen_logp" in features[0]:
             batch["ref_chosen_logp"] = torch.tensor(
                 [f["ref_chosen_logp"] for f in features], dtype=torch.float32)
