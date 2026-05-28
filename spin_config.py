@@ -159,12 +159,12 @@ class SPINConfig:
     #   2. Trains a new model to prefer human responses over those synthetic ones.
     # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 5
+    num_iterations: int = 8
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
     # Range: 1–5. Typical: 1–3.
-    num_epochs_per_iteration: int = 2
+    num_epochs_per_iteration: int = 1
 
     # Hard cap on the total number of records read from the dataset at load time.
     # Applied in load_base_dataset_fixed() before any per-iteration sampling.
@@ -181,7 +181,7 @@ class SPINConfig:
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
     # Range: 50–10000. Start at 200 and tune for your restart tolerance.
-    data_batch_size: int = 65536
+    data_batch_size: int = 207865
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -189,12 +189,12 @@ class SPINConfig:
     # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
     # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
     # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 10.0
+    lambda_initial: float = 2.0
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
     # A much larger value here applies a strong final alignment push.
     # Range: 10–100 with per-token normalization.
-    lambda_final_iteration: Optional[float] = 50.0
+    lambda_final_iteration: Optional[float] = 5.0
 
     # When True, lambda_final_iteration replaces lambda_initial only for the very last
     # iteration; all earlier iterations still use lambda_initial.
@@ -229,21 +229,21 @@ class SPINConfig:
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
     # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 1e-6
+    learning_rate: float = 2e-6
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 2e-7
+    learning_rate_late: float = 1e-6
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
-    late_lr_start_iteration: int = 2
+    late_lr_start_iteration: int = 4
 
     # L2 regularisation coefficient applied to weight matrices (not biases or layer norms).
     # 0.0 is standard for supervised fine-tuning. Small values (1e-4) can help generalisation.
     # Range: 0.0–0.1.
-    weight_decay: float = 0.0
+    weight_decay: float = 0.01
 
     # Number of linear LR warmup steps at the beginning of each iteration.
     # Must be small relative to total optimizer steps per SPIN batch.
@@ -251,13 +251,13 @@ class SPINConfig:
     #   total optimizer steps per batch = (16384/16/32)*2 = 64
     # So warmup_steps=5 → ~8% warmup, which is correct.
     # (Large values like 50 would make 78% of training run be warmup — broken.)
-    warmup_steps: int = 5
+    warmup_steps: int = 50
 
     # Learning rate scheduler shape after warmup.
     # "cosine"  — smooth decay to 0; best for fine-tuning.
     # "linear"  — linear decay to 0.
     # "constant"— no decay; rarely used for fine-tuning.
-    lr_scheduler_type: str = "cosine"
+    lr_scheduler_type: str = "constant"
 
     # Optimizer algorithm.
     # "rmsprop" — 1 state tensor per parameter (running mean of squared gradients); lower GPU memory.
@@ -324,10 +324,6 @@ class SPINConfig:
     # "none"        — disables all external logging.
     report_to: str = "tensorboard"
 
-    # Path to a DeepSpeed JSON configuration file for ZeRO-stage memory offloading.
-    # None = DeepSpeed disabled. ZeRO-2/3 can enable training models larger than GPU memory
-    # by offloading optimizer states (ZeRO-2) or parameters (ZeRO-3) to CPU RAM.
-    deepspeed: Optional[str] = None
 
     # ── torch.compile ────────────────────────────────────────────────────────
 
@@ -372,7 +368,7 @@ class SPINConfig:
     # Disabled: model.generate() uses a Python while-loop that always causes a graph break,
     # so compile_fullgraph=True fails silently (caught by maybe_compile_model's try/except)
     # and falls back to eager — paying max-autotune search time for zero runtime benefit.
-    compile_ref_model: bool = False
+    compile_ref_model: bool = True
 
     # ── LoRA / PEFT ──────────────────────────────────────────────────────────
 
@@ -566,7 +562,7 @@ class SPINConfig:
     # Logits per batch = batch × actual_seq_len × vocab_size × 2B.
     # Real eval sequences (ARC, TruthfulQA, Winogrande) average 100–400 tokens, not 2048.
     # SmolLM2-135M: batch=8 × 512 tokens × 49152 vocab × 2B ≈ 0.4 GB — safe on 8 GB.
-    eval_batch_size: int = 8
+    eval_batch_size: int = 2
 
     # Maximum total token length (context + continuation) fed to the model during evaluation.
     # Sequences longer than this are truncated from the left.
@@ -583,6 +579,3 @@ class SPINConfig:
     # False (default) = skip iterations that already have a .parsed.json result file.
     eval_no_cache: bool = False
 
-    # Automatically run benchmark evaluation after all SPIN training iterations complete.
-    # Set to False to skip evaluation and run it separately with evaluate.py.
-    eval_run_after_training: bool = True

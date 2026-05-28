@@ -126,15 +126,14 @@ All `SPINConfig` fields are exposed as CLI flags — pass any field as `--field_
 
 This implementation is being systematically evaluated on the following models in size order:
 
-| Size | Model | Status |
-|------|-------|--------|
-| ~21 M | `roneneldan/TinyStories-1Layer-21M` | Planned |
-| ~33 M | `roneneldan/TinyStories-Instruct-33M` | Planned |
-| 82 M | `distilbert/distilgpt2` | **In progress** |
-| 135 M | `HuggingFaceTB/SmolLM2-135M` | Planned |
-| 270 M | `microsoft/harrier-oss-v1-270m` | 1/5 iterations complete |
-| 600 M | `microsoft/harrier-oss-v1-0.6b` | Planned |
-| 1.3 B | `microsoft/phi-1_5` | Planned |
+| Model | Params | Status |
+|-------|--------|--------|
+| `roneneldan/TinyStories-Instruct-33M` | 33M | No significant gain as model is too small. |
+| `distilbert/distilgpt2` | 82M | Model is not fine tuned for instruct dataset. |
+| `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | Spin Play ongoing. Required multiple rounds of hyperparameter tuning. |
+| `HuggingFaceTB/SmolLM2-360M-Instruct` | 360M | Queued |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 500M | Queued |
+| `google/gemma-3-1b-it` | 1B | Queued |
 
 LoRA target modules are auto-detected per architecture — no config change needed when switching models.
 

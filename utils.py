@@ -1091,7 +1091,6 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
                 cfg.report_to="none",
                 cfg.gradient_checkpointing=True,
                 cfg.max_grad_norm=1.0,
-                cfg.deepspeed=None,
                 iteration_dir="output/checkpoints/iter_0/batch_000000",
                 learning_rate=5e-5,
                 logging_dir="output/tensorboard/iter_0/batch_000000"
@@ -1156,7 +1155,6 @@ def build_training_args(cfg: SPINConfig, iteration_dir: str, learning_rate: floa
         dataloader_pin_memory=cfg.dataloader_pin_memory,
         gradient_checkpointing=cfg.gradient_checkpointing,
         max_grad_norm=cfg.max_grad_norm,
-        deepspeed=cfg.deepspeed,
     )
 
 

@@ -429,7 +429,7 @@ def _pick_best(scores: list[float], choices: list[str], normalize: bool) -> int:
 # ---------------------------------------------------------------------------
 
 def eval_arc_challenge(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate ARC-Challenge using length-normalised log-likelihood (acc_norm)."""
     logger.info(f"ARC-Challenge: loading dataset (n_shot={n_shot}, limit={limit})")
@@ -467,7 +467,7 @@ def eval_arc_challenge(
 # ---------------------------------------------------------------------------
 
 def eval_truthfulqa_mc2(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate TruthfulQA MC2: softmax probability mass on correct answers."""
     logger.info(f"TruthfulQA MC2: loading dataset (zero-shot, limit={limit})")
@@ -512,7 +512,7 @@ def eval_truthfulqa_mc2(
 # ---------------------------------------------------------------------------
 
 def eval_winogrande(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate Winogrande commonsense pronoun resolution (acc)."""
     logger.info(f"Winogrande: loading dataset (n_shot={n_shot}, limit={limit})")
@@ -575,7 +575,7 @@ def _extract_number(text: str) -> Optional[str]:
 
 
 def eval_gsm8k(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 8
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate GSM8k grade-school math via batched greedy generation (acc)."""
     logger.info(f"GSM8k: loading dataset (n_shot={n_shot}, limit={limit}, max_new_tokens={GSM8K_MAX_NEW_TOKENS})")
@@ -659,7 +659,7 @@ def _clean_hellaswag(text: str) -> str:
 
 
 def eval_hellaswag(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate HellaSwag commonsense sentence completion (acc_norm)."""
     logger.info(f"HellaSwag: loading dataset (n_shot={n_shot}, limit={limit})")
@@ -713,7 +713,7 @@ def _mmlu_format(ex: dict, with_answer: bool = False) -> str:
 
 
 def eval_mmlu(
-    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 32
+    model, tokenizer, device: str, n_shot: int, limit: Optional[int], batch_size: int = 4
 ) -> float:
     """Evaluate MMLU across 57 subjects using single-letter continuation scoring (acc)."""
     logger.info(f"MMLU: loading dataset (n_shot={n_shot}, limit={limit})")
@@ -766,7 +766,7 @@ def run_all_benchmarks(
     device: str,
     n_shots: dict[str, int],
     limit: Optional[int],
-    batch_size: int = 32,
+    batch_size: int = 4,
     active_tasks: Optional[list[tuple]] = None,
 ) -> tuple[dict[str, float | None], dict[str, float]]:
     """Run benchmarks for *active_tasks* (defaults to the full TASKS list).
@@ -1275,7 +1275,6 @@ def run_eval(
                 # Cap MAX_SEQ_LEN to what this model can actually accept so the
                 # truncation guards in score_continuations_batched / score_examples_batched
                 # fire before PyTorch hits an out-of-bounds positional embedding.
-                global MAX_SEQ_LEN
                 model_max = getattr(model.config, "max_position_embeddings", MAX_SEQ_LEN)
                 tok_max   = getattr(tokenizer, "model_max_length", MAX_SEQ_LEN)
                 MAX_SEQ_LEN = min(MAX_SEQ_LEN, model_max, tok_max)
