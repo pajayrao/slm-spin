@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    model_name_or_path: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -107,7 +107,7 @@ class SPINConfig:
     # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
     # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
     # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 256
+    generation_batch_size: int = 128
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -159,7 +159,7 @@ class SPINConfig:
     #   2. Trains a new model to prefer human responses over those synthetic ones.
     # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 8
+    num_iterations: int = 4
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
@@ -181,7 +181,7 @@ class SPINConfig:
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
     # Range: 50–10000. Start at 200 and tune for your restart tolerance.
-    data_batch_size: int = 207865
+    data_batch_size: int = 10000
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -189,12 +189,12 @@ class SPINConfig:
     # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
     # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
     # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 2.0
+    lambda_initial: float = 10.0
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
     # A much larger value here applies a strong final alignment push.
     # Range: 10–100 with per-token normalization.
-    lambda_final_iteration: Optional[float] = 5.0
+    lambda_final_iteration: Optional[float] = 20.0
 
     # When True, lambda_final_iteration replaces lambda_initial only for the very last
     # iteration; all earlier iterations still use lambda_initial.
@@ -229,12 +229,12 @@ class SPINConfig:
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
     # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 2e-6
+    learning_rate: float = 2e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 1e-6
+    learning_rate_late: float = 1e-5
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
@@ -251,13 +251,13 @@ class SPINConfig:
     #   total optimizer steps per batch = (16384/16/32)*2 = 64
     # So warmup_steps=5 → ~8% warmup, which is correct.
     # (Large values like 50 would make 78% of training run be warmup — broken.)
-    warmup_steps: int = 50
+    warmup_steps: int = 5
 
     # Learning rate scheduler shape after warmup.
     # "cosine"  — smooth decay to 0; best for fine-tuning.
     # "linear"  — linear decay to 0.
     # "constant"— no decay; rarely used for fine-tuning.
-    lr_scheduler_type: str = "constant"
+    lr_scheduler_type: str = "cosine"
 
     # Optimizer algorithm.
     # "rmsprop" — 1 state tensor per parameter (running mean of squared gradients); lower GPU memory.
@@ -348,7 +348,7 @@ class SPINConfig:
     #                                capture requires a CPU-side C++ launcher compiled with OpenMP (omp.h),
     #                                which is not available in this MSVC setup on Windows. Use this mode
     #                                to get Triton kernel tuning without the C++ compilation step.
-    compile_mode: str = "default"
+    compile_mode: str = "max-autotune-no-cudagraphs"
 
     # compile_dynamic (bool or None): Use dynamic shape tracing.  When this is True, we will up-front attempt
     # to generate a kernel that is as dynamic as possible to avoid recompilations when
@@ -515,7 +515,7 @@ class SPINConfig:
     # Maximum number of parameter tensors to log per step.
     # Prevents TensorBoard from becoming unresponsive when the model has thousands of layers.
     # Range: 10–1000. Reduce if TensorBoard is slow to load.
-    parameter_log_max_tensors: int = 200
+    parameter_log_max_tensors: int = 1000
 
     # Log a summary of trainable vs total parameter counts when a model is prepared
     # for training. Disabled by default to keep logs quiet during normal runs.
@@ -537,7 +537,7 @@ class SPINConfig:
     # Full vocab is often 32k–128k tokens which makes projection too slow in the browser.
     # 2048 covers the most common tokens and keeps the projector fast.
     # Range: 256–8192.
-    embedding_projector_n_tokens: int = 2048
+    embedding_projector_n_tokens: int = 8192
 
     # Attempt to trace and log the model's computation graph.
     # Activates the GRAPHS tab in TensorBoard.

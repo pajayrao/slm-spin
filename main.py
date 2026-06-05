@@ -485,6 +485,18 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, su
     if start_batch == total_batches:
         logger.info(
             f"  All batches already done for iter_{iteration} — nothing to process.")
+        # Crash-recovery guard: if a previous run crashed after all batch .done sentinels
+        # were written but before save_pretrained(iter_dir) completed, iter_dir has no model
+        # weights. Copy them now from the last batch directory before writing the iter .done.
+        if not os.path.exists(os.path.join(iter_dir, "config.json")):
+            last_batch_dir = batch_train_dir(cfg, iteration, total_batches - 1)
+            logger.warning(
+                f"  Model weights missing from {iter_dir} (crash recovery). "
+                f"Copying from {last_batch_dir}...")
+            for entry in os.scandir(last_batch_dir):
+                if entry.is_file() and not entry.name.startswith("."):
+                    shutil.copy2(entry.path, os.path.join(iter_dir, entry.name))
+            logger.info(f"  Model files copied to {iter_dir}.")
     else:
         summary_callback.set_iteration(
             iteration,

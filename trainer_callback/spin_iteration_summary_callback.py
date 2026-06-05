@@ -191,14 +191,19 @@ class SPINIterationSummaryCallback(TrainerCallback):
                 "SPINIterationSummaryCallback.on_train_begin: model is None — skipping weight snapshot.")
             return
 
-        trainable = [(n, p)
-                     for n, p in model.named_parameters() if p.requires_grad]
-        for name, param in trainable:
-            self._iter_start_params[name] = param.detach(
-            ).float().cpu().clone()
-        logger.info(f"SPINIterationSummaryCallback.on_train_begin: "
-                    f"snapshotted {len(self._iter_start_params)} trainable param tensors "
-                    f"at iteration {self.spin_iteration} start (for drift tracking).")
+        # Only snapshot on the first batch of this iteration; subsequent batches within
+        # the same iteration would overwrite and make drift measure per-batch, not per-iteration.
+        if not self._iter_start_params:
+            trainable = [(n, p)
+                         for n, p in model.named_parameters() if p.requires_grad]
+            for name, param in trainable:
+                self._iter_start_params[name] = param.detach().float().cpu().clone()
+            logger.info(f"SPINIterationSummaryCallback.on_train_begin: "
+                        f"snapshotted {len(self._iter_start_params)} trainable param tensors "
+                        f"at iteration {self.spin_iteration} start (for drift tracking).")
+        else:
+            logger.info(f"SPINIterationSummaryCallback.on_train_begin: "
+                        f"skipping weight snapshot — already captured for iteration {self.spin_iteration}.")
 
         if self.spin_iteration == 0 and not self.base_model_params:
             self.base_model_params = {k: v.clone()

@@ -979,9 +979,9 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
         logger.info(
             f"model.generate done. Decoding {len(outputs)} sequences (slicing off prompt tokens).")
 
-        input_lengths = enc["attention_mask"].sum(dim=1).tolist()
+        padded_prompt_len = enc["input_ids"].shape[1]
         for i, seq in enumerate(outputs):
-            gen_ids = seq[input_lengths[i]:]
+            gen_ids = seq[padded_prompt_len:]
             synthetic = tokenizer.decode(
                 gen_ids, skip_special_tokens=True).strip()
             out_rows.append({
