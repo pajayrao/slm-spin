@@ -351,161 +351,165 @@ Available panels (depending on config flags):
 
 Values are organised by the TensorBoard sub-run they appear in. Open `tensorboard --logdir ./spin_outputs/tensorboard` and select runs in the left panel to compare.
 
-> Per-layer parameter/gradient histograms and per-parameter scalar stats (`parameters/*`, `parameter_delta/*`, `gradients/*`, `layer_health/*`) are written by `TensorBoardParameterStatsCallback` under `param_stats/` — they are omitted from the tables below because they repeat for every trainable weight tensor.
+> Per-layer parameter/gradient histograms and per-parameter scalar stats (`parameters/*`, `parameter_delta/*`, `gradients/*`, `layer_health/*`) are written by `TensorBoardParameterStatsCallback` under `param_stats/` — they are excluded from the tables below because they repeat for every trainable weight tensor.
+
+The **Trend** column shows the expected direction when comparing the same metric at a consistent point in time (e.g. end of training) **across SPIN iterations 0 → 1 → 2 → …**. For `spin_progress/*` the trend applies to the per-iteration value directly.
 
 ---
 
 #### `train/*` — per optimizer step (`iter_N/batch_K/`)
 
-Logged by `TensorBoardCallbackExtended` every time `SPINTrainer` calls `self.log()`.
+Logged by `TensorBoardCallbackExtended` every time `SPINTrainer` calls `self.log()`, plus derived values computed in `on_step_end`.
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `train/loss` | SPIN loss for the current step | Loss function (e.g. `softplus(−margin)`) applied to the batch-mean margin | Primary health indicator. Starts at ≈ 0.693 (log 2) when margin = 0, should fall toward 0 as the model aligns |
-| `train/margin_mean` | Mean per-example margin across the batch | `mean(λ × ((log π_θ(chosen) − ref_chosen_logp) − (log π_θ(rejected) − ref_rejected_logp)))` | Core alignment signal. Starts at 0 (π_θ is identical to π_prev at step 0), trends positive within an iteration, resets to 0 at every iteration boundary |
-| `train/margin_std` | Standard deviation of per-example margins | `std(...)` of the same per-example margins | Width of the alignment distribution. High std = some examples are well-aligned, others are not. Extremely low std may indicate a plateau |
-| `train/win_rate` | Fraction of batch examples where margin > 0 | `mean(margin > 0)` | How often π_θ is already ahead of π_prev on human responses. Trends from ≈ 0.5 toward 1.0 within an iteration |
-| `train/pi_chosen_logp` | Log-prob π_θ assigns to the human response | `Σ_t log π_θ(token_t \| prompt, prior_tokens)` over response tokens (prompt masked) | Should become less negative as training progresses |
-| `train/pi_rejected_logp` | Log-prob π_θ assigns to the synthetic response | Same sum over synthetic response tokens | Should stay flat or decrease while `pi_chosen_logp` rises. Both rising equally means the model is inflating probability on all responses (SPIN margin catches this) |
-| `train/ref_chosen_logp` | Log-prob π_prev (frozen) assigns to the human response | Pre-computed in Step 2, loaded from `_logprobs.jsonl`; constant throughout the iteration | Fixed anchor for the chosen side of the margin. Becomes less negative across iterations as each successive π_prev is better aligned |
-| `train/ref_rejected_logp` | Log-prob π_prev (frozen) assigns to the synthetic response | Pre-computed in Step 2, loaded from `_logprobs.jsonl`; constant throughout the iteration | Fixed anchor for the rejected side. Also rises across iterations as synthetic quality improves — the gap `ref_chosen_logp − ref_rejected_logp` narrows each round |
-| `train/logp_gap` | Log-prob gap between chosen and rejected under π_θ | `pi_chosen_logp − pi_rejected_logp` (derived on every logged step) | Should grow positive over training. If negative, π_θ is assigning more probability to the synthetic than the human response — a clear misalignment signal |
-| `train/kl_from_ref` | Approximate KL divergence from π_prev | `mean(pi_chosen_logp − ref_chosen_logp)` — average log-ratio on the chosen side | Regularisation gauge. Should stay small and controlled. Rapidly growing KL indicates the model has drifted far from π_prev (too-high LR or λ) |
-| `train/spin_lambda` | λ scaling factor used for this iteration | `lambda_initial` for all but the last iteration; `lambda_final_iteration` for the last | Confirms the two-phase λ schedule. The jump on the final iteration should visibly increase margins |
-| `train/learning_rate` | Current LR at this step | Read from the optimizer param group after the scheduler step | Verify the two-phase LR schedule: `learning_rate` early, dropping to `learning_rate_late` from `late_lr_start_iteration` onward |
-| `train/grad_global_norm` | L2 norm of all parameter gradients | `sqrt(Σ ‖g_i‖²)` over all parameters with a gradient, computed in one fused operation | Gradient explosion detector. Sudden spikes (> 10×) indicate the LR or λ is too large. Clipped by the trainer's `max_grad_norm` setting |
-| `train/weight_global_norm` | L2 norm of all trainable parameters | `sqrt(Σ ‖w_i‖²)` over all parameters with `requires_grad=True` | Sanity check on model scale. Should be stable; large changes indicate an unusual weight update |
-| `train/weight_drift` | Total weight movement since iteration start | `sqrt(Σ ‖w_i − w_i_initial‖²)` accumulated from the snapshot taken at `on_train_begin` | Measures how much the model has changed in this iteration. Small drift = conservative updates; large drift = aggressive alignment push |
-| `train/throughput_sps` | Training samples processed per second | `per_device_train_batch_size / elapsed_step_time` | GPU utilisation proxy. Drops indicate I/O stalls, memory thrashing, or kernel launch overhead |
-| `train/perplexity` | Perplexity of the SPIN loss | `exp(min(loss, 20))` — capped at `exp(20)` to avoid overflow | More interpretable than raw loss. Should decrease from ≈ 2.0 (log-2 starting loss → exp(0.693)) toward 1.0 as alignment improves |
-| `train/alignment_accuracy` | Binary alignment signal | `1.0` if `margin_mean > 0`, else `0.0` | Step-level indicator of whether the model is ahead of the reference this step. Noisy — use `epoch/win_rate_mean` for a smoother view |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `train/loss` | SPIN loss for the current step | Loss function (e.g. `softplus(−margin)`) applied to the batch-mean margin | Starts at ≈ 0.693 when margin = 0; falls toward 0 as alignment improves within the iteration | ↓ decreases |
+| `train/margin_mean` | Mean per-example margin across the batch | `mean(λ × ((log π_θ(chosen) − ref_chosen_logp) − (log π_θ(rejected) − ref_rejected_logp)))` | Core alignment signal. Starts at 0 at step 0 of each iteration (π_θ is a copy of π_prev); trends positive during training; resets to 0 at every iteration boundary | ↑→ rises, plateaus |
+| `train/margin_std` | Standard deviation of per-example margins | `std(...)` of the same per-example margins | High std = uneven alignment across the batch. Narrows as training consistently aligns most examples | ↓→ falls, stabilises |
+| `train/win_rate` | Fraction of batch examples where margin > 0 | `mean(margin > 0)` | Proportion of examples where π_θ is ahead of π_prev. Trends from ≈ 0.5 to 1.0 within an iteration | ↑→ rises toward 1.0 |
+| `train/pi_chosen_logp` | Log-prob π_θ assigns to the human response | `Σ_t log π_θ(token_t \| prompt, prior_tokens)` over response tokens (prompt tokens masked) | Becomes less negative as the model learns to predict human text more confidently | ↑ increases (less negative) |
+| `train/pi_rejected_logp` | Log-prob π_θ assigns to the synthetic response | Same sum over synthetic response tokens | Should stay flat or drift downward while `pi_chosen_logp` rises. Both rising equally = model inflating all probabilities (SPIN margin catches this) | ↑ increases (synthetic quality improves each iteration) |
+| `train/ref_chosen_logp` | Log-prob π_prev (frozen) assigns to the human response | Pre-computed in Step 2; loaded from `_logprobs.jsonl`; **constant** throughout the iteration | Fixed anchor for the chosen side. Becomes less negative iteration-to-iteration as each new π_prev is better aligned | ↑ increases (less negative) |
+| `train/ref_rejected_logp` | Log-prob π_prev (frozen) assigns to the synthetic response | Pre-computed in Step 2; **constant** throughout the iteration | Fixed anchor for the rejected side. Also rises as synthetic quality improves; the gap `ref_chosen − ref_rejected` narrows each iteration | ↑ increases (less negative) |
+| `train/logp_gap` | Log-prob gap chosen − rejected under π_θ | `pi_chosen_logp − pi_rejected_logp` (derived each logged step) | Should be positive and grow during training. Negative = π_θ assigns more probability to synthetic than human — clear misalignment | →↓ may narrow as synthetic approaches human quality |
+| `train/kl_from_ref` | Approximate KL divergence from π_prev | `mean(pi_chosen_logp − ref_chosen_logp)` — average log-ratio on the chosen side | Starts at 0 (π_θ is identical to π_prev), grows during training. Rapidly growing KL = model drifted too far | → stable magnitude across iterations |
+| `train/spin_lambda` | λ scaling factor for this iteration | `lambda_initial` for all but the last iteration; `lambda_final_iteration` for the last | Confirms the two-phase λ schedule. The jump on the final iteration should visibly increase margins | →↑ stable, then jumps on the last iteration |
+| `train/learning_rate` | Current LR at this step | Read from optimizer param group after scheduler step | Verify the two-phase LR: `learning_rate` early, dropping to `learning_rate_late` at `late_lr_start_iteration` | →↓ stable, then drops |
+| `train/grad_global_norm` | L2 norm of all parameter gradients | `sqrt(Σ ‖g_i‖²)` across all parameters with a gradient (one fused GPU op) | Gradient explosion detector. Sustained spikes (> 10×) indicate LR or λ is too large | ↓→ falls, stabilises |
+| `train/weight_global_norm` | L2 norm of all trainable parameters | `sqrt(Σ ‖w_i‖²)` across all `requires_grad=True` parameters | Sanity check on model scale; should be broadly stable across updates | → stable |
+| `train/weight_drift` | Weight movement since the start of this training call | `sqrt(Σ ‖w_i − w_initial‖²)` from the snapshot taken at `on_train_begin` | Grows monotonically within a training call. Comparable magnitude across iterations = consistent update pressure | → similar magnitude each iteration |
+| `train/throughput_sps` | Training samples processed per second | `per_device_train_batch_size / elapsed_step_time` | GPU utilisation proxy. Drops indicate I/O stalls, memory pressure, or kernel launch overhead | → stable |
+| `train/perplexity` | Perplexity of the SPIN loss | `exp(min(loss, 20))` — capped to avoid overflow | More interpretable than raw loss. Falls from ≈ 2.0 (when loss = log 2) toward 1.0 as alignment improves | ↓→ falls, plateaus near 1.0 |
+| `train/alignment_accuracy` | Binary step-level alignment indicator | `1.0` if `margin_mean > 0`, else `0.0` | Is the model ahead of the reference this step? Noisy — use `epoch/win_rate_mean` for a smoother view | ↑→ rises toward 1.0 |
 
 ---
 
 #### `system/*` — per optimizer step (`iter_N/batch_K/`)
 
-Logged by `TensorBoardCallbackExtended` (on_step_end) and `MemoryProbeCallback` (first 3 steps always; then every `log_every_n_steps`).
+Logged by `TensorBoardCallbackExtended` (`on_step_end`) and `MemoryProbeCallback` (first 3 steps always; then every `log_every_n_steps`).
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `system/gpu_alloc_mb` | GPU memory actively holding tensor data | `torch.cuda.memory_allocated() / 1024²` | Active footprint of weights, activations, and optimizer states. Sudden persistent jumps at batch boundaries indicate allocation leaks |
-| `system/gpu_reserved_mb` | GPU memory held by PyTorch's caching allocator | `torch.cuda.memory_reserved() / 1024²` | Always ≥ `gpu_alloc_mb`. PyTorch keeps freed blocks in a cache for fast reuse. The gap (reserved − allocated) is the allocator's free list. If reserved grows without bound across iterations, call `torch.cuda.empty_cache()` between iterations |
-| `system/gpu_util_pct` | GPU compute utilisation (%) | `pynvml.nvmlDeviceGetUtilizationRates(handle).gpu` (falls back to `torch.cuda.utilization()`) | How busy the GPU SM cores are. Low values (< 50%) on a training run indicate CPU-GPU pipeline stalls, small batch size, or excessive Python overhead |
-| `system/cpu_rss_mb` | Process RSS in CPU RAM | `psutil.Process(os.getpid()).memory_info().rss / 1024²` | Should stay stable across batches. Steady growth across iterations signals a dataset object or tensor not being freed between iterations |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `system/gpu_alloc_mb` | GPU memory actively holding tensor data | `torch.cuda.memory_allocated() / 1024²` | Active footprint of weights, activations, and optimizer states. Persistent jumps at batch boundaries indicate allocation leaks | → stable |
+| `system/gpu_reserved_mb` | GPU memory held by PyTorch's caching allocator | `torch.cuda.memory_reserved() / 1024²` | Always ≥ `gpu_alloc_mb`. The gap (reserved − allocated) is the allocator's free list. Unbounded growth = call `torch.cuda.empty_cache()` | → stable |
+| `system/gpu_util_pct` | GPU compute utilisation (%) | `pynvml.nvmlDeviceGetUtilizationRates(handle).gpu`; falls back to `torch.cuda.utilization()` | Values < 50% during training indicate CPU-GPU pipeline stalls or a batch size that is too small | → stable (ideally high) |
+| `system/cpu_rss_mb` | Process RSS in CPU RAM | `psutil.Process(os.getpid()).memory_info().rss / 1024²` | Should stay stable across batches. Steady growth across iterations = dataset object or tensor not freed between iterations | → stable |
 
 ---
 
 #### `epoch/*` — per epoch (`iter_N/batch_K/`)
 
-Logged by `TensorBoardCallbackExtended` at `on_epoch_end`. X-axis is epoch number within the current batch's training.
+Logged by `TensorBoardCallbackExtended` at `on_epoch_end`. X-axis is epoch number within one data batch's training.
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `epoch/loss_mean` | Average loss over all steps in the epoch | `mean(all step losses accumulated this epoch)` | Smoother loss trend than per-step — use this to judge whether the epoch improved the model |
-| `epoch/loss_min` | Best (lowest) loss seen in the epoch | `min(all step losses this epoch)` | Indicates the peak alignment the model reached at any point in the epoch |
-| `epoch/loss_max` | Worst (highest) loss seen in the epoch | `max(all step losses this epoch)` | A large gap between `loss_min` and `loss_max` indicates high variance in the training signal |
-| `epoch/loss_final` | Loss at the last step of the epoch | Last accumulated loss value before reset | The loss the next epoch inherits; directly comparable to the `loss_mean` of the previous epoch |
-| `epoch/margin_mean` | Average SPIN margin over all steps in the epoch | `mean(margin_mean values accumulated this epoch)` | Epoch-level alignment health. Should increase epoch over epoch within each SPIN iteration |
-| `epoch/margin_final` | Margin at the last step of the epoch | Last accumulated margin value | The alignment state the next epoch starts from |
-| `epoch/win_rate_mean` | Average win rate over all steps in the epoch | `mean(win_rate values accumulated this epoch)` | More stable than per-step win rate. Should trend toward 1.0 across epochs |
-| `epoch/win_rate_final` | Win rate at the last step of the epoch | Last accumulated win rate | If this does not improve epoch-to-epoch, the model may have plateaued |
-| `epoch/logp_gap_mean` | Average log-prob gap (chosen − rejected) over the epoch | `mean(pi_chosen_logp − pi_rejected_logp)` per step, averaged | Should grow positive and increase epoch-to-epoch. Negative mean gap means the model assigns higher probability to synthetic responses than human ones |
-| `epoch/logp_gap_final` | Log-prob gap at the last step of the epoch | Last accumulated logp gap | Trailing indicator — use alongside `logp_gap_mean` for a complete picture |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `epoch/loss_mean` | Average loss over all steps in the epoch | `mean(step losses this epoch)` | Smoother loss view. Should fall epoch-over-epoch within each batch's training | ↓ decreases |
+| `epoch/loss_min` | Best loss seen in the epoch | `min(step losses this epoch)` | The peak alignment reached at any point in the epoch | ↓ decreases |
+| `epoch/loss_max` | Worst loss seen in the epoch | `max(step losses this epoch)` | Large gap between `loss_min` and `loss_max` = high step-to-step variance | ↓ decreases |
+| `epoch/loss_final` | Loss at the last step of the epoch | Last step loss before reset | Inherited by the next epoch; directly comparable epoch-to-epoch | ↓ decreases |
+| `epoch/margin_mean` | Average SPIN margin over the epoch | `mean(margin_mean values this epoch)` | Epoch-level alignment health; should rise each epoch | ↑ increases |
+| `epoch/margin_final` | Margin at the last step of the epoch | Last step margin before reset | Alignment state at the epoch boundary | ↑ increases |
+| `epoch/win_rate_mean` | Average win rate over the epoch | `mean(win_rate values this epoch)` | More stable than per-step win rate; stagnation = plateau | ↑→ rises toward 1.0 |
+| `epoch/win_rate_final` | Win rate at the last step of the epoch | Last step win rate before reset | Win rate at the epoch boundary; stagnation epoch-to-epoch signals a plateau | ↑→ rises toward 1.0 |
+| `epoch/logp_gap_mean` | Average log-prob gap (chosen − rejected) over the epoch | `mean(pi_chosen_logp − pi_rejected_logp per step)` | Negative mean = model prefers synthetic over human; should be positive and growing | ↑ increases |
+| `epoch/logp_gap_final` | Log-prob gap at the last step of the epoch | Last step gap before reset | Trailing indicator; use alongside `logp_gap_mean` | ↑ increases |
 
-> `epoch/loss_distribution` is also written as a histogram of all step losses in the epoch, visible in the **Histograms** tab.
+> `epoch/loss_distribution` is also written as a **histogram** of all step losses in the epoch (visible in the Histograms tab). The distribution should shift toward 0 across iterations.
+>
+> `train/alignment_pr_curve` is written at `on_epoch_end` if `log_pr_curves=True` — see Non-scalar outputs below.
 
 ---
 
 #### `iteration_summary/*` — end of each batch's training phase (`iter_N/batch_K/`)
 
-Logged by `TensorBoardCallbackExtended` at `on_train_end`. Written once per `_step_train()` call (i.e. once per data batch).
+Logged by `TensorBoardCallbackExtended` at `on_train_end`. Written once per `_step_train()` call (once per data batch).
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `iteration_summary/total_weight_drift` | Total parameter movement from start to end of this batch's training | `sqrt(Σ ‖w_final − w_initial‖²)` across all trainable parameters | How much the model changed in this batch. Compare across batches and iterations to spot unusually large updates |
-| `iteration_summary/final_loss` | Loss at the very last logged step | Taken from the last training metrics entry in `state.log_history` | The loss value this batch's model hands to the next batch |
-| `iteration_summary/final_margin_mean` | Margin at the very last logged step | Same source as `final_loss` | Final alignment state after all epochs on this data batch |
-| `iteration_summary/final_pi_chosen_logp` | π_θ log-prob on the human response at the last step | Same source | How confidently the final model predicts human text |
-| `iteration_summary/final_pi_rejected_logp` | π_θ log-prob on the synthetic response at the last step | Same source | How confidently the final model predicts the synthetic text (should be lower than `final_pi_chosen_logp`) |
-| `iteration_summary/final_win_rate` | Win rate at the very last logged step | Same source | Proportion of examples the model got right by the end of this batch |
-| `iteration_summary/final_kl_from_ref` | KL from ref at the very last logged step | Same source | How far the trained model has drifted from π_prev after all updates |
-| `iteration_summary/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | The model's discrimination ability between human and synthetic responses at end of training |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `iteration_summary/total_weight_drift` | Total parameter movement from start to end of this batch's training | `sqrt(Σ ‖w_final − w_initial‖²)` across all trainable parameters | How much the model changed in this batch. Comparable magnitude across batches = consistent update pressure | → similar magnitude each iteration |
+| `iteration_summary/final_loss` | Loss at the very last logged step | Last metrics entry in `state.log_history` | Loss value this batch hands forward; compare across iterations to confirm steady alignment | ↓ decreases |
+| `iteration_summary/final_margin_mean` | Margin at the very last logged step | Last metrics entry | Final alignment state after all epochs on this data batch | ↑→ rises, plateaus |
+| `iteration_summary/final_pi_chosen_logp` | π_θ log-prob on human response at the last step | Last metrics entry | How confidently the final batch model predicts human text | ↑ increases (less negative) |
+| `iteration_summary/final_pi_rejected_logp` | π_θ log-prob on synthetic response at the last step | Last metrics entry | Should remain lower than `final_pi_chosen_logp`; rises as synthetic quality improves across iterations | ↑ increases (less negative) |
+| `iteration_summary/final_win_rate` | Win rate at the very last logged step | Last metrics entry | Proportion of examples the model gets right at batch end | ↑→ rises toward 1.0 |
+| `iteration_summary/final_kl_from_ref` | KL from ref at the very last logged step | Last metrics entry | How far the trained model drifted from π_prev after all updates | → stable across iterations |
+| `iteration_summary/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Discrimination ability between human and synthetic at end of training | →↓ may narrow as synthetic approaches human quality |
 
 ---
 
 #### `hparam/*` — HParams tab (`iter_N/batch_K/hparams/`)
 
-Logged by `TensorBoardCallbackExtended` at `on_train_end` into a `hparams/` subdirectory. Visible in TensorBoard's **HParams** tab as a parallel coordinates plot for cross-run comparison.
+Logged by `TensorBoardCallbackExtended` at `on_train_end` into a `hparams/` subdirectory. Visible in TensorBoard's **HParams** tab as a parallel coordinates / scatter plot for cross-run comparison. Hyperparameters tracked: `learning_rate`, `batch_size`, `num_epochs`, `spin_iteration`, `spin_lambda`.
 
-| Tag | Paired hyperparameter | What it signifies |
-|-----|----------------------|-------------------|
-| `hparam/final_loss` | `learning_rate`, `batch_size`, `num_epochs`, `spin_iteration`, `spin_lambda` | Allows comparing final loss across runs with different hyperparameters in a single interactive chart |
-| `hparam/final_margin` | Same | Final alignment margin per hyperparameter combination |
-| `hparam/final_win_rate` | Same | Final win rate per hyperparameter combination |
-| `hparam/final_logp_gap` | Same | Final logp gap per hyperparameter combination |
-| `hparam/final_kl_from_ref` | Same | Final KL from reference per hyperparameter combination |
+| Tag | What it signifies | Trend |
+|-----|-------------------|-------|
+| `hparam/final_loss` | Final loss for this hyperparameter combination | ↓ decreases |
+| `hparam/final_margin` | Final SPIN margin | ↑→ rises |
+| `hparam/final_win_rate` | Final win rate | ↑→ rises |
+| `hparam/final_logp_gap` | Final log-prob gap | →↓ may narrow |
+| `hparam/final_kl_from_ref` | Final KL from reference | → stable |
 
 ---
 
 #### `spin_progress/*` — per SPIN iteration (`global/`)
 
-Logged by `SPINIterationSummaryCallback` at `on_train_end`, using the **SPIN iteration index** as the x-axis. All values across all iterations appear on a single chart, making cross-iteration trends visible.
+Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteration index** as the x-axis. These are the primary signals for tracking SPIN convergence across all iterations on a single chart.
 
 **Loss:**
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `spin_progress/final_loss` | Loss at the last step of the iteration | Last accumulated loss value | The loss this iteration hands forward; compare iteration-to-iteration to confirm steady alignment |
-| `spin_progress/mean_loss` | Average loss over all steps in the iteration | `mean(all step losses this iteration)` | More robust than final loss alone — a noisy final step can be misleading |
-| `spin_progress/min_loss` | Best loss seen anywhere in the iteration | `min(all step losses)` | The lowest point the model reached; a consistently falling min_loss across iterations confirms improvement |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `spin_progress/final_loss` | Loss at the last step of the iteration | Last accumulated loss value | Loss value this iteration hands forward | ↓→ falls, plateaus near 0 |
+| `spin_progress/mean_loss` | Average loss over all steps in the iteration | `mean(all step losses this iteration)` | More robust than final alone — a noisy last step can mislead | ↓→ falls, plateaus |
+| `spin_progress/min_loss` | Best loss seen anywhere in the iteration | `min(all step losses)` | The lowest point reached; consistently falling confirms genuine improvement | ↓→ falls, plateaus |
 
 **Alignment signal:**
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `spin_progress/final_margin` | SPIN margin at the last step | Last accumulated margin value | Higher = model strongly prefers human over synthetic at the end of this iteration |
-| `spin_progress/mean_margin` | Average margin over all steps | `mean(margin_mean values this iteration)` | Iteration-level alignment health. Should trend upward across SPIN iterations |
-| `spin_progress/final_pi_chosen_logp` | π_θ log-prob on human response at the last step | Last accumulated value | Becomes less negative across iterations as the model assigns higher probability to human text |
-| `spin_progress/final_pi_rejected_logp` | π_θ log-prob on synthetic response at the last step | Last accumulated value | Tracks synthetic quality — rises across iterations as π_prev improves, eventually approaching `final_pi_chosen_logp` (Nash equilibrium) |
-| `spin_progress/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Key convergence indicator. Should be positive and remain stable or grow; approaching 0 signals Nash equilibrium |
-| `spin_progress/mean_logp_gap` | Average logp gap over the iteration | `mean(pi_chosen_logp − pi_rejected_logp)` per step | More stable than the final value; use alongside `final_logp_gap` |
-| `spin_progress/final_win_rate` | Win rate at the last step | Last accumulated value | How often the final model beats π_prev per example. Should trend toward 1.0 across iterations |
-| `spin_progress/mean_win_rate` | Average win rate over the iteration | `mean(win_rate values this iteration)` | Iteration-level discrimination ability |
-| `spin_progress/final_kl_from_ref` | KL divergence from ref at the last step | Last accumulated value | How far π_θ drifted from π_prev; large values indicate aggressive updates |
-| `spin_progress/mean_kl_from_ref` | Average KL over the iteration | `mean(kl_from_ref values this iteration)` | Average drift pressure applied during this iteration |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `spin_progress/final_margin` | SPIN margin at the last step | Last accumulated `margin_mean` | Higher = model strongly prefers human over synthetic at iteration end | ↑→ rises, plateaus |
+| `spin_progress/mean_margin` | Average margin over all steps | `mean(margin_mean values this iteration)` | Iteration-level alignment health | ↑→ rises, plateaus |
+| `spin_progress/final_pi_chosen_logp` | π_θ log-prob on human response at the last step | Last accumulated value | Becomes less negative each iteration as the model predicts human text better | ↑ increases (less negative) |
+| `spin_progress/final_pi_rejected_logp` | π_θ log-prob on synthetic response at the last step | Last accumulated value | Also rises as synthetic quality improves; approaches `final_pi_chosen_logp` at Nash equilibrium | ↑ increases (less negative) |
+| `spin_progress/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Positive and ideally sustained. Approaching 0 signals Nash equilibrium (convergence) | ↓→ narrows toward 0 |
+| `spin_progress/mean_logp_gap` | Average logp gap over the iteration | `mean(pi_chosen_logp − pi_rejected_logp per step)` | More stable cross-iteration signal for discrimination ability | ↓→ narrows toward 0 |
+| `spin_progress/final_win_rate` | Win rate at the last step | Last accumulated `win_rate` | How often the final model beats π_prev per example | ↑→ rises toward 1.0 |
+| `spin_progress/mean_win_rate` | Average win rate over the iteration | `mean(win_rate values this iteration)` | Iteration-level discrimination ability | ↑→ rises toward 1.0 |
+| `spin_progress/final_kl_from_ref` | KL divergence from ref at the last step | Last accumulated `kl_from_ref` | How far π_θ drifted from π_prev by the end of training | → stable |
+| `spin_progress/mean_kl_from_ref` | Average KL over the iteration | `mean(kl_from_ref values this iteration)` | Average regularisation pressure this iteration | → stable |
 
 **Training configuration:**
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `spin_progress/total_steps` | Total optimizer steps taken in the iteration | `state.global_step` at `on_train_end` | Confirms the iteration ran for the expected number of steps |
-| `spin_progress/final_lr` | Learning rate at the end of the iteration | Last `learning_rate` value accumulated from logs | Verify the two-phase LR schedule applied correctly |
-| `spin_progress/spin_lambda` | λ value used for this iteration | `lambda_initial` or `lambda_final_iteration` | Confirms λ jumped on the final iteration as configured |
-| `spin_progress/dataset_size` | Number of training examples used in this iteration | Set by `set_iteration()` before `trainer.train()` | Useful when the dataset size varies across iterations or for partial-batch runs |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `spin_progress/total_steps` | Total optimizer steps in this iteration | `state.global_step` at `on_train_end` | Confirms the iteration ran for the expected number of steps | → stable |
+| `spin_progress/final_lr` | Learning rate at the end of the iteration | Last `learning_rate` value from logs | Verify the two-phase LR schedule applied correctly | →↓ stable, then drops at `late_lr_start_iteration` |
+| `spin_progress/spin_lambda` | λ value used for this iteration | `lambda_initial` or `lambda_final_iteration` | Confirms λ jumped on the final iteration as configured | →↑ stable, then jumps on the last iteration |
+| `spin_progress/dataset_size` | Number of training examples this iteration | Set by `set_iteration()` before `trainer.train()` | Useful when dataset size varies across iterations | → stable |
 
-**Weight drift (cross-iteration model evolution):**
+**Weight drift:**
 
-| Tag | What it is | How it's calculated | What it signifies |
-|-----|-----------|---------------------|-------------------|
-| `spin_progress/weight_drift_from_iter_start` | How much the model changed within this iteration | `sqrt(Σ ‖w_final − w_iter_start‖²)` across all trainable params | Measures the magnitude of alignment update in this round. Should be consistent across iterations; a sudden large jump with poor metrics indicates instability |
-| `spin_progress/weight_drift_from_base_model` | Cumulative total weight change since the very first checkpoint | `sqrt(Σ ‖w_final − w_base‖²)` — base model snapshot captured at iteration 0 | Shows how far the model has moved from its pre-SPIN starting point across all iterations combined |
-| `spin_progress/cosine_sim_to_iter_start` | Directional similarity between iteration-start and iteration-end weights | `cosine_similarity(flat_start_params, flat_end_params)` — 1.0 = no directional change | A value near 1.0 means training moved the model in a consistent direction. Values near 0 indicate the gradient flipped direction, which can signal instability or oscillation |
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `spin_progress/weight_drift_from_iter_start` | How much the model changed within this iteration | `sqrt(Σ ‖w_final − w_iter_start‖²)` across all trainable params | Magnitude of the alignment update this round. Sudden large jumps with poor metrics indicate instability | ↓→ may decrease slightly as model nears convergence |
+| `spin_progress/weight_drift_from_base_model` | Cumulative drift from the very first checkpoint | `sqrt(Σ ‖w_final − w_base‖²)` — base snapshot captured at iteration 0 | Total alignment shift across all iterations combined | ↑ always increases |
+| `spin_progress/cosine_sim_to_iter_start` | Directional similarity between iteration-start and iteration-end weights | `cosine_similarity(flat_start_params, flat_end_params)` | 1.0 = no change; lower = larger directional shift. Near convergence the model changes less, so similarity rises | ↑→ rises toward 1.0 at convergence |
 
 ---
 
 #### Non-scalar outputs
 
-| Panel / Tab | Tag or location | What it shows |
-|------------|-----------------|---------------|
-| **Text → config/spin_config** | `iter_N/batch_K/`, written at training start | Full `SPINConfig` dump — confirms which hyperparameters were active |
-| **Text → spin_iterations/log** | `global/`, written at each iteration start | One-line record of LR, epochs, and batch size for each SPIN iteration |
-| **Text → spin_iterations/summary** | `global/`, written at each iteration end | Markdown summary card: final loss, margin, win rate, logp gap, KL, λ, steps, dataset size |
-| **Text → profiler/key_averages_iter_N** | `global/` (if `enable_profiler=True`) | Top-N PyTorch operators sorted by CUDA time — operator-level GPU performance breakdown |
-| **PR Curves → train/alignment_pr_curve** | `iter_N/batch_K/` per epoch (if `log_pr_curves=True`) | Precision-Recall curve where label=1 means margin > 0 and score=sigmoid(margin). Shows how reliably the margin score predicts alignment at different thresholds |
-| **Projector → embeddings/tokens_iter_start** | `iter_N/batch_K/` at training start (if `log_embedding_projector=True`) | PCA/UMAP/t-SNE of the token embedding matrix before training — visualise vocabulary geometry |
-| **Projector → embeddings/tokens_iter_end** | `iter_N/batch_K/` at training end | Same embedding matrix after training — compare to iter_start to see how SPIN shifted token representations |
-| **Histograms → epoch/loss_distribution** | `iter_N/batch_K/` per epoch | Distribution of step-level loss values across the epoch |
-| **Graphs** | `global/` (if `log_model_graph=True`) | Schematic causal LM architecture graph (embedding → N decoder layers → LM head) |
+| Panel / Tab | Tag or location | What it shows | Trend across iterations |
+|------------|-----------------|---------------|------------------------|
+| **Text → config/spin_config** | `iter_N/batch_K/` at training start | Full `SPINConfig` dump — confirms active hyperparameters | → same every iteration |
+| **Text → spin_iterations/log** | `global/` at each iteration start | One-line record of LR, epochs, batch size for each SPIN iteration | LR entry ↓ after `late_lr_start_iteration` |
+| **Text → spin_iterations/summary** | `global/` at each iteration end | Markdown card: final loss, margin, win rate, logp gap, KL, λ, steps, dataset size | Values follow their respective scalar trends |
+| **Text → profiler/key_averages_iter_N** | `global/` if `enable_profiler=True` | Top-N PyTorch operators sorted by CUDA time — operator-level GPU profile | → similar op profile each iteration |
+| **PR Curves → train/alignment_pr_curve** | `iter_N/batch_K/` per epoch if `log_pr_curves=True` | Label = 1 when margin > 0; score = sigmoid(margin). Precision-Recall curve showing how reliably margin predicts alignment | ↑ AUC rises toward 1.0 across iterations |
+| **Projector → embeddings/tokens_iter_start** | `iter_N/batch_K/` at training start if `log_embedding_projector=True` | PCA/UMAP/t-SNE of the token embedding matrix before training | Visible cluster shift across iterations as alignment reshapes token geometry |
+| **Projector → embeddings/tokens_iter_end** | `iter_N/batch_K/` at training end | Same embedding matrix after training — compare to iter_start | ↓ smaller shift from start→end as model converges |
+| **Histograms → epoch/loss_distribution** | `iter_N/batch_K/` per epoch | Distribution of step-level loss values in the epoch | ↓ distribution shifts toward 0 across iterations |
+| **Graphs** | `global/` if `log_model_graph=True` | Schematic causal LM architecture (embedding → N decoder layers → LM head) | → same every iteration |
 
 ---
 
