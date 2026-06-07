@@ -227,7 +227,12 @@ class SPINIterationSummaryCallback(TrainerCallback):
         """Accumulate step-level metrics; summarised at on_train_end."""
         if logs is None:
             return
-        loss_val = logs.get("loss") or logs.get("train_loss")
+        # Only capture the step-level SPIN "loss" key, never "train_loss".
+        # HF Trainer appends a timing summary at the end of training that contains
+        # "train_loss" (the run-average, often 20+) but not "loss".  Using
+        # `logs.get("loss") or logs.get("train_loss")` would store that ~20 value
+        # as the last element of _losses, corrupting final_loss and mean_loss.
+        loss_val = logs.get("loss")
         if loss_val is not None:
             self._losses.append(loss_val)
         if "margin_mean" in logs:

@@ -126,6 +126,16 @@ class TensorBoardCallbackExtended(TrainerCallback):
         if model is None:
             return
 
+        # Snapshot trainable weights at training start for per-step weight drift tracking.
+        # train/weight_drift and iteration_summary/total_weight_drift both depend on this.
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.initial_params[name] = param.detach().float().cpu().clone()
+        logger.info(
+            f"  Weight snapshot taken: {len(self.initial_params)} trainable tensors "
+            f"(used for train/weight_drift and iteration_summary/total_weight_drift)."
+        )
+
         # Log a text summary of the training config for reference
         cfg_text = "\n".join(f"    {k}: {v}" for k,
                              v in vars(self.cfg).items())
@@ -195,9 +205,12 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self._epoch_gaps.append(gap)
             self._final_logp_gap = gap
 
+        # Use only the per-step "loss" key. HF Trainer appends a timing summary at
+        # training end containing "train_loss" (the run average, often the same
+        # magnitude as the real loss but logged as a single point). Falling back to
+        # "train_loss" would corrupt _final_loss and epoch accumulators with that
+        # average rather than the last real step loss.
         loss = logs.get("loss")
-        if loss is None:
-            loss = logs.get("train_loss")
         margin = logs.get("margin_mean")
         wr = logs.get("win_rate")
         kl = logs.get("kl_from_ref")
@@ -258,24 +271,37 @@ class TensorBoardCallbackExtended(TrainerCallback):
         if gpu_util is not None:
             self.writer.add_scalar("system/gpu_util_pct", gpu_util, step)
 
-        # ── Global gradient norm ─────────────────────────────────────────────
-        # Compute in one fused operation with a single GPU sync instead of one .item() per parameter.
-        grads = [p.grad.detach()
-                 for p in model.parameters() if p.grad is not None]
-        if grads:
-            grad_sq_sum = torch.stack(
-                [g.float().norm().pow(2) for g in grads]).sum().item()
-            self.writer.add_scalar(
-                "train/grad_global_norm", grad_sq_sum ** 0.5, step)
+        # ── Global weight norm (ALL trainable parameters, every step) ──────────
+        # NOTE: train/grad_global_norm is computed in SPINTrainer.training_step immediately
+        # after loss.backward() (while gradients are alive) and logged via self.log().
+        # It cannot be computed here because HF Trainer calls model.zero_grad() at line 118
+        # of _run_epoch BEFORE on_step_end fires at line 121 — so p.grad is None here.
+        # GPU-only op: stack norms and sum → one sync via .item().
+        # Covers every requires_grad parameter, so the value matches the README
+        # spec independent of parameter_log_max_tensors.
+        weight_norms_sq = [p.detach().float().norm().pow(2)
+                           for p in model.parameters() if p.requires_grad]
+        if weight_norms_sq:
+            weight_global_norm = torch.stack(weight_norms_sq).sum().item() ** 0.5
+            self.writer.add_scalar("train/weight_global_norm", weight_global_norm, step)
 
-        # ── Per-parameter stats (throttled to parameter_log_interval) ────────
+        # ── Per-parameter stats + weight drift (throttled) ───────────────────
         # HuggingFace Trainer increments global_step before calling on_step_end,
         # so step starts at 1; check step == 1 to fire on the very first optimizer step.
+        # Weight drift requires CPU transfers (comparing to initial_params snapshot),
+        # so it is throttled along with the per-layer detailed stats.
         if not self._should_log_params(step):
             return
 
-        total_weight_sq = 0.0
-        total_delta_sq = 0.0
+        # Weight drift over ALL trainable parameters (not capped at parameter_log_max_tensors).
+        if self.initial_params:
+            total_delta_sq = sum(
+                (p.detach().float().cpu() - self.initial_params[n]).norm().item() ** 2
+                for n, p in model.named_parameters()
+                if p.requires_grad and n in self.initial_params
+            )
+            self.writer.add_scalar("train/weight_drift", total_delta_sq ** 0.5, step)
+
         logged = 0
 
         for name, param in model.named_parameters():
@@ -286,12 +312,10 @@ class TensorBoardCallbackExtended(TrainerCallback):
 
             w = param.detach().float().cpu()
             tag = name.replace(".", "/")
-            total_weight_sq += w.norm().item() ** 2
 
-            # Weight drift from the start of this SPIN iteration
+            # Per-parameter weight drift
             if name in self.initial_params:
                 delta = w - self.initial_params[name]
-                total_delta_sq += delta.norm().item() ** 2
                 if self.cfg.log_parameter_scalars:
                     self.writer.add_scalar(
                         f"weight_delta/norm/{tag}", delta.norm().item(), step)
@@ -316,12 +340,6 @@ class TensorBoardCallbackExtended(TrainerCallback):
                 )
 
             logged += 1
-
-        # Global aggregates: useful for a single high-level view without per-layer noise
-        self.writer.add_scalar("train/weight_global_norm",
-                               total_weight_sq ** 0.5, step)
-        self.writer.add_scalar("train/weight_drift",
-                               total_delta_sq ** 0.5, step)
         self.writer.flush()
 
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -411,21 +429,18 @@ class TensorBoardCallbackExtended(TrainerCallback):
             self.writer.add_scalar(
                 "iteration_summary/total_weight_drift", total_delta_sq ** 0.5, state.global_step)
 
-        # Scan log_history in reverse for the last step that actually contains training metrics.
-        # The final entry is often a timing summary (train_runtime, etc.) without loss values.
         last_metrics: dict = {}
         for entry in reversed(state.log_history):
-            if "loss" in entry or "train_loss" in entry:
+            if "margin_mean" in entry:
                 last_metrics = entry
                 break
 
-        for key in ("loss", "train_loss", "margin_mean", "pi_chosen_logp", "pi_rejected_logp",
+        for key in ("loss", "margin_mean", "pi_chosen_logp", "pi_rejected_logp",
                     "win_rate", "kl_from_ref"):
             val = last_metrics.get(key)
             if val is not None:
-                canonical = key if key != "train_loss" else "loss"
                 self.writer.add_scalar(
-                    f"iteration_summary/final_{canonical}", val, state.global_step)
+                    f"iteration_summary/final_{key}", val, state.global_step)
 
         if "pi_chosen_logp" in last_metrics and "pi_rejected_logp" in last_metrics:
             self.writer.add_scalar(

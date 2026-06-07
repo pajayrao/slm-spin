@@ -772,11 +772,16 @@ def pad_to_max_len(seqs: List[List[int]], pad_value: int) -> torch.Tensor:
 
 
 def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Compute the sum of per-token log-probabilities for each sequence in a batch.
+    """Compute the per-token average log-probability for each sequence in a batch.
 
     Applies the standard auto-regressive shift (predict token t from tokens 0..t-1),
-    masks positions where labels == -100 (i.e. prompt tokens), and sums the
-    remaining log-probs.  Returns a 1-D tensor of shape (batch,).
+    masks positions where labels == -100 (i.e. prompt tokens), sums the remaining
+    log-probs, then divides by the number of response tokens to produce a per-token
+    average.  Returns a 1-D tensor of shape (batch,).
+
+    Dividing by response length makes the SPIN margin length-agnostic: a short
+    response and a long response with the same token-level quality produce the
+    same scalar, so the margin comparison is fair regardless of sequence length.
 
     Example:
         Input:  logits shape=(2, 5, 32000)   # batch=2, seq_len=5, vocab=32000
@@ -790,14 +795,14 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
           - log_softmax applied over vocab dimension
           - gather log-prob of the actual next token at each response position
           - mask out prompt positions (label == -100)
-          - sum per sequence
+          - sum per sequence, divide by number of response tokens
 
-        Output: tensor([-4.8231, -3.1054])  # one scalar per sequence in the batch
-                (more negative = lower probability assigned to those response tokens)
+        Output: tensor([-1.6077, -1.0351])  # per-token average; one scalar per sequence
+                (more negative = lower average probability per response token)
 
-    Example (single sequence, all response tokens):
+    Example (single sequence, 3 response tokens after shift):
         Input:  logits shape=(1, 4, 100), labels=tensor([[10, 20, 30, 40]])
-        Output: tensor([-2.4517])  # sum of log-probs for tokens 20, 30, 40 (shifted by 1)
+        Output: tensor([-0.8172])  # average log-prob over tokens 20, 30, 40
     """
     batch, seq_len, vocab = logits.shape
     logger.debug(
@@ -837,10 +842,10 @@ def sequence_logprob_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> 
     response_mask = (shift_labels != -100)
     token_logps = token_logps * response_mask
 
-    # Step 5: Sum response-token log-probs and normalize by response length.
-    # Dividing by the number of non-masked tokens gives a per-token average so the SPIN
-    # margin compares quality rather than sequence length — a short response with 3 tokens
-    # and a long one with 30 tokens are now on the same scale.
+    # Step 5: Sum response-token log-probs and divide by response token count.
+    # The division yields a per-token average so the SPIN margin compares quality
+    # rather than sequence length — a short response with 3 tokens and a long one
+    # with 30 tokens are on the same scale.
     # Example: token_logps=[0.0,-1.2,-0.8,-2.1], resp_lens=3
     #          seq_logps = (-1.2 + -0.8 + -2.1) / 3 = -1.37
     resp_lens = response_mask.sum(dim=-1)

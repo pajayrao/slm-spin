@@ -367,20 +367,32 @@ Logged by `TensorBoardCallbackExtended` every time `SPINTrainer` calls `self.log
 | `train/margin_mean` | Mean per-example margin across the batch | `mean(λ × ((log π_θ(chosen) − ref_chosen_logp) − (log π_θ(rejected) − ref_rejected_logp)))` | Core alignment signal. Starts at 0 at step 0 of each iteration (π_θ is a copy of π_prev); trends positive during training; resets to 0 at every iteration boundary | ↑→ rises, plateaus |
 | `train/margin_std` | Standard deviation of per-example margins | `std(...)` of the same per-example margins | High std = uneven alignment across the batch. Narrows as training consistently aligns most examples | ↓→ falls, stabilises |
 | `train/win_rate` | Fraction of batch examples where margin > 0 | `mean(margin > 0)` | Proportion of examples where π_θ is ahead of π_prev. Trends from ≈ 0.5 to 1.0 within an iteration | ↑→ rises toward 1.0 |
-| `train/pi_chosen_logp` | Log-prob π_θ assigns to the human response | `Σ_t log π_θ(token_t \| prompt, prior_tokens)` over response tokens (prompt tokens masked) | Becomes less negative as the model learns to predict human text more confidently | ↑ increases (less negative) |
-| `train/pi_rejected_logp` | Log-prob π_θ assigns to the synthetic response | Same sum over synthetic response tokens | Should stay flat or drift downward while `pi_chosen_logp` rises. Both rising equally = model inflating all probabilities (SPIN margin catches this) | ↑ increases (synthetic quality improves each iteration) |
-| `train/ref_chosen_logp` | Log-prob π_prev (frozen) assigns to the human response | Pre-computed in Step 2; loaded from `_logprobs.jsonl`; **constant** throughout the iteration | Fixed anchor for the chosen side. Becomes less negative iteration-to-iteration as each new π_prev is better aligned | ↑ increases (less negative) |
-| `train/ref_rejected_logp` | Log-prob π_prev (frozen) assigns to the synthetic response | Pre-computed in Step 2; **constant** throughout the iteration | Fixed anchor for the rejected side. Also rises as synthetic quality improves; the gap `ref_chosen − ref_rejected` narrows each iteration | ↑ increases (less negative) |
-| `train/logp_gap` | Log-prob gap chosen − rejected under π_θ | `pi_chosen_logp − pi_rejected_logp` (derived each logged step) | Should be positive and grow during training. Negative = π_θ assigns more probability to synthetic than human — clear misalignment | →↓ may narrow as synthetic approaches human quality |
-| `train/kl_from_ref` | Approximate KL divergence from π_prev | `mean(pi_chosen_logp − ref_chosen_logp)` — average log-ratio on the chosen side | Starts at 0 (π_θ is identical to π_prev), grows during training. Rapidly growing KL = model drifted too far | → stable magnitude across iterations |
+| `train/pi_chosen_logp` | Log-prob π_θ assigns to the human response | `(Σ_t log π_θ(token_t \| prompt, prior_tokens)) / n_response_tokens` — per-token average over response tokens (prompt tokens masked) | Becomes less negative as the model learns to predict human text more confidently. Values are per-token averages (typically −1 to −5), not raw sums | ↑ increases (less negative) |
+| `train/pi_rejected_logp` | Log-prob π_θ assigns to the synthetic response | Same per-token average over synthetic response tokens | Should stay flat or drift downward while `pi_chosen_logp` rises. Both rising equally = model inflating all probabilities (SPIN margin catches this) | ↑ increases (synthetic quality improves each iteration) |
+| `train/ref_chosen_logp` | Log-prob π_prev (frozen) assigns to the human response | Pre-computed in Step 2; loaded from `_logprobs.jsonl`; **constant** throughout the iteration. Per-token average (same normalization as `pi_chosen_logp`) | Fixed anchor for the chosen side. In a healthy run this becomes less negative iteration-to-iteration as each new π_prev is better aligned. **If it trends downward (more negative) across iterations the previous iteration's training made π_prev worse at human text — reduce LR or λ** | ↑ increases (less negative); ↓ = training is diverging |
+| `train/ref_rejected_logp` | Log-prob π_prev (frozen) assigns to the synthetic response | Pre-computed in Step 2; **constant** throughout the iteration. Per-token average | Fixed anchor for the rejected side. Also rises as synthetic quality improves; the gap `ref_chosen − ref_rejected` narrows each iteration. Trending downward alongside `ref_chosen_logp` confirms model collapse | ↑ increases (less negative); ↓ = training is diverging |
+| `train/logp_gap` | Log-prob gap chosen − rejected under π_θ | `pi_chosen_logp − pi_rejected_logp` (derived each logged step) | Should be positive and **growing** — the model is widening its preference for human over synthetic. Negative = clear misalignment | ↑ increases during active training |
+| `train/kl_from_ref` | Signed average policy advantage vs π_prev (**not** a true KL divergence — can be negative) | `(mean(pi_chosen − ref_chosen) + mean(pi_rejected − ref_rejected)) / 2` — average log-ratio across **both** chosen and rejected sides | 0 at step 0 (π_θ identical to π_prev). **Positive** = model is improving on both sides. **Negative** = model is regressing on chosen or aggressively pushing down rejected without lifting chosen — a negative trend is an alignment alarm, not normal. Distinct from margin: margin can be positive even when kl_from_ref is negative (if rejected drops faster than chosen) | **→ near 0 is healthy**; sustained negative = check LR/λ |
 | `train/spin_lambda` | λ scaling factor for this iteration | `lambda_initial` for all but the last iteration; `lambda_final_iteration` for the last | Confirms the two-phase λ schedule. The jump on the final iteration should visibly increase margins | →↑ stable, then jumps on the last iteration |
 | `train/learning_rate` | Current LR at this step | Read from optimizer param group after scheduler step | Verify the two-phase LR: `learning_rate` early, dropping to `learning_rate_late` at `late_lr_start_iteration` | →↓ stable, then drops |
-| `train/grad_global_norm` | L2 norm of all parameter gradients | `sqrt(Σ ‖g_i‖²)` across all parameters with a gradient (one fused GPU op) | Gradient explosion detector. Sustained spikes (> 10×) indicate LR or λ is too large | ↓→ falls, stabilises |
-| `train/weight_global_norm` | L2 norm of all trainable parameters | `sqrt(Σ ‖w_i‖²)` across all `requires_grad=True` parameters | Sanity check on model scale; should be broadly stable across updates | → stable |
-| `train/weight_drift` | Weight movement since the start of this training call | `sqrt(Σ ‖w_i − w_initial‖²)` from the snapshot taken at `on_train_begin` | Grows monotonically within a training call. Comparable magnitude across iterations = consistent update pressure | → similar magnitude each iteration |
+| `train/grad_global_norm` | L2 norm of all parameter gradients | `sqrt(Σ ‖g_i‖²)` across all parameters with a gradient — computed in `SPINTrainer.training_step` immediately after `loss.backward()` while gradients are alive, then logged via `self.log()`. HF Trainer calls `model.zero_grad()` before `on_step_end`, so this cannot be read reliably in a callback | Gradient explosion detector. Sustained spikes (> 10×) indicate LR or λ is too large | ↓→ falls, stabilises |
+| `train/weight_global_norm` | L2 norm of all trainable parameters | `sqrt(Σ ‖w_i‖²)` across all `requires_grad=True` parameters — computed on GPU every step | Sanity check on model scale; should be broadly stable across updates | → stable |
+| `train/weight_drift` | Weight movement since the start of this training call | `sqrt(Σ ‖w_i − w_initial‖²)` from the snapshot taken at `on_train_begin`, covering all trainable parameters. Logged every `parameter_log_interval` steps (throttled to avoid repeated CPU transfers) | Grows monotonically within a training call. Comparable magnitude across iterations = consistent update pressure | → similar magnitude each iteration |
 | `train/throughput_sps` | Training samples processed per second | `per_device_train_batch_size / elapsed_step_time` | GPU utilisation proxy. Drops indicate I/O stalls, memory pressure, or kernel launch overhead | → stable |
 | `train/perplexity` | Perplexity of the SPIN loss | `exp(min(loss, 20))` — capped to avoid overflow | More interpretable than raw loss. Falls from ≈ 2.0 (when loss = log 2) toward 1.0 as alignment improves | ↓→ falls, plateaus near 1.0 |
 | `train/alignment_accuracy` | Binary step-level alignment indicator | `1.0` if `margin_mean > 0`, else `0.0` | Is the model ahead of the reference this step? Noisy — use `epoch/win_rate_mean` for a smoother view | ↑→ rises toward 1.0 |
+
+The following are **auto-logged by HuggingFace Trainer** and appear in TensorBoard because `on_log` writes every key in the Trainer's `logs` dict under `train/`. They are not emitted by SPINTrainer directly.
+
+| Tag | What it is | How it's calculated | What it signifies | Trend |
+|-----|-----------|---------------------|-------------------|-------|
+| `train/epoch` | Fractional epoch progress | Computed by HF Trainer: `completed_steps / steps_per_epoch` | Cycles 0→1 over each batch's training. Useful as an x-axis proxy when steps and epochs are both present | → cycles 0→1 each training call |
+| `train/grad_norm` | Gradient L2 norm before clipping | Computed by HF Trainer during gradient clipping, before `optimizer.step()` and `zero_grad()` — always valid. Distinct from `train/grad_global_norm` which is computed by SPINTrainer after `loss.backward()` and includes all params (not only clipped) | Logged every step. Use alongside `grad_global_norm` to catch gradient spikes | ↓→ falls, stabilises |
+| `train/total_flops` | Accumulated FLOPs for this training run | Estimated by HF Trainer from model architecture; **not all architectures are supported** — unsupported models log 0 or near-zero | Rough compute cost estimate. Values near 0 or erratic indicate HF Trainer could not infer FLOPs for this model family | → stable per run (accumulated total) |
+| `train/train_loss` | Average SPIN loss over the entire training run | `accumulated_loss / total_steps` — logged once at the end of training by HF Trainer | Per-run average loss (single dot per run in TensorBoard). Complements `iteration_summary/final_loss` which is the last-step loss | ↓ decreases across iterations |
+| `train/train_runtime` | Total wall-clock time for this training run (seconds) | Logged once by HF Trainer at `on_train_end` | Per-run training time. Significant variation between runs indicates data loading or GPU memory issues | → stable |
+| `train/train_samples_per_second` | Overall throughput for the training run | `total_samples / train_runtime` — logged once at `on_train_end` | Run-level average throughput (vs `train/throughput_sps` which is per-step). Use to compare across iterations | → stable |
+| `train/train_steps_per_second` | Overall steps-per-second for the training run | `total_steps / train_runtime` — logged once at `on_train_end` | Similar to `train_samples_per_second` but in optimizer steps. Both are scatter-plot style (one dot per run) | → stable |
 
 ---
 
@@ -427,13 +439,13 @@ Logged by `TensorBoardCallbackExtended` at `on_train_end`. Written once per `_st
 | Tag | What it is | How it's calculated | What it signifies | Trend |
 |-----|-----------|---------------------|-------------------|-------|
 | `iteration_summary/total_weight_drift` | Total parameter movement from start to end of this batch's training | `sqrt(Σ ‖w_final − w_initial‖²)` across all trainable parameters | How much the model changed in this batch. Comparable magnitude across batches = consistent update pressure | → similar magnitude each iteration |
-| `iteration_summary/final_loss` | Loss at the very last logged step | Last metrics entry in `state.log_history` | Loss value this batch hands forward; compare across iterations to confirm steady alignment | ↓ decreases |
+| `iteration_summary/final_loss` | SPIN loss at the very last step-level log entry | Taken from the last `state.log_history` entry that contains `margin_mean` (the SPIN step-level entry — the HF Trainer timing summary that is appended after it is deliberately skipped) | Loss value this batch hands forward; compare across iterations to confirm steady alignment | ↓ decreases |
 | `iteration_summary/final_margin_mean` | Margin at the very last logged step | Last metrics entry | Final alignment state after all epochs on this data batch | ↑→ rises, plateaus |
 | `iteration_summary/final_pi_chosen_logp` | π_θ log-prob on human response at the last step | Last metrics entry | How confidently the final batch model predicts human text | ↑ increases (less negative) |
 | `iteration_summary/final_pi_rejected_logp` | π_θ log-prob on synthetic response at the last step | Last metrics entry | Should remain lower than `final_pi_chosen_logp`; rises as synthetic quality improves across iterations | ↑ increases (less negative) |
 | `iteration_summary/final_win_rate` | Win rate at the very last logged step | Last metrics entry | Proportion of examples the model gets right at batch end | ↑→ rises toward 1.0 |
-| `iteration_summary/final_kl_from_ref` | KL from ref at the very last logged step | Last metrics entry | How far the trained model drifted from π_prev after all updates | → stable across iterations |
-| `iteration_summary/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Discrimination ability between human and synthetic at end of training | →↓ may narrow as synthetic approaches human quality |
+| `iteration_summary/final_kl_from_ref` | Signed average policy advantage vs π_prev at the last step | `(mean(pi_chosen − ref_chosen) + mean(pi_rejected − ref_rejected)) / 2` | **Positive** = model improved on both sides. **Negative** = model regressed on chosen or pushed rejected down harder than it lifted chosen. A consistently negative trend across batches is an alignment alarm | → near 0; negative = check LR/λ |
+| `iteration_summary/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Should be positive and growing — model actively prefers human over synthetic. Only narrows toward 0 at Nash equilibrium | ↑ increases during active training |
 
 ---
 
@@ -447,7 +459,7 @@ Logged by `TensorBoardCallbackExtended` at `on_train_end` into a `hparams/` subd
 | `hparam/final_margin` | Final SPIN margin | ↑→ rises |
 | `hparam/final_win_rate` | Final win rate | ↑→ rises |
 | `hparam/final_logp_gap` | Final log-prob gap | →↓ may narrow |
-| `hparam/final_kl_from_ref` | Final KL from reference | → stable |
+| `hparam/final_kl_from_ref` | Final signed avg policy advantage vs π_prev — positive = healthy alignment, negative = regression | → near 0; negative = check config |
 
 ---
 
@@ -471,19 +483,19 @@ Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteratio
 | `spin_progress/mean_margin` | Average margin over all steps | `mean(margin_mean values this iteration)` | Iteration-level alignment health | ↑→ rises, plateaus |
 | `spin_progress/final_pi_chosen_logp` | π_θ log-prob on human response at the last step | Last accumulated value | Becomes less negative each iteration as the model predicts human text better | ↑ increases (less negative) |
 | `spin_progress/final_pi_rejected_logp` | π_θ log-prob on synthetic response at the last step | Last accumulated value | Also rises as synthetic quality improves; approaches `final_pi_chosen_logp` at Nash equilibrium | ↑ increases (less negative) |
-| `spin_progress/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Positive and ideally sustained. Approaching 0 signals Nash equilibrium (convergence) | ↓→ narrows toward 0 |
-| `spin_progress/mean_logp_gap` | Average logp gap over the iteration | `mean(pi_chosen_logp − pi_rejected_logp per step)` | More stable cross-iteration signal for discrimination ability | ↓→ narrows toward 0 |
+| `spin_progress/final_logp_gap` | Log-prob gap at the last step | `final_pi_chosen_logp − final_pi_rejected_logp` | Should be positive and **growing** — the model is widening its preference for human over synthetic during active alignment. Only at Nash equilibrium (run near convergence) does the gap approach 0 as synthetic quality matches human quality | ↑ increases during active training; →0 only at Nash equilibrium |
+| `spin_progress/mean_logp_gap` | Average logp gap over the iteration | `mean(pi_chosen_logp − pi_rejected_logp per step)` | More stable than the final value; follows the same widening trend | ↑ increases during active training; →0 only at Nash equilibrium |
 | `spin_progress/final_win_rate` | Win rate at the last step | Last accumulated `win_rate` | How often the final model beats π_prev per example | ↑→ rises toward 1.0 |
 | `spin_progress/mean_win_rate` | Average win rate over the iteration | `mean(win_rate values this iteration)` | Iteration-level discrimination ability | ↑→ rises toward 1.0 |
-| `spin_progress/final_kl_from_ref` | KL divergence from ref at the last step | Last accumulated `kl_from_ref` | How far π_θ drifted from π_prev by the end of training | → stable |
-| `spin_progress/mean_kl_from_ref` | Average KL over the iteration | `mean(kl_from_ref values this iteration)` | Average regularisation pressure this iteration | → stable |
+| `spin_progress/final_kl_from_ref` | Signed average policy advantage vs π_prev at the last step | `(mean(pi_chosen − ref_chosen) + mean(pi_rejected − ref_rejected)) / 2` | **Positive** = model improved on both sides. **Negative** = regressed on chosen or pushed rejected down harder than it lifted chosen. A cross-iteration downward trend means alignment is failing — reduce LR or λ | → near 0; negative trend = alignment alarm |
+| `spin_progress/mean_kl_from_ref` | Average signed advantage over the iteration | `mean(kl_from_ref values this iteration)` | Per-iteration average. More robust than the final value — use alongside `final_kl_from_ref` | → near 0; negative trend = alignment alarm |
 
 **Training configuration:**
 
 | Tag | What it is | How it's calculated | What it signifies | Trend |
 |-----|-----------|---------------------|-------------------|-------|
 | `spin_progress/total_steps` | Total optimizer steps in this iteration | `state.global_step` at `on_train_end` | Confirms the iteration ran for the expected number of steps | → stable |
-| `spin_progress/final_lr` | Learning rate at the end of the iteration | Last `learning_rate` value from logs | Verify the two-phase LR schedule applied correctly | →↓ stable, then drops at `late_lr_start_iteration` |
+| `spin_progress/final_lr` | Learning rate at the **very last logged step** of the iteration | Last `learning_rate` value accumulated from logs | HF Trainer's default linear decay schedule reduces the LR from the configured peak (e.g. 5e-5) to ~0 by the final step of each training call. So `final_lr` is expected to be near zero every iteration — it does **not** represent the peak or average LR. To see the peak LR configured for each iteration use `train/learning_rate` early in the training steps | → near 0 every iteration (linear decay bottoms out); configured peak is the meaningful number |
 | `spin_progress/spin_lambda` | λ value used for this iteration | `lambda_initial` or `lambda_final_iteration` | Confirms λ jumped on the final iteration as configured | →↑ stable, then jumps on the last iteration |
 | `spin_progress/dataset_size` | Number of training examples this iteration | Set by `set_iteration()` before `trainer.train()` | Useful when dataset size varies across iterations | → stable |
 
@@ -493,7 +505,7 @@ Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteratio
 |-----|-----------|---------------------|-------------------|-------|
 | `spin_progress/weight_drift_from_iter_start` | How much the model changed within this iteration | `sqrt(Σ ‖w_final − w_iter_start‖²)` across all trainable params | Magnitude of the alignment update this round. Sudden large jumps with poor metrics indicate instability | ↓→ may decrease slightly as model nears convergence |
 | `spin_progress/weight_drift_from_base_model` | Cumulative drift from the very first checkpoint | `sqrt(Σ ‖w_final − w_base‖²)` — base snapshot captured at iteration 0 | Total alignment shift across all iterations combined | ↑ always increases |
-| `spin_progress/cosine_sim_to_iter_start` | Directional similarity between iteration-start and iteration-end weights | `cosine_similarity(flat_start_params, flat_end_params)` | 1.0 = no change; lower = larger directional shift. Near convergence the model changes less, so similarity rises | ↑→ rises toward 1.0 at convergence |
+| `spin_progress/cosine_sim_to_iter_start` | Directional similarity between iteration-start and iteration-end weights | `cosine_similarity(flat_start_params, flat_end_params)` over all `requires_grad=True` parameters | With LoRA, `lora_B` is **reinitialized to 0** at the start of every batch via `make_trainable()`. As training becomes more effective, `lora_B` accumulates larger values by the end of each iteration — the weight vector drifts further from the all-zero starting point, producing **lower** cosine similarity. Near convergence the updates shrink and similarity may recover slightly, but the dominant trend during active alignment is downward. Values well below 0.5 with large λ are normal | ↓ decreases as training becomes more effective; may stabilise near convergence |
 
 ---
 
@@ -1195,22 +1207,23 @@ reference values from disk remain fixed throughout.
  │                                                                              │
  │  Compute log-probability the base model assigns to each response:            │
  │                                                                              │
- │  ref_chosen_logp_0   = log π_base(y_human | x)    =  −145.3                │
+ │  ref_chosen_logp_0   = log π_base(y_human | x)    =  −2.42                 │
  │                         ─────────────────────────────────────────────────   │
- │                         Sum of per-token log-probs over y_human given x.    │
- │                         Large negative number — less negative = higher P.   │
- │                         This is the BASE MODEL'S view of the human text.    │
+ │                         Per-token average log-prob over y_human given x     │
+ │                         (sum of per-token log-probs ÷ response token count).│
+ │                         Less negative = higher P. Base model's view of the  │
+ │                         human text. Typical range: −1 to −5 per token.      │
  │                                                                              │
- │  ref_rejected_logp_0 = log π_base(y_syn_0 | x)   =  −148.7                │
+ │  ref_rejected_logp_0 = log π_base(y_syn_0 | x)   =  −2.76                 │
  │                         ───────────────────────────────────────────────     │
- │                         The base model's log-prob for its OWN generation.   │
+ │                         Per-token average for the model's own generation.   │
  │                         More negative than ref_chosen_logp_0 → even the    │
- │                         unaligned base model already ranks y_human higher.  │
- │                         Chosen−rejected gap: −145.3 − (−148.7) = 3.4 nats. │
+ │                         unaligned base model ranks y_human higher per token.│
+ │                         Chosen−rejected gap: −2.42 − (−2.76) = 0.34 nats.  │
  │                                                                              │
  │  Saved to disk:                                                              │
  │    iter_0_batch_k_logprobs.jsonl                                            │
- │    {"ref_chosen_logp": −145.3, "ref_rejected_logp": −148.7}                 │
+ │    {"ref_chosen_logp": −2.42, "ref_rejected_logp": −2.76}                  │
  │                                                                              │
  │  π_prev moved back to CPU. These scalars are now the FIXED ANCHOR           │
  │  for all of Step 3 — they will not change until iteration 1.                │
@@ -1223,18 +1236,19 @@ reference values from disk remain fixed throughout.
  │  SPINTrainer.compute_loss() — called for every mini-batch:                  │
  │                                                                              │
  │  Loaded from disk (constant across ALL optimizer steps this iteration):     │
- │    ref_chosen_logp_0   = −145.3  ◄── iter_0_batch_k_logprobs.jsonl         │
- │    ref_rejected_logp_0 = −148.7  ◄── iter_0_batch_k_logprobs.jsonl         │
+ │    ref_chosen_logp_0   = −2.42  ◄── iter_0_batch_k_logprobs.jsonl          │
+ │    ref_rejected_logp_0 = −2.76  ◄── iter_0_batch_k_logprobs.jsonl          │
+ │    (per-token averages; divide raw sum by response length)                  │
  │                                                                              │
  │  ─── Optimizer step 0  (π_θ weights are still an exact copy of π_prev) ─── │
  │                                                                              │
- │  Forward pass 1:  x ++ y_human →  π_θ [= base] → log_p = −145.3           │
- │  Forward pass 2:  x ++ y_syn_0 →  π_θ [= base] → log_p = −148.7           │
+ │  Forward pass 1:  x ++ y_human →  π_θ [= base] → log_p = −2.42            │
+ │  Forward pass 2:  x ++ y_syn_0 →  π_θ [= base] → log_p = −2.76            │
  │                                                                              │
  │  RI_human = log π_θ(y_human|x) − ref_chosen_logp_0                         │
- │           =       −145.3       −     (−145.3)       =   0.0                 │
+ │           =       −2.42        −     (−2.42)         =   0.0                │
  │  RI_synth = log π_θ(y_syn_0|x) − ref_rejected_logp_0                       │
- │           =       −148.7       −     (−148.7)       =   0.0                 │
+ │           =       −2.76        −     (−2.76)         =   0.0                │
  │                                                                              │
  │  margin = λ × (RI_human − RI_synth) = λ × (0.0 − 0.0) =   0.0             │
  │  loss   = softplus(−0.0) = log(2) ≈ 0.693                                   │
@@ -1244,15 +1258,15 @@ reference values from disk remain fixed throughout.
  │                                                                              │
  │  ─── Optimizer step 1  (π_θ weights have diverged from base model) ─────── │
  │                                                                              │
- │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −144.1          │
+ │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −2.22            │
  │                                                  ← shifted toward y_human   │
- │  Forward pass 2:  x ++ y_syn_0 →  π_θ [updated] → log_p = −148.1          │
+ │  Forward pass 2:  x ++ y_syn_0 →  π_θ [updated] → log_p = −2.66            │
  │                                                  ← mild incidental drift    │
  │                                                                              │
- │  RI_human = −144.1 − (−145.3) = +1.2   (π_θ now likes y_human 1.2 more)   │
- │  RI_synth = −148.1 − (−148.7) = +0.6   (π_θ drifted slightly on y_syn_0)  │
+ │  RI_human = −2.22 − (−2.42) = +0.20   (π_θ now likes y_human 0.20 more)   │
+ │  RI_synth = −2.66 − (−2.76) = +0.10   (π_θ drifted slightly on y_syn_0)   │
  │                                                                              │
- │  margin = λ × (1.2 − 0.6) = λ × 0.6  > 0  ✓  model is aligning            │
+ │  margin = λ × (0.20 − 0.10) = λ × 0.10  > 0  ✓  model is aligning         │
  │  loss   = softplus(−0.6λ)  < 0.693           (improving)                   │
  │                                                                              │
  │  loss.backward() → optimizer.step() → margin grows further with each step  │
@@ -1311,30 +1325,30 @@ reference values from disk remain fixed throughout.
  ┌──────────────────────────────────────────────────────────────────────────────┐
  │  STEP 2 — Reference Scoring   (π_prev = iter_0 model, moved to GPU again)   │
  │                                                                              │
- │  ref_chosen_logp_1   = log π_iter0(y_human | x)    =  −141.5               │
+ │  ref_chosen_logp_1   = log π_iter0(y_human | x)    =  −2.12                │
  │                         ─────────────────────────────────────────────────   │
- │                         LESS negative than iter_0's −145.3.                 │
+ │                         LESS negative than iter_0's −2.42 (per-token avg).  │
  │                         The iter_0 model assigns HIGHER probability to      │
  │                         y_human than the base model did — alignment worked. │
  │                         This value rises (becomes less negative) every      │
  │                         iteration as the model gets closer to human text.   │
  │                                                                              │
- │  ref_rejected_logp_1 = log π_iter0(y_syn_1 | x)   =  −143.2               │
+ │  ref_rejected_logp_1 = log π_iter0(y_syn_1 | x)   =  −2.40                │
  │                         ─────────────────────────────────────────────────   │
- │                         LESS negative than iter_0's −148.7.                 │
+ │                         LESS negative than iter_0's −2.76 (per-token avg).  │
  │                         y_syn_1 is a stronger completion, so the iter_0    │
  │                         model considers it more probable than the weak      │
  │                         y_syn_0 was to the base model.                      │
  │                                                                              │
- │                         Chosen−rejected gap: −141.5 − (−143.2) = 1.7 nats  │
- │                         vs. iteration 0 gap:                   = 3.4 nats   │
+ │                         Chosen−rejected gap: −2.12 − (−2.40) = 0.28 nats   │
+ │                         vs. iteration 0 gap:                   = 0.34 nats  │
  │                         ─────────────────────────────────────────────────   │
  │                         Gap narrows each iteration. The synthetic is harder │
  │                         to beat → training signal becomes subtler.          │
  │                                                                              │
  │  Saved to disk:                                                              │
  │    iter_1_batch_k_logprobs.jsonl                                            │
- │    {"ref_chosen_logp": −141.5, "ref_rejected_logp": −143.2}                 │
+ │    {"ref_chosen_logp": −2.12, "ref_rejected_logp": −2.40}                  │
  │                                                                              │
  │  These scalars are the new FIXED ANCHOR for all of iter_1 Step 3.          │
  └──────────────────────────────────────────────────────────────────────────┬───┘
@@ -1344,16 +1358,16 @@ reference values from disk remain fixed throughout.
  │  STEP 3 — Training Loop   (π_θ starts at iter_0 weights, not base weights)  │
  │                                                                              │
  │  Loaded from disk (constant throughout all iter_1 optimizer steps):         │
- │    ref_chosen_logp_1   = −141.5  ◄── iter_1_batch_k_logprobs.jsonl         │
- │    ref_rejected_logp_1 = −143.2  ◄── iter_1_batch_k_logprobs.jsonl         │
+ │    ref_chosen_logp_1   = −2.12  ◄── iter_1_batch_k_logprobs.jsonl          │
+ │    ref_rejected_logp_1 = −2.40  ◄── iter_1_batch_k_logprobs.jsonl          │
  │                                                                              │
  │  ─── Optimizer step 0  (π_θ weights are still identical to π_prev=iter_0) ─ │
  │                                                                              │
- │  Forward pass 1:  x ++ y_human →  π_θ [= iter_0] → log_p = −141.5         │
- │  Forward pass 2:  x ++ y_syn_1 →  π_θ [= iter_0] → log_p = −143.2         │
+ │  Forward pass 1:  x ++ y_human →  π_θ [= iter_0] → log_p = −2.12          │
+ │  Forward pass 2:  x ++ y_syn_1 →  π_θ [= iter_0] → log_p = −2.40          │
  │                                                                              │
- │  RI_human = −141.5 − (−141.5) = 0.0                                         │
- │  RI_synth = −143.2 − (−143.2) = 0.0                                         │
+ │  RI_human = −2.12 − (−2.12) = 0.0                                           │
+ │  RI_synth = −2.40 − (−2.40) = 0.0                                           │
  │  margin = 0.0  →  loss = log(2) ≈ 0.693  (same starting loss as iter_0)    │
  │                                                                              │
  │  loss.backward() → optimizer.step()                                         │
@@ -1361,18 +1375,18 @@ reference values from disk remain fixed throughout.
  │                                                                              │
  │  ─── Optimizer step 1  (π_θ weights have moved) ─────────────────────────── │
  │                                                                              │
- │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −140.3          │
- │  Forward pass 2:  x ++ y_syn_1 →  π_θ [updated] → log_p = −142.9          │
+ │  Forward pass 1:  x ++ y_human →  π_θ [updated] → log_p = −2.02            │
+ │  Forward pass 2:  x ++ y_syn_1 →  π_θ [updated] → log_p = −2.37            │
  │                                                                              │
- │  RI_human = −140.3 − (−141.5) = +1.2  (same improvement magnitude)         │
- │  RI_synth = −142.9 − (−143.2) = +0.3  (smaller than iter_0's +0.6)         │
+ │  RI_human = −2.02 − (−2.12) = +0.10  (improvement on chosen)               │
+ │  RI_synth = −2.37 − (−2.40) = +0.03  (smaller than iter_0's +0.10)         │
  │                          ─────────────────────────────────────────────────  │
  │                          y_syn_1 is tightly coupled to human quality →     │
  │                          π_θ drifts on it less easily. The model cannot     │
  │                          cheat by inflating both responses together.        │
  │                                                                              │
- │  margin = λ × (1.2 − 0.3) = λ × 0.9  > 0  ✓  (larger than iter_0's 0.6)  │
- │  loss   = softplus(−0.9λ)  < softplus(−0.6λ)    (lower loss = better fit)  │
+ │  margin = λ × (0.10 − 0.03) = λ × 0.07  > 0  ✓                            │
+ │  loss   = softplus(−0.07λ)  < 0.693    (lower loss = better fit)            │
  │                                                                              │
  │  loss.backward() → optimizer.step() → margin continues to grow              │
  │                                                                              │
@@ -1391,12 +1405,12 @@ reference values from disk remain fixed throughout.
 |---|---|---|---|
 | `π_prev` source | Base model | `checkpoints/iter_0/` | Gets stronger each round |
 | `y_synthetic` quality | Weak — generic, imprecise | Stronger — resembles `y_human` | Harder to beat each round |
-| `ref_chosen_logp` | −145.3 (base model's view) | −141.5 (iter_0's view) | Rises (less negative) each round |
-| `ref_rejected_logp` | −148.7 | −143.2 | Rises (less negative) each round |
-| Chosen − rejected gap | 3.4 nats | 1.7 nats | Narrows → subtler signal |
+| `ref_chosen_logp` | −2.42 (base model, per-token avg) | −2.12 (iter_0's view) | Rises (less negative) each round |
+| `ref_rejected_logp` | −2.76 | −2.40 | Rises (less negative) each round |
+| Chosen − rejected gap | 0.34 nats/token | 0.28 nats/token | Narrows → subtler signal |
 | `π_θ` starting weights | Base model | iter_0 checkpoint | Stronger starting point |
-| `RI_synth` at opt step 1 | +0.6 | +0.3 | Harder to drift on synthetic |
-| `margin` at opt step 1 | λ × 0.6 | λ × 0.9 | Model improves more cleanly |
+| `RI_synth` at opt step 1 | +0.10 | +0.03 | Harder to drift on synthetic |
+| `margin` at opt step 1 | λ × 0.10 | λ × 0.07 | Margin from improved chosen, less drift on synthetic |
 
 The `_logprobs.jsonl` values (`ref_chosen_logp`, `ref_rejected_logp`) are the **fixed
 anchor** within each SPIN iteration — they never change across optimizer steps. They

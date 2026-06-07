@@ -423,6 +423,16 @@ class SPINTrainer(Trainer):
         loss.backward()
         logger.debug("  Backward pass complete. Gradients accumulated.")
 
+        # Gradient global norm — computed HERE, immediately after backward(), while gradients
+        # are still alive on the parameters.  HF Trainer calls model.zero_grad() BEFORE
+        # firing on_step_end, so computing this in the callback would always yield 0/None.
+        # One fused GPU op (stack + sum) keeps the number of GPU syncs to 1.
+        grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+        grad_global_norm = (
+            torch.stack([g.float().norm().pow(2) for g in grads]).sum().item() ** 0.5
+            if grads else 0.0
+        )
+
         # Step 9: Detach all tensors to plain Python floats before building the metrics dict.
         # .detach() breaks the autograd graph so these scalars don't keep the computation
         # graph alive in memory after this step.
@@ -460,6 +470,7 @@ class SPINTrainer(Trainer):
             "ref_rejected_logp": ref_rej_mean,
             "kl_from_ref":       kl_val,
             "spin_lambda":       self.spin_lambda,
+            "grad_global_norm":  grad_global_norm,
         }
         if self.optimizer is not None:
             log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
