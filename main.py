@@ -2,6 +2,8 @@ from spin_trainer import *
 from trainer_callback import *
 from spin_data_collator import *
 from spin_dataset import *
+from sft_warmup import run_sft_warmup
+from evaluate import run_eval
 from utils import *
 from transformers.trainer_utils import get_last_checkpoint
 from transformers import set_seed
@@ -575,6 +577,17 @@ def main():
         f"Starting at iteration {start_iteration} "
         f"({'fresh run' if start_iteration == 0 else 'resuming'}).")
 
+    # Optional SFT warmup: SFT the base model on the (prompt, response) gold data
+    # once, then use that checkpoint as iteration 0's π_0. Reproduces the paper's
+    # base → SFT-on-gold → SPIN recipe so SPIN starts already fitted to p_data.
+    # Only needed when iteration 0 will actually run; on resume past iter 0 the
+    # warmup checkpoint is not used, so it is skipped entirely. run_sft_warmup is
+    # itself idempotent (skips if a completed warmup checkpoint already exists).
+    iter0_model_path = cfg.model_name_or_path
+    if cfg.sft_warmup_enabled and start_iteration == 0:
+        iter0_model_path = run_sft_warmup(cfg, tokenizer, base_rows)
+        logger.info(f"SFT warmup checkpoint will seed iteration 0: {iter0_model_path}")
+
     global_tb_dir = os.path.join(cfg.tensorboard_dir, "global")
     ensure_dir(global_tb_dir)
 
@@ -592,7 +605,7 @@ def main():
         ensure_dir(iter_dir)
 
         prev_model_path = (
-            cfg.model_name_or_path if iteration == 0
+            iter0_model_path if iteration == 0
             else os.path.join(cfg.checkpoints_dir, f"iter_{iteration - 1}")
         )
         logger.info(f"  Loading π_prev from: {prev_model_path}")
@@ -607,6 +620,11 @@ def main():
         free_model(prev_model)
         logger.info(
             f"╚══ SPIN ITERATION {iteration} COMPLETE ══════════════════════════════════╝")
+
+        if cfg.eval_run_after_training:
+            logger.info(f"  Evaluating iter_{iteration} (benchmarks run via evaluate.run_eval)...")
+            run_eval(cfg)
+            logger.info(f"  Evaluation for iter_{iteration} complete.")
 
     summary_callback.close()
     logger.info("")

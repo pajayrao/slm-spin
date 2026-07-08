@@ -95,7 +95,7 @@ def pre_start_cleanup():
     for lock_file in glob.glob(os.path.join(hf_cache, "**", "*.lock"), recursive=True):
         try:
             os.remove(lock_file)
-            logger.info(f"Removed stale lock: {lock_file}", flush=True)
+            logger.info(f"Removed stale lock: {lock_file}")
         except OSError:
             pass
 
@@ -963,6 +963,7 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
             padding=True,
             truncation=True,
             max_length=cfg.max_prompt_length,
+            add_special_tokens=False,
         )
         enc = {k: v.to(model.device) for k, v in enc.items()}
         logger.info(

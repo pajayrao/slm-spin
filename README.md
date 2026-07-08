@@ -217,7 +217,7 @@ All options live in [spin_config.py](spin_config.py). The most important ones:
 | `eval_max_seq_len` | `2048` | Maximum token length (context + continuation) fed to the model during evaluation |
 | `eval_gsm8k_max_new_tokens` | `256` | Maximum new tokens generated per response in the GSM8k benchmark |
 | `eval_no_cache` | `False` | Re-evaluate iterations even if a cached `.parsed.json` result exists |
-| `eval_run_after_training` | `True` | Automatically run benchmark evaluation after all training iterations complete |
+| `eval_run_after_training` | `True` | Automatically run benchmark evaluation right after each SPIN iteration's checkpoint is saved (not just at the end) |
 
 ### SPIN Loss
 
@@ -559,7 +559,11 @@ Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteratio
    already-complete batches within the current iteration.
 5. **Run the iteration loop** — For each iteration: loads `π_prev` from disk to CPU as a
    frozen reference model, then runs the inner batch loop (Steps 1–3 per batch).
-6. **Global TensorBoard** — A `SummaryWriter` at `tensorboard/global/` captures
+6. **Evaluate the new checkpoint** — When `eval_run_after_training` is `True` (default),
+   calls `evaluate.run_eval(cfg)` immediately after that iteration's checkpoint is saved.
+   `run_eval()` auto-discovers every `iter_*` directory and skips any with a cached
+   `.parsed.json`, so only the iteration that just finished is actually benchmarked.
+7. **Global TensorBoard** — A `SummaryWriter` at `tensorboard/global/` captures
    cross-iteration memory and training signals.
 
 **Key functions:**
@@ -812,6 +816,13 @@ delegate to the shared helpers in `utils.py` (imported via `from utils import *`
 | `log_memory(tag)` | Log CPU/GPU memory before and after each model load/free |
 
 ### Programmatic vs Standalone Usage
+
+**Automatic, per-iteration** (default): `main.py` calls `evaluate.run_eval(cfg)` right
+after each SPIN iteration's checkpoint is saved, whenever `cfg.eval_run_after_training`
+is `True` (the default). Because `run_eval()` auto-discovers every `iter_*` directory
+and skips any with a cached `.parsed.json`, each call only benchmarks the iteration
+that just finished — earlier iterations are loaded from cache, not re-evaluated. Set
+`eval_run_after_training=False` to disable this and only evaluate manually.
 
 **Standalone** (CLI):
 ```bash

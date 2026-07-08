@@ -239,7 +239,7 @@ class SPINTrainer(Trainer):
 
         return (loss, metrics) if return_outputs else loss
 
-    def training_step(self, model, inputs, num_items_in_batch):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         """Execute one SPIN training step: two forward passes, loss computation, and backward.
 
         Each call: forward chosen, forward rejected, compute SPIN margin loss, backward.
@@ -444,7 +444,8 @@ class SPINTrainer(Trainer):
         #          win_rate = 2/4 = 0.50  (2 examples had positive margin)
         #          kl_from_ref = (chosen_adv_mean + rejected_adv_mean) / 2
         #                      = (0.325 + 0.425) / 2 = 0.375  (model drifted +0.375 nats from ref)
-        win_rate = (margin > 0).float().mean().detach().item()
+        n_wins = int((margin > 0).sum().item())
+        win_rate = n_wins / bs if bs > 0 else 0.0
         margin_mean = margin.mean().detach().item()
         margin_std = margin.std().detach().item() if margin.numel() > 1 else 0.0
         loss_val = loss.detach().item()
@@ -482,7 +483,7 @@ class SPINTrainer(Trainer):
             logger.info(
                 f"training_step #{self._spin_step}{lr_str} — "
                 f"loss={loss_val:.4f}, margin={margin_mean:.4f}±{margin_std:.4f}, "
-                f"win_rate={win_rate:.3f} ({int(win_rate * bs)}/{bs} positive), "
+                f"win_rate={win_rate:.3f} ({n_wins}/{bs} positive), "
                 f"π_θ(chosen)={pi_chosen_mean:.4f}, π_θ(rejected)={pi_rej_mean:.4f}, "
                 f"π_ref(chosen)={ref_ch_mean:.4f}, π_ref(rejected)={ref_rej_mean:.4f}, "
                 f"chosen_adv={chosen_adv_mean:.4f}, "
@@ -495,7 +496,7 @@ class SPINTrainer(Trainer):
                 f"loss={loss_val:.4f}, margin={margin_mean:.4f}, win_rate={win_rate:.3f}"
             )
 
-        return loss.detach()
+        return loss.detach() / self.args.gradient_accumulation_steps
 
 
 class RMSPropSPINTrainer(SPINTrainer):

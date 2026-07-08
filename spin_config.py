@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
+    model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -68,7 +68,7 @@ class SPINConfig:
     # "auto"                — use the tokenizer's built-in chat_template if present, else fall back to instruction_response mode.
     # "plain"               — pass the raw prompt string with no wrapping; suitable for base models.
     # "instruction_response"— manually prepend instruction_prefix and append response_prefix.
-    chat_template_mode: str = "auto"
+    chat_template_mode: str = "instruction_response"
 
     # String prepended to the prompt when chat_template_mode="instruction_response".
     # Change to match the format the model was pre-trained with.
@@ -107,7 +107,7 @@ class SPINConfig:
     # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
     # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
     # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 128
+    generation_batch_size: int = 32
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -150,7 +150,7 @@ class SPINConfig:
     # logits tensor = batch × seq_len × vocab_size × 2B.
     # SmolLM2-135M (vocab=49152, max_length=512): batch=32 → 32×512×49152×2B ≈ 1.5 GB.
     # Safe on 8 GB; 2× faster than batch=16.
-    ref_logprob_batch_size: int = 32
+    ref_logprob_batch_size: int = 8
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ class SPINConfig:
     #   2. Trains a new model to prefer human responses over those synthetic ones.
     # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 4
+    num_iterations: int = 5
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
@@ -181,7 +181,7 @@ class SPINConfig:
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
     # Range: 50–10000. Start at 200 and tune for your restart tolerance.
-    data_batch_size: int = 10000
+    data_batch_size: int = 50000
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
@@ -218,7 +218,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 1
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -250,7 +250,6 @@ class SPINConfig:
     # With per_device=16, GA=32, data_batch=16384, epochs=2:
     #   total optimizer steps per batch = (16384/16/32)*2 = 64
     # So warmup_steps=5 → ~8% warmup, which is correct.
-    # (Large values like 50 would make 78% of training run be warmup — broken.)
     warmup_steps: int = 5
 
     # Learning rate scheduler shape after warmup.
@@ -562,11 +561,20 @@ class SPINConfig:
     # Logits per batch = batch × actual_seq_len × vocab_size × 2B.
     # Real eval sequences (ARC, TruthfulQA, Winogrande) average 100–400 tokens, not 2048.
     # SmolLM2-135M: batch=8 × 512 tokens × 49152 vocab × 2B ≈ 0.4 GB — safe on 8 GB.
-    eval_batch_size: int = 2
+    eval_batch_size: int = 1
 
     # Maximum total token length (context + continuation) fed to the model during evaluation.
-    # Sequences longer than this are truncated from the left.
-    eval_max_seq_len: int = 2048
+    # Sequences longer than this are truncated from the left. Lowering this is a direct way
+    # to cut eval GPU memory — the per-position vocab projection dominates, so 1024 roughly
+    # halves peak memory vs 2048 (few-shot prompts truncate slightly more).
+    eval_max_seq_len: int = 1024
+
+    # Apply torch.compile() to each model before evaluation. Disabled by default:
+    # eval feeds variable-length sequences, so torch.compile recompiles per shape and
+    # inflates GPU memory (and rebuilds Triton kernels) for little speedup — it is the
+    # main cause of eval OOM on small GPUs. Training compilation is controlled separately
+    # by compile_model and is unaffected by this flag.
+    eval_compile_model: bool = False
 
     # Maximum new tokens generated per response in the GSM8k benchmark (generation task).
     eval_gsm8k_max_new_tokens: int = 256
@@ -578,4 +586,38 @@ class SPINConfig:
     # Re-evaluate iterations even if a cached JSON result already exists.
     # False (default) = skip iterations that already have a .parsed.json result file.
     eval_no_cache: bool = False
+
+    # Automatically run benchmark evaluation (evaluate.run_eval) as soon as each SPIN
+    # iteration's checkpoint is saved, instead of waiting until all iterations finish.
+    # Already-evaluated iterations are skipped via the same .parsed.json cache used by
+    # the standalone evaluate.py, so this adds no overhead on resume.
+    eval_run_after_training: bool = True
+
+    # ── SFT warmup (optional — reproduces the SPIN paper's precondition) ──────────
+
+    # When True, run one supervised fine-tuning pass over the (prompt, response) rows
+    # BEFORE the SPIN loop and use that checkpoint as iteration 0's starting model
+    # instead of model_name_or_path. This reproduces the paper's setup
+    # (zephyr-7b-sft-full = a base model SFT'd on the SPIN dataset), so SPIN starts
+    # already fitted to p_data and *sharpens* the model rather than relocating it.
+    # Lets any base model be plugged in:  base → SFT-on-gold → SPIN.
+    sft_warmup_enabled: bool = True
+
+    # Directory where the warmed-up model + tokenizer are saved. Reused as the
+    # iteration-0 base on resume (skipped if a completed checkpoint already exists).
+    sft_warmup_dir: str = "./spin_outputs/sft_warmup"
+
+    # Epochs for the warmup SFT pass. The paper uses 1 — enough to fit the model to
+    # p_data while leaving the residual "quality gap" that SPIN then exploits.
+    sft_warmup_epochs: float = 1.0
+
+    # Peak learning rate for the warmup SFT pass (independent of the SPIN LRs).
+    sft_warmup_learning_rate: float = 2e-5
+
+    # Cap on the number of (prompt, response) rows used for warmup SFT.
+    # 0 = use all loaded rows (already bounded by max_data_load).
+    sft_warmup_max_samples: int = 0
+
+    # Cache the tokenized warmup dataset to a .pt file so re-runs skip tokenization.
+    sft_warmup_cache_tokenized: bool = True
 

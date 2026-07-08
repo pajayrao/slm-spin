@@ -313,15 +313,6 @@ class TensorBoardCallbackExtended(TrainerCallback):
             w = param.detach().float().cpu()
             tag = name.replace(".", "/")
 
-            # Per-parameter weight drift
-            if name in self.initial_params:
-                delta = w - self.initial_params[name]
-                if self.cfg.log_parameter_scalars:
-                    self.writer.add_scalar(
-                        f"weight_delta/norm/{tag}", delta.norm().item(), step)
-                    self.writer.add_scalar(
-                        f"weight_delta/mean/{tag}", delta.mean().item(), step)
-
             # Gradient stats for this parameter
             if param.grad is not None:
                 g = param.grad.detach().float().cpu()

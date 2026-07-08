@@ -8,14 +8,19 @@ generation with answer extraction.
 
 Flow overview
 -------------
+  0. run_eval() is invoked once per SPIN iteration by main.py (right after that
+     iteration's checkpoint is saved) when cfg.eval_run_after_training is True,
+     as well as standalone via this file's CLI.
   1. Discover iteration checkpoint directories (iter_0, iter_1, …) under --checkpoints-dir.
   2. For each iteration:
-       a. Load model + tokenizer from the checkpoint.
-       b. Run all six benchmarks, collecting one scalar metric per task.
-       c. Compute delta vs the previous iteration's scores.
-       d. Track the running best-average across all evaluated iterations.
-       e. Save per-iteration results to a JSON file.
-       f. Free the model from GPU memory before loading the next checkpoint.
+       a. Skip straight to the cached .parsed.json if one already exists —
+          this is what makes repeated per-iteration calls cheap.
+       b. Otherwise load model + tokenizer from the checkpoint.
+       c. Run all six benchmarks, collecting one scalar metric per task.
+       d. Compute delta vs the previous iteration's scores.
+       e. Track the running best-average across all evaluated iterations.
+       f. Save per-iteration results to a JSON file.
+       g. Free the model from GPU memory before loading the next checkpoint.
   3. Write a human-readable comparative summary (TXT + JSON).
   4. Write TensorBoard scalars, text cards, and metadata for the full run.
 
@@ -305,7 +310,10 @@ def score_continuations_batched(
     input_ids_t = torch.tensor(padded_ids, dtype=torch.long, device=device)
     attn_mask_t = torch.tensor(attn_masks,  dtype=torch.long, device=device)
     logits      = model(input_ids=input_ids_t, attention_mask=attn_mask_t).logits
-    log_probs   = F.log_softmax(logits, dim=-1)
+    # log_softmax is applied per-row on just the continuation slice in Step 4 below, NOT over
+    # the full (rows, max_len, vocab) tensor — the per-position vocab projection dominates
+    # eval memory with large vocabularies (e.g. Qwen ~152k), so the full-sequence softmax is
+    # the main eval OOM source on small GPUs.
 
     # Step 4: For each continuation, extract the log-prob of each actual token and sum.
     # Autoregressive alignment: the prediction for position cs is at log_probs[cs-1],
@@ -321,7 +329,7 @@ def score_continuations_batched(
         cs = adj_starts[i]
         actual_len = min(cont_len, max_len - cs)
         cont_tok_ids = input_ids_t[i, cs:cs + actual_len]
-        pred_lp      = log_probs[i, cs - 1:cs - 1 + actual_len]
+        pred_lp      = F.log_softmax(logits[i, cs - 1:cs - 1 + actual_len], dim=-1)
         scores.append(pred_lp[torch.arange(actual_len, device=device), cont_tok_ids].sum().item())
 
     return scores
@@ -384,20 +392,24 @@ def score_examples_batched(
         # Step 3: Single forward pass for the whole chunk → log-probs over vocab.
         ids_t  = torch.tensor(padded, dtype=torch.long, device=device)
         mask_t = torch.tensor(masks,  dtype=torch.long, device=device)
-        lp = F.log_softmax(
-            model(input_ids=ids_t, attention_mask=mask_t).logits, dim=-1
-        )
+        logits = model(input_ids=ids_t, attention_mask=mask_t).logits
 
         # Step 4: Gather per-token log-probs for the continuation slice and sum into a scalar.
         # Autoregressive offset: prediction for position cs is stored at lp[cs-1].
         # Write score back to output[ex_idx][cont_idx] so the outer loop gets a 2-D result.
         # Example: cs=2, cont=[tok_a, tok_b]
         #          score = lp[j, 1, tok_a] + lp[j, 2, tok_b]
+        # log_softmax runs per-row over ONLY the continuation positions (cs-1 : cs-1+alen),
+        # never the full (rows, max_len, vocab) tensor — that full-vocab softmax is the
+        # dominant eval memory cost on large vocabularies (Qwen ~152k) and small GPUs.
         for j, (full_ids, _, cont_len, ex_idx, cont_idx) in enumerate(batch):
             cs = adj_cs[j]
             alen = min(cont_len, max_len - cs)
+            if alen <= 0:
+                continue
             tok = ids_t[j, cs : cs + alen]
-            score = lp[j, cs - 1 : cs - 1 + alen][torch.arange(alen, device=device), tok].sum().item()
+            row_lp = F.log_softmax(logits[j, cs - 1 : cs - 1 + alen], dim=-1)
+            score = row_lp[torch.arange(alen, device=device), tok].sum().item()
             output[ex_idx][cont_idx] = score
 
     return output
@@ -903,16 +915,16 @@ def print_results_table(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def write_summary(rows: list[dict], path: Path) -> None:
-    """Write a human-readable comparative summary to a TSV + narrative text file."""
+    """Write a human-readable comparative summary as an aligned table + narrative text file."""
     headers = [
         "Iteration", "Arc", "TruthfulQA", "Winogrande", "GSM8k",
         "HellaSwag", "MMLU", "Average", "DeltaPrevAvg", "BestSoFarAvg",
     ]
-    lines = ["\t".join(headers)]
 
+    data: list[list[str]] = []
     for row in rows:
         m, dp = row["metrics"], row["delta_prev"]
-        vals = [
+        data.append([
             row["iteration"],
             fmt(m.get("Arc")),        fmt(m.get("TruthfulQA")),
             fmt(m.get("Winogrande")), fmt(m.get("GSM8k")),
@@ -920,8 +932,18 @@ def write_summary(rows: list[dict], path: Path) -> None:
             fmt(m.get("Average")),
             fmt(dp.get("Average") if dp else None),
             fmt(row.get("best_so_far_avg")),
-        ]
-        lines.append("\t".join(vals))
+        ])
+
+    # Fixed-width columns so the file lines up in any text editor. Tabs do NOT align when
+    # cell widths vary — that misalignment is what made the Average column look wrong even
+    # though the values were correct. Mirrors print_results_table (the terminal output).
+    widths = [max(len(headers[i]), max((len(r[i]) for r in data), default=0)) for i in range(len(headers))]
+    sep        = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    header_row = "| " + " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))) + " |"
+    lines = [sep, header_row, sep]
+    for r in data:
+        lines.append("| " + " | ".join(r[i].ljust(widths[i]) for i in range(len(headers))) + " |")
+    lines.append(sep)
 
     lines += ["", "Per-iteration comparative analysis:"]
     for row in rows:
@@ -1090,10 +1112,14 @@ def run_eval(
 ) -> None:
     """Run benchmark evaluation for all (or specified) SPIN iteration checkpoints.
 
-    Called from main.py after training completes, or directly from the standalone
-    main() below.  Evaluation settings come from cfg (eval_output_dir,
-    eval_batch_size, eval_limit, etc.); model loading and compilation reuse
-    load_causal_lm() and maybe_compile_model() from utils.
+    Called from main.py after each SPIN iteration completes (when
+    cfg.eval_run_after_training is True), or directly from the standalone main()
+    below.  Each call auto-discovers every iter_* checkpoint under
+    cfg.checkpoints_dir and skips any that already have a cached .parsed.json
+    result, so repeated calls only evaluate the newest iteration.  Evaluation
+    settings come from cfg (eval_output_dir, eval_batch_size, eval_limit, etc.);
+    model loading and compilation reuse load_causal_lm() and maybe_compile_model()
+    from utils.
 
     Parameters
     ----------
@@ -1188,10 +1214,10 @@ def run_eval(
                 global MAX_SEQ_LEN
                 model_max = getattr(model.config, "max_position_embeddings", MAX_SEQ_LEN)
                 tok_max   = getattr(tokenizer, "model_max_length", MAX_SEQ_LEN)
-                MAX_SEQ_LEN = min(MAX_SEQ_LEN, model_max, tok_max)
+                MAX_SEQ_LEN = min(cfg.eval_max_seq_len, model_max, tok_max)
                 logger.info(f"  MAX_SEQ_LEN capped to {MAX_SEQ_LEN} (model={model_max}, tokenizer={tok_max})")
 
-                if cfg.compile_model:
+                if cfg.eval_compile_model:
                     compile_cfg = dataclasses.replace(cfg, compile_fullgraph=False, compile_mode="default")
                     model = maybe_compile_model(model, compile_cfg, label="eval_base_model")
 
@@ -1277,10 +1303,10 @@ def run_eval(
                 # fire before PyTorch hits an out-of-bounds positional embedding.
                 model_max = getattr(model.config, "max_position_embeddings", MAX_SEQ_LEN)
                 tok_max   = getattr(tokenizer, "model_max_length", MAX_SEQ_LEN)
-                MAX_SEQ_LEN = min(MAX_SEQ_LEN, model_max, tok_max)
+                MAX_SEQ_LEN = min(cfg.eval_max_seq_len, model_max, tok_max)
                 logger.info(f"  MAX_SEQ_LEN capped to {MAX_SEQ_LEN} (model={model_max}, tokenizer={tok_max})")
 
-                if cfg.compile_model:
+                if cfg.eval_compile_model:
                     # eval uses model.generate (GSM8k), so fullgraph must be False.
                     compile_cfg = dataclasses.replace(cfg, compile_fullgraph=False, compile_mode="default")
                     model = maybe_compile_model(model, compile_cfg, label=f"eval_{iter_name}")
