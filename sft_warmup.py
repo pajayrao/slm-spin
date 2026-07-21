@@ -146,12 +146,20 @@ class SFTDataCollator:
 # Warmup runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]]) -> str:
+def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]],
+                   base_model_path: Optional[str] = None,
+                   out_dir: Optional[str] = None) -> str:
     """Run one SFT pass over base_rows and return the warmed-up model directory.
 
+    base_model_path defaults to cfg.model_name_or_path and out_dir to
+    cfg.sft_warmup_dir. Pass explicit values to SFT an arbitrary checkpoint into a
+    dedicated directory — this is how the interleaved SFT stage re-fits each even
+    SPIN iteration's incoming model (the previous iteration's checkpoint) to the
+    gold data before that iteration's self-play.
+
     Idempotent: if a completed warmup checkpoint already exists (a `.done` sentinel
-    plus config.json in cfg.sft_warmup_dir), this returns immediately so resuming a
-    SPIN run never re-trains the warmup. Otherwise it loads cfg.model_name_or_path,
+    plus config.json in out_dir), this returns immediately so resuming a SPIN run
+    never re-trains a finished SFT pass. Otherwise it loads base_model_path,
     SFTs it (LoRA or full, per cfg.use_lora), merges any LoRA adapters, and saves a
     plain AutoModelForCausalLM that load_causal_lm() can load like any checkpoint.
 
@@ -167,7 +175,8 @@ def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]]) 
         Input:  cfg.sft_warmup_dir contains config.json and .done
         Output: "./spin_outputs/sft_warmup"  (returns immediately, no training)
     """
-    out_dir = cfg.sft_warmup_dir
+    base_model_path = base_model_path or cfg.model_name_or_path
+    out_dir = out_dir or cfg.sft_warmup_dir
     ensure_dir(out_dir)
     done_path = os.path.join(out_dir, ".done")
 
@@ -183,7 +192,7 @@ def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]]) 
     logger.info(
         f"run_sft_warmup() — SFT warmup starting: {len(rows)} rows, "
         f"epochs={cfg.sft_warmup_epochs}, lr={cfg.sft_warmup_learning_rate:.2e}, "
-        f"use_lora={cfg.use_lora}, base={cfg.model_name_or_path}")
+        f"use_lora={cfg.use_lora}, base={base_model_path}")
 
     # Step 2: Build the tokenized dataset + collator (same formatting as SPIN).
     cache_path = (os.path.join(cfg.synthetic_cache_dir, "sft_warmup_tokenized.pt")
@@ -193,7 +202,7 @@ def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]]) 
 
     # Step 3: Load the base model and make it trainable (LoRA or full fine-tune).
     log_memory("before_load_sft_warmup")
-    model = load_causal_lm(cfg.model_name_or_path, cfg, trainable=False).to(cfg.device)
+    model = load_causal_lm(base_model_path, cfg, trainable=False).to(cfg.device)
     model = make_trainable(model, cfg)
     log_memory("after_load_sft_warmup")
 
@@ -202,7 +211,8 @@ def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]]) 
     # lets a long warmup resume after a thermal shutdown, consistent with the rest of
     # the SPIN pipeline. The warmup LR is passed explicitly so it stays independent of
     # the SPIN iteration LRs.
-    tb_log_dir = os.path.join(cfg.tensorboard_dir, "sft_warmup")
+    tb_log_dir = os.path.join(
+        cfg.tensorboard_dir, os.path.basename(os.path.normpath(out_dir)))
     args_cfg = dataclasses.replace(
         cfg,
         num_epochs_per_iteration=cfg.sft_warmup_epochs,

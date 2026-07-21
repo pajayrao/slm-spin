@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
+    model_name_or_path: str = "roneneldan/TinyStories-Instruct-33M"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -37,7 +37,7 @@ class SPINConfig:
     # None                — default PyTorch eager attention (compatible with all hardware).
     # "flash_attention_2" — requires flash-attn package + Ampere+ GPU; 2-4x faster, uses less memory.
     # "sdpa"              — PyTorch scaled_dot_product_attention; free on PyTorch 2.0+, good default.
-    attn_implementation: Optional[str] = "sdpa"
+    attn_implementation: Optional[str] = "eager"
 
     # ── Data ─────────────────────────────────────────────────────────────────
 
@@ -103,11 +103,9 @@ class SPINConfig:
     # ── Generation (synthetic response production) ───────────────────────────
 
     # Number of prompts decoded in a single GPU batch during synthetic generation.
-    # KV-cache peak = batch × (max_prompt + max_new_tokens) × layers × KV-heads × head_dim × 2B.
-    # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
-    # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
-    # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 64
+    # Reduce if generation causes OOM (each beam holds its own KV cache).
+    # Range: 1–1024; for an 8 GB GPU with max_length=1024, start at 4.
+    generation_batch_size: int = 256
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -147,10 +145,9 @@ class SPINConfig:
 
     # Number of rows scored in a single forward pass during compute_ref_logprobs().
     # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
-    # logits tensor = batch × seq_len × vocab_size × 2B.
-    # SmolLM2-135M (vocab=49152, max_length=512): batch=32 → 32×512×49152×2B ≈ 1.5 GB.
-    # Safe on 8 GB; 2× faster than batch=16.
-    ref_logprob_batch_size: int = 8
+    # logits tensor = batch × seq_len × vocab_size.
+    # even batch=8 allocates 8×512×256K×2B = 2 GB just for logits. For 8 GB GPUs, use 4–8.
+    ref_logprob_batch_size: int = 64
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -164,7 +161,7 @@ class SPINConfig:
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
     # Range: 1–5. Typical: 1–3.
-    num_epochs_per_iteration: int = 1
+    num_epochs_per_iteration: int = 2
 
     # Hard cap on the total number of records read from the dataset at load time.
     # Applied in load_base_dataset_fixed() before any per-iteration sampling.
@@ -172,7 +169,7 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 200000
+    max_data_load: int = 207865
 
     # Number of dataset rows processed as one atomic checkpoint unit during
     # synthetic generation and ref-logprob scoring. Each batch is saved to
@@ -181,20 +178,18 @@ class SPINConfig:
     # Smaller → more frequent saves, lower restart cost.
     # Larger  → fewer file writes, but more work lost per crash.
     # Range: 50–10000. Start at 200 and tune for your restart tolerance.
-    data_batch_size: int = 50000
+    data_batch_size: int = 65536
 
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
     # Larger λ = stronger gradient signal, but too large can destabilise training.
-    # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
-    # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
-    # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 0.5
+    # Range: 0.01–1.0. Typical: 0.1.
+    lambda_initial: float = 0.1
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
     # A much larger value here applies a strong final alignment push.
-    # Range: 10–100 with per-token normalization.
-    lambda_final_iteration: Optional[float] = 20.0
+    # Range: 1.0–10.0. Set to None to reuse lambda_initial in the last iteration.
+    lambda_final_iteration: Optional[float] = 5.0
 
     # When True, lambda_final_iteration replaces lambda_initial only for the very last
     # iteration; all earlier iterations still use lambda_initial.
@@ -206,7 +201,7 @@ class SPINConfig:
     # "hinge"       — relu(1 − margin): zero loss once margin > 1; hard boundary.
     # "correlation" — (1 − margin): linear penalty; constant gradient, easiest to tune.
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
-    loss_type: str = "hinge"
+    loss_type: str = "logistic"
 
     # ── Training hyperparameters ─────────────────────────────────────────────
 
@@ -218,7 +213,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 16
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -228,41 +223,39 @@ class SPINConfig:
 
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
-    # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 1e-6
+    # Range: 1e-7–5e-6. Typical: 5e-7.
+    learning_rate: float = 5e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 5e-7
+    learning_rate_late: float = 1e-5
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
-    late_lr_start_iteration: int = 4
+    late_lr_start_iteration: int = 20
 
     # L2 regularisation coefficient applied to weight matrices (not biases or layer norms).
     # 0.0 is standard for supervised fine-tuning. Small values (1e-4) can help generalisation.
     # Range: 0.0–0.1.
-    weight_decay: float = 0.01
+    weight_decay: float = 0.0
 
     # Number of linear LR warmup steps at the beginning of each iteration.
-    # Must be small relative to total optimizer steps per SPIN batch.
-    # With per_device=16, GA=32, data_batch=16384, epochs=2:
-    #   total optimizer steps per batch = (16384/16/32)*2 = 64
-    # So warmup_steps=5 → ~8% warmup, which is correct.
-    warmup_steps: int = 5
+    # Prevents large gradient updates when the optimizer states are cold.
+    # Range: 0–100. Typical: 10–50.
+    warmup_steps: int = 0
 
     # Learning rate scheduler shape after warmup.
     # "cosine"  — smooth decay to 0; best for fine-tuning.
     # "linear"  — linear decay to 0.
     # "constant"— no decay; rarely used for fine-tuning.
-    lr_scheduler_type: str = "cosine"
+    lr_scheduler_type: str = "constant"
 
     # Optimizer algorithm.
     # "rmsprop" — 1 state tensor per parameter (running mean of squared gradients); lower GPU memory.
     # "adamw"   — 2 state tensors per parameter (first + second moment); better convergence, more memory.
     # For an 8 GB GPU, prefer "rmsprop" to save ~2 GB of optimizer state.
-    optimizer: str = "adamw"
+    optimizer: str = "rmsprop"
 
     # Maximum L2 norm of the gradient vector before clipping is applied.
     # Prevents a single bad batch from causing a catastrophic parameter update.
@@ -271,10 +264,8 @@ class SPINConfig:
 
     # Frequency (in optimizer steps) at which training metrics are written to the log.
     # Lower = more granular progress but slightly more I/O overhead.
-    # With per_device=16, GA=32, data_batch=16384, epochs=2: total steps = 64 per SPIN batch.
-    # logging_steps=10 → ~6 log events per batch; logging_steps=50 → only 1 event (too sparse).
     # Range: 1–500. Typical: 10–50.
-    logging_steps: int = 10
+    logging_steps: int = 50
 
     # When to save checkpoints.
     # "epoch" — save once per training epoch (default, safe).
@@ -323,6 +314,10 @@ class SPINConfig:
     # "none"        — disables all external logging.
     report_to: str = "tensorboard"
 
+    # Path to a DeepSpeed JSON configuration file for ZeRO-stage memory offloading.
+    # None = DeepSpeed disabled. ZeRO-2/3 can enable training models larger than GPU memory
+    # by offloading optimizer states (ZeRO-2) or parameters (ZeRO-3) to CPU RAM.
+    deepspeed: Optional[str] = None
 
     # ── torch.compile ────────────────────────────────────────────────────────
 
@@ -347,7 +342,7 @@ class SPINConfig:
     #                                capture requires a CPU-side C++ launcher compiled with OpenMP (omp.h),
     #                                which is not available in this MSVC setup on Windows. Use this mode
     #                                to get Triton kernel tuning without the C++ compilation step.
-    compile_mode: str = "max-autotune-no-cudagraphs"
+    compile_mode: str = "default"
 
     # compile_dynamic (bool or None): Use dynamic shape tracing.  When this is True, we will up-front attempt
     # to generate a kernel that is as dynamic as possible to avoid recompilations when
@@ -367,7 +362,7 @@ class SPINConfig:
     # Disabled: model.generate() uses a Python while-loop that always causes a graph break,
     # so compile_fullgraph=True fails silently (caught by maybe_compile_model's try/except)
     # and falls back to eager — paying max-autotune search time for zero runtime benefit.
-    compile_ref_model: bool = True
+    compile_ref_model: bool = False
 
     # ── LoRA / PEFT ──────────────────────────────────────────────────────────
 
@@ -394,10 +389,10 @@ class SPINConfig:
     lora_dropout: float = 0.05
 
     # Comma-separated list of nn.Linear layer name suffixes that receive LoRA adapters.
-    # SmolLM2-135M-Instruct uses LLaMA-style attention: "q_proj,k_proj,v_proj,o_proj".
-    # GPT-2 / distilgpt2 family uses: "c_attn,c_proj".
+    # Default matches the default model (distilgpt2 / GPT-2 family: c_attn, c_proj).
+    # For LLaMA/Mistral/Qwen style models use: "q_proj,k_proj,v_proj,o_proj"
     # make_trainable() will auto-detect the correct names if these aren't found in the model.
-    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
+    lora_target_modules: str = "c_attn,c_proj"
 
     # ── Misc ─────────────────────────────────────────────────────────────────
 
@@ -506,15 +501,13 @@ class SPINConfig:
 
     # Log parameter statistics every N optimizer steps.
     # Higher values reduce TensorBoard file size and logging overhead.
-    # With 64 total optimizer steps per SPIN batch, 500 never fires — use 20 instead.
-    # 20 → logs at steps 20, 40, 60 (~3× per batch); safe overhead.
-    # Range: 10–500. Typical: 20–50.
-    parameter_log_interval: int = 20
+    # Range: 10–500. Typical: 50.
+    parameter_log_interval: int = 500
 
     # Maximum number of parameter tensors to log per step.
     # Prevents TensorBoard from becoming unresponsive when the model has thousands of layers.
     # Range: 10–1000. Reduce if TensorBoard is slow to load.
-    parameter_log_max_tensors: int = 1000
+    parameter_log_max_tensors: int = 200
 
     # Log a summary of trainable vs total parameter counts when a model is prepared
     # for training. Disabled by default to keep logs quiet during normal runs.
@@ -536,7 +529,7 @@ class SPINConfig:
     # Full vocab is often 32k–128k tokens which makes projection too slow in the browser.
     # 2048 covers the most common tokens and keeps the projector fast.
     # Range: 256–8192.
-    embedding_projector_n_tokens: int = 8192
+    embedding_projector_n_tokens: int = 2048
 
     # Attempt to trace and log the model's computation graph.
     # Activates the GRAPHS tab in TensorBoard.
@@ -558,23 +551,13 @@ class SPINConfig:
     eval_limit: Optional[int] = None
 
     # Number of (context, continuation) rows per GPU forward pass during evaluation.
-    # Logits per batch = batch × actual_seq_len × vocab_size × 2B.
-    # Real eval sequences (ARC, TruthfulQA, Winogrande) average 100–400 tokens, not 2048.
-    # SmolLM2-135M: batch=8 × 512 tokens × 49152 vocab × 2B ≈ 0.4 GB — safe on 8 GB.
-    eval_batch_size: int = 1
+    # Increase for larger GPUs or shorter sequences; decrease if OOM during eval.
+    # Range: 4–64. Default 8 is conservative for 8 GB GPUs.
+    eval_batch_size: int = 8
 
     # Maximum total token length (context + continuation) fed to the model during evaluation.
-    # Sequences longer than this are truncated from the left. Lowering this is a direct way
-    # to cut eval GPU memory — the per-position vocab projection dominates, so 1024 roughly
-    # halves peak memory vs 2048 (few-shot prompts truncate slightly more).
-    eval_max_seq_len: int = 1024
-
-    # Apply torch.compile() to each model before evaluation. Disabled by default:
-    # eval feeds variable-length sequences, so torch.compile recompiles per shape and
-    # inflates GPU memory (and rebuilds Triton kernels) for little speedup — it is the
-    # main cause of eval OOM on small GPUs. Training compilation is controlled separately
-    # by compile_model and is unaffected by this flag.
-    eval_compile_model: bool = False
+    # Sequences longer than this are truncated from the left.
+    eval_max_seq_len: int = 2048
 
     # Maximum new tokens generated per response in the GSM8k benchmark (generation task).
     eval_gsm8k_max_new_tokens: int = 256
@@ -587,37 +570,6 @@ class SPINConfig:
     # False (default) = skip iterations that already have a .parsed.json result file.
     eval_no_cache: bool = False
 
-    # Automatically run benchmark evaluation (evaluate.run_eval) as soon as each SPIN
-    # iteration's checkpoint is saved, instead of waiting until all iterations finish.
-    # Already-evaluated iterations are skipped via the same .parsed.json cache used by
-    # the standalone evaluate.py, so this adds no overhead on resume.
+    # Automatically run benchmark evaluation after all SPIN training iterations complete.
+    # Set to False to skip evaluation and run it separately with evaluate.py.
     eval_run_after_training: bool = True
-
-    # ── SFT warmup (optional — reproduces the SPIN paper's precondition) ──────────
-
-    # When True, run one supervised fine-tuning pass over the (prompt, response) rows
-    # BEFORE the SPIN loop and use that checkpoint as iteration 0's starting model
-    # instead of model_name_or_path. This reproduces the paper's setup
-    # (zephyr-7b-sft-full = a base model SFT'd on the SPIN dataset), so SPIN starts
-    # already fitted to p_data and *sharpens* the model rather than relocating it.
-    # Lets any base model be plugged in:  base → SFT-on-gold → SPIN.
-    sft_warmup_enabled: bool = True
-
-    # Directory where the warmed-up model + tokenizer are saved. Reused as the
-    # iteration-0 base on resume (skipped if a completed checkpoint already exists).
-    sft_warmup_dir: str = "./spin_outputs/sft_warmup"
-
-    # Epochs for the warmup SFT pass. The paper uses 1 — enough to fit the model to
-    # p_data while leaving the residual "quality gap" that SPIN then exploits.
-    sft_warmup_epochs: float = 1.0
-
-    # Peak learning rate for the warmup SFT pass (independent of the SPIN LRs).
-    sft_warmup_learning_rate: float = 2e-5
-
-    # Cap on the number of (prompt, response) rows used for warmup SFT.
-    # 0 = use all loaded rows (already bounded by max_data_load).
-    sft_warmup_max_samples: int = 0
-
-    # Cache the tokenized warmup dataset to a .pt file so re-runs skip tokenization.
-    sft_warmup_cache_tokenized: bool = True
-

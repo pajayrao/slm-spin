@@ -1,0 +1,135 @@
+[
+  {
+    "iteration": "iter_0",
+    "metrics": {
+      "Arc": 23.8055,
+      "TruthfulQA": 46.0409,
+      "Winogrande": 49.7238,
+      "HellaSwag": 26.3493,
+      "MMLU": 26.3851,
+      "Average": 34.4609
+    },
+    "delta_prev": null,
+    "best_so_far_avg": 34.4609,
+    "best_iteration_so_far": "iter_0",
+    "elapsed_seconds": {
+      "Arc": 59.0,
+      "TruthfulQA": 22.6,
+      "Winogrande": 10.8,
+      "HellaSwag": 295.1,
+      "MMLU": 531.4
+    }
+  },
+  {
+    "iteration": "iter_1",
+    "metrics": {
+      "Arc": 23.9761,
+      "TruthfulQA": 47.6279,
+      "Winogrande": 50.5919,
+      "HellaSwag": 27.3252,
+      "MMLU": 26.143,
+      "Average": 35.1328
+    },
+    "delta_prev": {
+      "Arc": 0.1706,
+      "TruthfulQA": 1.587,
+      "Winogrande": 0.8681,
+      "HellaSwag": 0.9759,
+      "MMLU": -0.2421,
+      "Average": 0.6719
+    },
+    "best_so_far_avg": 35.1328,
+    "best_iteration_so_far": "iter_1",
+    "elapsed_seconds": {
+      "Arc": 69.6,
+      "TruthfulQA": 8.3,
+      "Winogrande": 9.5,
+      "HellaSwag": 324.3,
+      "MMLU": 542.5
+    }
+  },
+  {
+    "iteration": "iter_2",
+    "metrics": {
+      "Arc": 24.2321,
+      "TruthfulQA": 44.7204,
+      "Winogrande": 49.8816,
+      "HellaSwag": 27.5144,
+      "MMLU": 26.6415,
+      "Average": 34.598
+    },
+    "delta_prev": {
+      "Arc": 0.256,
+      "TruthfulQA": -2.9075,
+      "Winogrande": -0.7103,
+      "HellaSwag": 0.1892,
+      "MMLU": 0.4985,
+      "Average": -0.5348
+    },
+    "best_so_far_avg": 35.1328,
+    "best_iteration_so_far": "iter_1",
+    "elapsed_seconds": {
+      "Arc": 72.7,
+      "TruthfulQA": 9.4,
+      "Winogrande": 10.1,
+      "HellaSwag": 344.7,
+      "MMLU": 570.8
+    }
+  },
+  {
+    "iteration": "iter_3",
+    "metrics": {
+      "Arc": 24.9147,
+      "TruthfulQA": 48.1304,
+      "Winogrande": 50.6709,
+      "HellaSwag": 27.1161,
+      "MMLU": 25.6872,
+      "Average": 35.3039
+    },
+    "delta_prev": {
+      "Arc": 0.6826,
+      "TruthfulQA": 3.41,
+      "Winogrande": 0.7893,
+      "HellaSwag": -0.3983,
+      "MMLU": -0.9543,
+      "Average": 0.7059
+    },
+    "best_so_far_avg": 35.3039,
+    "best_iteration_so_far": "iter_3",
+    "elapsed_seconds": {
+      "Arc": 73.2,
+      "TruthfulQA": 9.3,
+      "Winogrande": 10.3,
+      "HellaSwag": 355.2,
+      "MMLU": 554.8
+    }
+  },
+  {
+    "iteration": "iter_4",
+    "metrics": {
+      "Arc": 24.0614,
+      "TruthfulQA": 49.053,
+      "Winogrande": 50.6709,
+      "HellaSwag": 26.419,
+      "MMLU": 26.2783,
+      "Average": 35.2965
+    },
+    "delta_prev": {
+      "Arc": -0.8533,
+      "TruthfulQA": 0.9226,
+      "Winogrande": 0.0,
+      "HellaSwag": -0.6971,
+      "MMLU": 0.5911,
+      "Average": -0.0074
+    },
+    "best_so_far_avg": 35.3039,
+    "best_iteration_so_far": "iter_3",
+    "elapsed_seconds": {
+      "Arc": 74.7,
+      "TruthfulQA": 8.7,
+      "Winogrande": 9.9,
+      "HellaSwag": 340.7,
+      "MMLU": 537.0
+    }
+  }
+]

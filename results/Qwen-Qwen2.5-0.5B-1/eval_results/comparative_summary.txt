@@ -1,0 +1,29 @@
+Iteration	Arc	TruthfulQA	Winogrande	GSM8k	HellaSwag	MMLU	Average	DeltaPrevAvg	BestSoFarAvg
+base_model	36.86	38.05	53.28	NA	52.04	47.74	45.59	NA	45.59
+iter_0	36.09	36.82	52.64	NA	50.82	47.06	44.69	-0.91	45.59
+iter_1	37.03	36.45	52.41	NA	52.61	47.44	45.19	0.50	45.59
+iter_2	36.09	36.12	52.25	NA	52.46	47.38	44.86	-0.33	45.59
+
+Per-iteration comparative analysis:
+[base_model]
+scores: Arc=36.86, TruthfulQA=38.05, Winogrande=53.28, HellaSwag=52.04, MMLU=47.74, Average=45.59
+delta_vs_prev: baseline iteration (no previous to compare against)
+status: ★ NEW BEST average so far
+
+[iter_0]
+scores: Arc=36.09, TruthfulQA=36.82, Winogrande=52.64, HellaSwag=50.82, MMLU=47.06, Average=44.69
+delta_vs_prev: Arc=▼-0.77, TruthfulQA=▼-1.24, Winogrande=▼-0.63, HellaSwag=▼-1.22, MMLU=▼-0.68, Average=▼-0.91
+improved_tasks=[]  declined_tasks=['Arc', 'TruthfulQA', 'Winogrande', 'HellaSwag', 'MMLU']  stable_tasks=[]
+status: below best-so-far iteration base_model
+
+[iter_1]
+scores: Arc=37.03, TruthfulQA=36.45, Winogrande=52.41, HellaSwag=52.61, MMLU=47.44, Average=45.19
+delta_vs_prev: Arc=▲+0.94, TruthfulQA=▼-0.37, Winogrande=▼-0.24, HellaSwag=▲+1.79, MMLU=▲+0.38, Average=▲+0.50
+improved_tasks=['Arc', 'HellaSwag', 'MMLU']  declined_tasks=['TruthfulQA', 'Winogrande']  stable_tasks=[]
+status: below best-so-far iteration base_model
+
+[iter_2]
+scores: Arc=36.09, TruthfulQA=36.12, Winogrande=52.25, HellaSwag=52.46, MMLU=47.38, Average=44.86
+delta_vs_prev: Arc=▼-0.94, TruthfulQA=▼-0.33, Winogrande=▼-0.16, HellaSwag=▼-0.15, MMLU=▼-0.06, Average=▼-0.33
+improved_tasks=[]  declined_tasks=['Arc', 'TruthfulQA', 'Winogrande', 'HellaSwag', 'MMLU']  stable_tasks=[]
+status: below best-so-far iteration base_model

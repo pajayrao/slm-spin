@@ -577,17 +577,6 @@ def main():
         f"Starting at iteration {start_iteration} "
         f"({'fresh run' if start_iteration == 0 else 'resuming'}).")
 
-    # Optional SFT warmup: SFT the base model on the (prompt, response) gold data
-    # once, then use that checkpoint as iteration 0's π_0. Reproduces the paper's
-    # base → SFT-on-gold → SPIN recipe so SPIN starts already fitted to p_data.
-    # Only needed when iteration 0 will actually run; on resume past iter 0 the
-    # warmup checkpoint is not used, so it is skipped entirely. run_sft_warmup is
-    # itself idempotent (skips if a completed warmup checkpoint already exists).
-    iter0_model_path = cfg.model_name_or_path
-    if cfg.sft_warmup_enabled and start_iteration == 0:
-        iter0_model_path = run_sft_warmup(cfg, tokenizer, base_rows)
-        logger.info(f"SFT warmup checkpoint will seed iteration 0: {iter0_model_path}")
-
     global_tb_dir = os.path.join(cfg.tensorboard_dir, "global")
     ensure_dir(global_tb_dir)
 
@@ -605,9 +594,28 @@ def main():
         ensure_dir(iter_dir)
 
         prev_model_path = (
-            iter0_model_path if iteration == 0
+            cfg.model_name_or_path if iteration == 0
             else os.path.join(cfg.checkpoints_dir, f"iter_{iteration - 1}")
         )
+
+        # Interleaved SFT: on even iterations (0, 2, 4, …) re-fit the incoming model
+        # to the gold (prompt, response) data with one SFT pass, then run this
+        # iteration's SPIN self-play seeded from that SFT'd checkpoint (it becomes
+        # both π_prev and π_θ's starting point). Reproduces the paper's
+        # base → SFT-on-gold → SPIN recipe, refreshed every second iteration.
+        # run_sft_warmup is idempotent per out_dir, so a resumed run skips an
+        # already-completed SFT pass.
+        if cfg.sft_warmup_enabled and iteration % 2 == 0:
+            sft_out_dir = os.path.join(cfg.checkpoints_dir, f"sft_iter_{iteration}")
+            logger.info(
+                f"  Interleaved SFT for iteration {iteration}: "
+                f"SFT {prev_model_path} → {sft_out_dir}")
+            prev_model_path = run_sft_warmup(
+                cfg, tokenizer, base_rows,
+                base_model_path=prev_model_path,
+                out_dir=sft_out_dir,
+            )
+
         logger.info(f"  Loading π_prev from: {prev_model_path}")
         log_memory(f"before_load_iter{iteration}")
         prev_model = load_causal_lm(

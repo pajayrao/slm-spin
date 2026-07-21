@@ -1,0 +1,211 @@
+[
+  {
+    "iteration": "base_model",
+    "metrics": {
+      "Arc": 30.9727,
+      "TruthfulQA": 39.0279,
+      "Winogrande": 51.3812,
+      "HellaSwag": 43.2583,
+      "MMLU": 25.5306,
+      "Average": 38.0341
+    },
+    "delta_prev": null,
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_0",
+    "metrics": {
+      "Arc": 30.3754,
+      "TruthfulQA": 39.086,
+      "Winogrande": 51.3812,
+      "HellaSwag": 43.2683,
+      "MMLU": 25.5021,
+      "Average": 37.9226
+    },
+    "delta_prev": {
+      "Arc": -0.5973,
+      "TruthfulQA": 0.0581,
+      "Winogrande": 0.0,
+      "HellaSwag": 0.01,
+      "MMLU": -0.0285,
+      "Average": -0.1115
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_1",
+    "metrics": {
+      "Arc": 30.5461,
+      "TruthfulQA": 39.2774,
+      "Winogrande": 50.8287,
+      "HellaSwag": 43.2683,
+      "MMLU": 25.4309,
+      "Average": 37.8703
+    },
+    "delta_prev": {
+      "Arc": 0.1707,
+      "TruthfulQA": 0.1914,
+      "Winogrande": -0.5525,
+      "HellaSwag": 0.0,
+      "MMLU": -0.0712,
+      "Average": -0.0523
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_2",
+    "metrics": {
+      "Arc": 30.6314,
+      "TruthfulQA": 39.2678,
+      "Winogrande": 51.3812,
+      "HellaSwag": 43.2981,
+      "MMLU": 25.3098,
+      "Average": 37.9777
+    },
+    "delta_prev": {
+      "Arc": 0.0853,
+      "TruthfulQA": -0.0096,
+      "Winogrande": 0.5525,
+      "HellaSwag": 0.0298,
+      "MMLU": -0.1211,
+      "Average": 0.1074
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_3",
+    "metrics": {
+      "Arc": 25.8532,
+      "TruthfulQA": 41.6562,
+      "Winogrande": 51.2234,
+      "HellaSwag": 41.8642,
+      "MMLU": 24.1419,
+      "Average": 36.9478
+    },
+    "delta_prev": {
+      "Arc": -4.7782,
+      "TruthfulQA": 2.3884,
+      "Winogrande": -0.1578,
+      "HellaSwag": -1.4339,
+      "MMLU": -1.1679,
+      "Average": -1.0299
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_4",
+    "metrics": {
+      "Arc": 25.7679,
+      "TruthfulQA": 41.3635,
+      "Winogrande": 51.4601,
+      "HellaSwag": 42.2426,
+      "MMLU": 24.1703,
+      "Average": 37.0009
+    },
+    "delta_prev": {
+      "Arc": -0.0853,
+      "TruthfulQA": -0.2927,
+      "Winogrande": 0.2367,
+      "HellaSwag": 0.3784,
+      "MMLU": 0.0284,
+      "Average": 0.0531
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_5",
+    "metrics": {
+      "Arc": 27.1331,
+      "TruthfulQA": 40.955,
+      "Winogrande": 51.5391,
+      "HellaSwag": 42.2924,
+      "MMLU": 24.327,
+      "Average": 37.2493
+    },
+    "delta_prev": {
+      "Arc": 1.3652,
+      "TruthfulQA": -0.4085,
+      "Winogrande": 0.079,
+      "HellaSwag": 0.0498,
+      "MMLU": 0.1567,
+      "Average": 0.2484
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 214.0,
+      "TruthfulQA": 46.4,
+      "Winogrande": 26.2,
+      "HellaSwag": 755.0,
+      "MMLU": 1755.7
+    }
+  },
+  {
+    "iteration": "iter_6",
+    "metrics": {
+      "Arc": 25.6826,
+      "TruthfulQA": 40.5747,
+      "Winogrande": 51.1444,
+      "HellaSwag": 42.4119,
+      "MMLU": 23.8641,
+      "Average": 36.7355
+    },
+    "delta_prev": {
+      "Arc": -1.4505,
+      "TruthfulQA": -0.3803,
+      "Winogrande": -0.3947,
+      "HellaSwag": 0.1195,
+      "MMLU": -0.4629,
+      "Average": -0.5138
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 185.6,
+      "TruthfulQA": 50.8,
+      "Winogrande": 24.7,
+      "HellaSwag": 777.2,
+      "MMLU": 1822.5
+    }
+  },
+  {
+    "iteration": "iter_7",
+    "metrics": {
+      "Arc": 25.9386,
+      "TruthfulQA": 40.4546,
+      "Winogrande": 51.1444,
+      "HellaSwag": 42.2127,
+      "MMLU": 23.8356,
+      "Average": 36.7172
+    },
+    "delta_prev": {
+      "Arc": 0.256,
+      "TruthfulQA": -0.1201,
+      "Winogrande": 0.0,
+      "HellaSwag": -0.1992,
+      "MMLU": -0.0285,
+      "Average": -0.0183
+    },
+    "best_so_far_avg": 38.0341,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 183.1,
+      "TruthfulQA": 57.6,
+      "Winogrande": 24.3,
+      "HellaSwag": 783.9,
+      "MMLU": 1762.1
+    }
+  }
+]

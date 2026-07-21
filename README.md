@@ -10,6 +10,7 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
 2. [Installation](#installation)
 3. [Quick Start](#quick-start)
    - [Tested and Planned Models](#tested-and-planned-models)
+   - [Results Summary](#results-summary)
    - [Local Dataset](#local-dataset)
    - [Running Evaluation](#running-evaluation)
 4. [Configuration Reference](#configuration-reference)
@@ -128,14 +129,65 @@ This implementation is being systematically evaluated on the following models in
 
 | Model | Params | Status |
 |-------|--------|--------|
-| `roneneldan/TinyStories-Instruct-33M` | 33M | No significant gain as model is too small. |
-| `distilbert/distilgpt2` | 82M | Model is not fine tuned for instruct dataset. |
-| `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | Spin Play ongoing. Required multiple rounds of hyperparameter tuning. |
-| `HuggingFaceTB/SmolLM2-360M-Instruct` | 360M | Queued |
+| `roneneldan/TinyStories-Instruct-33M` | 33M | No significant gain — model too small. |
+| `distilbert/distilgpt2` | 82M | ✅ Net gain: best avg 35.30 vs base 34.46 (+0.84) at iter_3. |
+| `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | ❌ Never beat base (38.03); best avg 37.98 at iter_2. ARC collapsed −4.78 at iter_3 and never recovered over 8 iterations. |
+| `HuggingFaceTB/SmolLM2-360M-Instruct` | 360M | ❌ Single iteration run, dropped below base (42.88 → 42.52, −0.36); 4/5 tasks declined. |
+| `HuggingFaceTB/SmolLM2-360M` (base) | 360M | ❌ Never beat base (41.97); best avg 41.83 at iter_3 (−0.14). |
+| `Qwen/Qwen2.5-0.5B` (run 1) | 500M | ❌ Never beat base (45.59); best avg 45.19 at iter_1 (−0.40). |
+| `Qwen/Qwen2.5-0.5B` (run 2) | 500M | ⚠️ Marginal net gain (45.36 → 46.07, +0.71 at iter_1), driven almost entirely by a +6.14 TruthfulQA spike while 4/5 other tasks declined — not a robust win. |
+| `Qwen/Qwen2.5-1.5B` | 1.5B | ✅ Best result overall: 55.69 → 57.59 (+1.90) at iter_0, with 4/5 tasks improving together (ARC +2.56, TruthfulQA +4.96, Winogrande +0.47, HellaSwag +1.96). |
 | `Qwen/Qwen2.5-0.5B-Instruct` | 500M | Queued |
 | `google/gemma-3-1b-it` | 1B | Queued |
 
 LoRA target modules are auto-detected per architecture — no config change needed when switching models.
+
+### Results Summary
+
+Full per-iteration scores and comparative analysis are in [results.txt](results.txt)
+(all runs) and [spin_outputs/eval_results/comparative_summary.txt](spin_outputs/eval_results/comparative_summary.txt)
+(latest active run). All scores are 5-task averages across ARC-Challenge, TruthfulQA
+MC2, Winogrande, HellaSwag, and MMLU — **GSM8k is disabled** in `evaluate.py`'s task
+registry, so it is `NA` in every run below.
+
+| Model | Baseline avg | Best iter (avg) | Best-vs-base Δ | Net verdict |
+|---|---|---|---|---|
+| distilgpt2 (82M) | 34.46 | iter_3 — 35.30 | **+0.84** | Gain |
+| SmolLM2-135M-Instruct | 38.03 | iter_2 — 37.98 | −0.05 | No gain |
+| SmolLM2-360M-Instruct | 42.88 | iter_0 — 42.52 | −0.36 | No gain |
+| SmolLM2-360M (base) | 41.97 | iter_3 — 41.83 | −0.14 | No gain |
+| Qwen2.5-0.5B (run 1) | 45.59 | iter_1 — 45.19 | −0.40 | No gain |
+| Qwen2.5-0.5B (run 2) | 45.36 | iter_1 — 46.07 | **+0.71** | Marginal gain (single-metric driven) |
+| Qwen2.5-1.5B | 55.69 | iter_0 — 57.59 | **+1.90** | Clear gain |
+
+**Key findings:**
+
+- **Gains cluster at the two ends of the tested scale range.** distilgpt2 (82M) and
+  Qwen2.5-1.5B are the only runs with an unambiguous net improvement; every model in
+  between (135M–500M) ends its best iteration at or below its own base model.
+- **The best checkpoint is always early.** Across all 7 runs, the highest-scoring
+  iteration falls between iter_0 and iter_3, regardless of how many iterations the run
+  continued for (up to 8, for SmolLM2-135M-Instruct). Later iterations only ever lose
+  ground once a run has passed its peak — no run recovers past its own best average.
+- **TruthfulQA improvement is usually a trade-off, not a general gain.** The iteration
+  with the largest TruthfulQA jump in most runs (SmolLM2-360M-Instruct iter_0 +3.18,
+  SmolLM2-135M-Instruct iter_3 +2.39, Qwen2.5-0.5B run 2 iter_1 +6.14) is also the
+  iteration where 3+ of the other 4 tasks decline. Qwen2.5-1.5B's iter_0 is the one
+  exception — TruthfulQA rose (+4.96) alongside every other task except MMLU.
+- **MMLU and Winogrande are nearly SPIN-invariant** in every run (typical |Δ| < 0.5) —
+  for sub-500M models MMLU sits near chance already; for Qwen it moves the least of any
+  task regardless of direction.
+- **Instruction-tuned starting checkpoints fare worse than base checkpoints.** Neither
+  SmolLM2-135M-Instruct nor SmolLM2-360M-Instruct ever beats its own base model; the
+  360M-Instruct run degrades on 4/5 tasks in its very first iteration.
+- **Run-to-run variance at 0.5B is comparable to the SPIN effect itself.** The two
+  Qwen2.5-0.5B runs report different baselines (45.59 vs 45.36) under near-identical
+  configs and reach opposite conclusions (net loss vs marginal gain) — at this scale,
+  reported deltas should not be trusted without repeated runs.
+
+See the [Configuration Reference](#configuration-reference) for the hyperparameters
+governing these runs (`loss_type`, `lambda_initial`/`lambda_final_iteration`,
+`learning_rate`/`learning_rate_late`, `num_iterations`).
 
 ### Local dataset
 

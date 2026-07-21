@@ -1,0 +1,51 @@
+[
+  {
+    "iteration": "base_model",
+    "metrics": {
+      "Arc": 41.3823,
+      "TruthfulQA": 35.0638,
+      "Winogrande": 54.4594,
+      "HellaSwag": 57.9167,
+      "MMLU": 25.5946,
+      "Average": 42.8834
+    },
+    "delta_prev": null,
+    "best_so_far_avg": 42.8834,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 427.6,
+      "TruthfulQA": 115.9,
+      "Winogrande": 54.4,
+      "HellaSwag": 1938.1,
+      "MMLU": 3884.6
+    }
+  },
+  {
+    "iteration": "iter_0",
+    "metrics": {
+      "Arc": 40.8703,
+      "TruthfulQA": 38.2471,
+      "Winogrande": 52.644,
+      "HellaSwag": 55.7558,
+      "MMLU": 25.089,
+      "Average": 42.5212
+    },
+    "delta_prev": {
+      "Arc": -0.512,
+      "TruthfulQA": 3.1833,
+      "Winogrande": -1.8154,
+      "HellaSwag": -2.1609,
+      "MMLU": -0.5056,
+      "Average": -0.3622
+    },
+    "best_so_far_avg": 42.8834,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 1333.2,
+      "TruthfulQA": 138.6,
+      "Winogrande": 63.4,
+      "HellaSwag": 2718.3,
+      "MMLU": 4167.7
+    }
+  }
+]

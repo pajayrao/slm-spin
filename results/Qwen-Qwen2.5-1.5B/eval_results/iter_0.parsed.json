@@ -1,0 +1,8 @@
+{
+  "Arc": 57.6792,
+  "TruthfulQA": 41.5348,
+  "Winogrande": 58.09,
+  "HellaSwag": 69.9761,
+  "MMLU": 60.6609,
+  "Average": 57.5882
+}

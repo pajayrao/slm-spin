@@ -1,0 +1,15 @@
+Iteration	Arc	TruthfulQA	Winogrande	GSM8k	HellaSwag	MMLU	Average	DeltaPrevAvg	BestSoFarAvg
+base_model	41.38	35.06	54.46	NA	57.92	25.59	42.88	NA	42.88
+iter_0	40.87	38.25	52.64	NA	55.76	25.09	42.52	-0.36	42.88
+
+Per-iteration comparative analysis:
+[base_model]
+scores: Arc=41.38, TruthfulQA=35.06, Winogrande=54.46, HellaSwag=57.92, MMLU=25.59, Average=42.88
+delta_vs_prev: baseline iteration (no previous to compare against)
+status: ★ NEW BEST average so far
+
+[iter_0]
+scores: Arc=40.87, TruthfulQA=38.25, Winogrande=52.64, HellaSwag=55.76, MMLU=25.09, Average=42.52
+delta_vs_prev: Arc=▼-0.51, TruthfulQA=▲+3.18, Winogrande=▼-1.82, HellaSwag=▼-2.16, MMLU=▼-0.51, Average=▼-0.36
+improved_tasks=['TruthfulQA']  declined_tasks=['Arc', 'Winogrande', 'HellaSwag', 'MMLU']  stable_tasks=[]
+status: below best-so-far iteration base_model

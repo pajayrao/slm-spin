@@ -16,7 +16,7 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
+    model_name_or_path: str = "Qwen/Qwen2.5-1.5B"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -68,7 +68,7 @@ class SPINConfig:
     # "auto"                — use the tokenizer's built-in chat_template if present, else fall back to instruction_response mode.
     # "plain"               — pass the raw prompt string with no wrapping; suitable for base models.
     # "instruction_response"— manually prepend instruction_prefix and append response_prefix.
-    chat_template_mode: str = "auto"
+    chat_template_mode: str = "instruction_response"
 
     # String prepended to the prompt when chat_template_mode="instruction_response".
     # Change to match the format the model was pre-trained with.
@@ -107,7 +107,7 @@ class SPINConfig:
     # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
     # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
     # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 64
+    generation_batch_size: int = 32
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -172,7 +172,7 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 200000
+    max_data_load: int = 207865
 
     # Number of dataset rows processed as one atomic checkpoint unit during
     # synthetic generation and ref-logprob scoring. Each batch is saved to
@@ -189,7 +189,7 @@ class SPINConfig:
     # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
     # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
     # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 0.5
+    lambda_initial: float = 10.0
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
     # A much larger value here applies a strong final alignment push.
@@ -206,7 +206,7 @@ class SPINConfig:
     # "hinge"       — relu(1 − margin): zero loss once margin > 1; hard boundary.
     # "correlation" — (1 − margin): linear penalty; constant gradient, easiest to tune.
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
-    loss_type: str = "hinge"
+    loss_type: str = "logistic"
 
     # ── Training hyperparameters ─────────────────────────────────────────────
 
@@ -229,12 +229,12 @@ class SPINConfig:
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
     # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 1e-6
+    learning_rate: float = 2e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 5e-7
+    learning_rate_late: float = 1e-5
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.

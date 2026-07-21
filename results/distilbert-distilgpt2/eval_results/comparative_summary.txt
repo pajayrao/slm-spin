@@ -1,0 +1,36 @@
+Iteration	Arc	TruthfulQA	Winogrande	GSM8k	HellaSwag	MMLU	Average	DeltaPrevAvg	BestSoFarAvg
+iter_0	23.81	46.04	49.72	NA	26.35	26.39	34.46	NA	34.46
+iter_1	23.98	47.63	50.59	NA	27.33	26.14	35.13	0.67	35.13
+iter_2	24.23	44.72	49.88	NA	27.51	26.64	34.60	-0.53	35.13
+iter_3	24.91	48.13	50.67	NA	27.12	25.69	35.30	0.71	35.30
+iter_4	24.06	49.05	50.67	NA	26.42	26.28	35.30	-0.01	35.30
+
+Per-iteration comparative analysis:
+[iter_0]
+scores: Arc=23.81, TruthfulQA=46.04, Winogrande=49.72, HellaSwag=26.35, MMLU=26.39, Average=34.46
+delta_vs_prev: baseline iteration (no previous to compare against)
+status: ★ NEW BEST average so far
+
+[iter_1]
+scores: Arc=23.98, TruthfulQA=47.63, Winogrande=50.59, HellaSwag=27.33, MMLU=26.14, Average=35.13
+delta_vs_prev: Arc=▲+0.17, TruthfulQA=▲+1.59, Winogrande=▲+0.87, HellaSwag=▲+0.98, MMLU=▼-0.24, Average=▲+0.67
+improved_tasks=['Arc', 'TruthfulQA', 'Winogrande', 'HellaSwag']  declined_tasks=['MMLU']  stable_tasks=[]
+status: ★ NEW BEST average so far
+
+[iter_2]
+scores: Arc=24.23, TruthfulQA=44.72, Winogrande=49.88, HellaSwag=27.51, MMLU=26.64, Average=34.60
+delta_vs_prev: Arc=▲+0.26, TruthfulQA=▼-2.91, Winogrande=▼-0.71, HellaSwag=▲+0.19, MMLU=▲+0.50, Average=▼-0.53
+improved_tasks=['Arc', 'HellaSwag', 'MMLU']  declined_tasks=['TruthfulQA', 'Winogrande']  stable_tasks=[]
+status: below best-so-far iteration iter_1
+
+[iter_3]
+scores: Arc=24.91, TruthfulQA=48.13, Winogrande=50.67, HellaSwag=27.12, MMLU=25.69, Average=35.30
+delta_vs_prev: Arc=▲+0.68, TruthfulQA=▲+3.41, Winogrande=▲+0.79, HellaSwag=▼-0.40, MMLU=▼-0.95, Average=▲+0.71
+improved_tasks=['Arc', 'TruthfulQA', 'Winogrande']  declined_tasks=['HellaSwag', 'MMLU']  stable_tasks=[]
+status: ★ NEW BEST average so far
+
+[iter_4]
+scores: Arc=24.06, TruthfulQA=49.05, Winogrande=50.67, HellaSwag=26.42, MMLU=26.28, Average=35.30
+delta_vs_prev: Arc=▼-0.85, TruthfulQA=▲+0.92, Winogrande=─0.00, HellaSwag=▼-0.70, MMLU=▲+0.59, Average=▼-0.01
+improved_tasks=['TruthfulQA', 'MMLU']  declined_tasks=['Arc', 'HellaSwag']  stable_tasks=['Winogrande']
+status: below best-so-far iteration iter_3

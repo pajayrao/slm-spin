@@ -68,7 +68,7 @@ class SPINConfig:
     # "auto"                — use the tokenizer's built-in chat_template if present, else fall back to instruction_response mode.
     # "plain"               — pass the raw prompt string with no wrapping; suitable for base models.
     # "instruction_response"— manually prepend instruction_prefix and append response_prefix.
-    chat_template_mode: str = "auto"
+    chat_template_mode: str = "instruction_response"
 
     # String prepended to the prompt when chat_template_mode="instruction_response".
     # Change to match the format the model was pre-trained with.
@@ -107,7 +107,7 @@ class SPINConfig:
     # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
     # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
     # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 64
+    generation_batch_size: int = 128
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
@@ -150,7 +150,7 @@ class SPINConfig:
     # logits tensor = batch × seq_len × vocab_size × 2B.
     # SmolLM2-135M (vocab=49152, max_length=512): batch=32 → 32×512×49152×2B ≈ 1.5 GB.
     # Safe on 8 GB; 2× faster than batch=16.
-    ref_logprob_batch_size: int = 8
+    ref_logprob_batch_size: int = 32
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
@@ -172,7 +172,7 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 200000
+    max_data_load: int = 50000
 
     # Number of dataset rows processed as one atomic checkpoint unit during
     # synthetic generation and ref-logprob scoring. Each batch is saved to
@@ -189,7 +189,7 @@ class SPINConfig:
     # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
     # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
     # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 0.5
+    lambda_initial: float = 10.0
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
     # A much larger value here applies a strong final alignment push.
@@ -206,7 +206,7 @@ class SPINConfig:
     # "hinge"       — relu(1 − margin): zero loss once margin > 1; hard boundary.
     # "correlation" — (1 − margin): linear penalty; constant gradient, easiest to tune.
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
-    loss_type: str = "hinge"
+    loss_type: str = "logistic"
 
     # ── Training hyperparameters ─────────────────────────────────────────────
 
@@ -218,7 +218,7 @@ class SPINConfig:
     # For an 8 GB GPU with a ~1B parameter model: use 1.
     # For a 24 GB GPU: try 4–8.
     # Range: 1–32 (GPU-memory dependent).
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 2
 
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
@@ -229,12 +229,12 @@ class SPINConfig:
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
     # Very small values prevent catastrophic forgetting of pre-trained knowledge.
     # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 1e-6
+    learning_rate: float = 2e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
     # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 5e-7
+    learning_rate_late: float = 1e-5
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
     # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
@@ -564,17 +564,8 @@ class SPINConfig:
     eval_batch_size: int = 1
 
     # Maximum total token length (context + continuation) fed to the model during evaluation.
-    # Sequences longer than this are truncated from the left. Lowering this is a direct way
-    # to cut eval GPU memory — the per-position vocab projection dominates, so 1024 roughly
-    # halves peak memory vs 2048 (few-shot prompts truncate slightly more).
-    eval_max_seq_len: int = 1024
-
-    # Apply torch.compile() to each model before evaluation. Disabled by default:
-    # eval feeds variable-length sequences, so torch.compile recompiles per shape and
-    # inflates GPU memory (and rebuilds Triton kernels) for little speedup — it is the
-    # main cause of eval OOM on small GPUs. Training compilation is controlled separately
-    # by compile_model and is unaffected by this flag.
-    eval_compile_model: bool = False
+    # Sequences longer than this are truncated from the left.
+    eval_max_seq_len: int = 2048
 
     # Maximum new tokens generated per response in the GSM8k benchmark (generation task).
     eval_gsm8k_max_new_tokens: int = 256

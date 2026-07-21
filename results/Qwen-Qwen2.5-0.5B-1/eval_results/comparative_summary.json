@@ -1,0 +1,89 @@
+[
+  {
+    "iteration": "base_model",
+    "metrics": {
+      "Arc": 36.8601,
+      "TruthfulQA": 38.0542,
+      "Winogrande": 53.2755,
+      "HellaSwag": 52.0414,
+      "MMLU": 47.7425,
+      "Average": 45.5947
+    },
+    "delta_prev": null,
+    "best_so_far_avg": 45.5947,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_0",
+    "metrics": {
+      "Arc": 36.0922,
+      "TruthfulQA": 36.8161,
+      "Winogrande": 52.644,
+      "HellaSwag": 50.8166,
+      "MMLU": 47.0588,
+      "Average": 44.6855
+    },
+    "delta_prev": {
+      "Arc": -0.7679,
+      "TruthfulQA": -1.2381,
+      "Winogrande": -0.6315,
+      "HellaSwag": -1.2248,
+      "MMLU": -0.6837,
+      "Average": -0.9092
+    },
+    "best_so_far_avg": 45.5947,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_1",
+    "metrics": {
+      "Arc": 37.0307,
+      "TruthfulQA": 36.4503,
+      "Winogrande": 52.4073,
+      "HellaSwag": 52.609,
+      "MMLU": 47.4363,
+      "Average": 45.1867
+    },
+    "delta_prev": {
+      "Arc": 0.9385,
+      "TruthfulQA": -0.3658,
+      "Winogrande": -0.2367,
+      "HellaSwag": 1.7924,
+      "MMLU": 0.3775,
+      "Average": 0.5012
+    },
+    "best_so_far_avg": 45.5947,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_2",
+    "metrics": {
+      "Arc": 36.0922,
+      "TruthfulQA": 36.1155,
+      "Winogrande": 52.2494,
+      "HellaSwag": 52.4597,
+      "MMLU": 47.3793,
+      "Average": 44.8592
+    },
+    "delta_prev": {
+      "Arc": -0.9385,
+      "TruthfulQA": -0.3348,
+      "Winogrande": -0.1579,
+      "HellaSwag": -0.1493,
+      "MMLU": -0.057,
+      "Average": -0.3275
+    },
+    "best_so_far_avg": 45.5947,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {
+      "Arc": 518.6,
+      "TruthfulQA": 171.8,
+      "Winogrande": 82.0,
+      "HellaSwag": 2434.8,
+      "MMLU": 8151.3
+    }
+  }
+]
