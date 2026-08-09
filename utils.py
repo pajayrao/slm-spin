@@ -2,6 +2,7 @@ import os
 import gc
 import json
 import argparse
+import hashlib
 import logging
 import glob
 import traceback
@@ -99,8 +100,11 @@ def pre_start_cleanup():
         except OSError:
             pass
 
-
-pre_start_cleanup()
+# NOTE: pre_start_cleanup() is deliberately NOT called at import time. Deleting
+# every HF cache lock is only safe when this process is the sole user of the
+# cache; an import-time call fired from every module that imports utils (main,
+# evaluate, sft_warmup, …) including inside concurrently running processes.
+# main.py and evaluate.py call it explicitly at process start instead.
 
 
 def ensure_dir(path: str):
@@ -288,10 +292,15 @@ def maybe_apply_chat_template(tokenizer, user_prompt: str, cfg: SPINConfig) -> s
             tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
         if has_template:
             try:
+                # enable_thinking=False: Qwen3 templates default to thinking mode,
+                # which makes generations open with a <think>...</think> block that
+                # human dataset responses never contain — a trivial surface feature
+                # for the SPIN margin to key on. Non-Qwen3 templates ignore the kwarg.
                 result = tokenizer.apply_chat_template(
                     [{"role": "user", "content": user_prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
+                    enable_thinking=False,
                 )
                 logger.debug(
                     f"maybe_apply_chat_template: mode=auto → used tokenizer.apply_chat_template, "
@@ -947,6 +956,35 @@ def generate_synthetic_responses(model, tokenizer, rows: List[Dict[str, str]], c
     model.eval()
     out_rows = []
     bs = cfg.generation_batch_size
+
+    # Drop rows whose formatted prompt exceeds max_prompt_length instead of
+    # truncating them. Left-truncation of a chat-templated prompt amputates the
+    # template header (e.g. "<|im_start|>user"), producing a malformed prompt —
+    # and training would then score the synthetic response under a DIFFERENT
+    # (longer, max_length-truncated) prompt than the one it was generated from.
+    # Dropping here is safe: the returned rows are the source of truth for the
+    # ref-logprob and training steps, so all three stages stay row-aligned.
+    kept_rows = []
+    n_dropped = 0
+    for r in rows:
+        prompt_text = build_prompt_text(r["prompt"], tokenizer, cfg)
+        n_tok = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+        if n_tok <= cfg.max_prompt_length:
+            kept_rows.append(r)
+        else:
+            n_dropped += 1
+    if n_dropped:
+        logger.warning(
+            f"Dropped {n_dropped}/{len(rows)} rows whose formatted prompt exceeds "
+            f"max_prompt_length={cfg.max_prompt_length} tokens (prevents template-"
+            f"mangling truncation and generation/training prompt mismatch).")
+    rows = kept_rows
+    if not rows:
+        raise ValueError(
+            f"All rows dropped: every formatted prompt exceeds "
+            f"max_prompt_length={cfg.max_prompt_length}. Raise max_prompt_length "
+            f"or use a dataset with shorter prompts.")
+
     logger.info(
         f"Starting synthetic generation: {len(rows)} rows, batch_size={bs}.")
 
@@ -1370,6 +1408,23 @@ def make_trainable(model, cfg: SPINConfig):
         logger.info(
             "  PEFT model created — base weights frozen, LoRA adapter params trainable.")
 
+        # Keep trainable adapter params in fp32. The base model is loaded in bf16 and
+        # HF's bf16=True is autocast-only (no fp32 master weights), so optimizing bf16
+        # adapter params directly makes most updates vanish: bf16 has ~8 mantissa bits
+        # (relative resolution ~4e-3), while AdamW updates at lr≈1e-6 are ~1e-4–1e-5
+        # relative — they round to zero on every weight not near 0. PEFT's LoraLayer
+        # casts activations to the adapter dtype in forward, so mixed bf16-base /
+        # fp32-adapter is fully supported (the standard QLoRA configuration).
+        n_upcast = 0
+        for p in model.parameters():
+            if p.requires_grad and p.dtype != torch.float32:
+                p.data = p.data.to(torch.float32)
+                n_upcast += 1
+        if n_upcast:
+            logger.info(
+                f"  Upcast {n_upcast} trainable adapter tensors to fp32 "
+                f"(bf16 master weights round away lr-scale updates).")
+
         if cfg.gradient_checkpointing:
             model.enable_input_require_grads()
             logger.info(
@@ -1586,15 +1641,45 @@ def logprobs_path(cfg, iteration, k):
                         f"iter_{iteration}_batch_{k:06d}_logprobs.jsonl")
 
 
+def tokenization_fingerprint(cfg) -> str:
+    """Return a short hash of every config field that changes tokenization output.
+
+    Embedded in tokenized-cache filenames so that switching the model/tokenizer,
+    sequence caps, or chat-template settings invalidates the cache instead of
+    silently loading tensors produced under the old settings (the caches were
+    previously keyed by iteration/batch index only).
+
+    Example:
+        Input:  cfg.model_name_or_path="Qwen/Qwen2.5-0.5B", cfg.max_length=512,
+                cfg.max_prompt_length=256, cfg.chat_template_mode="auto", ...
+        Output: "3f9a1c2e"  (stable 8-hex-char digest; same cfg → same digest)
+    """
+    key = "|".join(str(v) for v in (
+        cfg.model_name_or_path,
+        cfg.tokenizer_name_or_path,
+        cfg.max_length,
+        cfg.max_prompt_length,
+        cfg.truncation_side,
+        cfg.chat_template_mode,
+        cfg.instruction_prefix,
+        cfg.response_prefix,
+        cfg.add_eos_to_response,
+    ))
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+
+
 def tokenized_path(cfg, iteration, k):
     """Return the .pt cache path for pre-tokenized tensors of batch k in a given iteration.
 
+    The filename embeds tokenization_fingerprint(cfg) so caches from different
+    model/tokenizer/sequence settings never collide.
+
     Example:
         Input:  cfg.synthetic_cache_dir="output/synth_cache", iteration=2, k=10
-        Output: "output/synth_cache/iter_2_batch_000010_tokenized.pt"
+        Output: "output/synth_cache/iter_2_batch_000010_tokenized_3f9a1c2e.pt"
     """
     return os.path.join(cfg.synthetic_cache_dir,
-                        f"iter_{iteration}_batch_{k:06d}_tokenized.pt")
+                        f"iter_{iteration}_batch_{k:06d}_tokenized_{tokenization_fingerprint(cfg)}.pt")
 
 
 def batch_train_dir(cfg, iteration, k):

@@ -16,7 +16,15 @@ class SPINConfig:
     # HuggingFace Hub model ID (e.g. "meta-llama/Llama-3.2-1B") or an absolute local
     # path to a directory containing config.json + model weights. This is both the
     # starting checkpoint for iteration 0 and the reference model for SPIN iteration 0.
-    model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
+    # Qwen3-0.6B-Base: 28 layers, hidden 1024, 16 Q / 8 KV heads (head_dim 128),
+    # vocab 151,936, LLaMA-style q/k/v/o_proj attention (LoRA targets already match).
+    # Requires transformers >= 4.51. Base (pretrain-only) variant chosen deliberately:
+    # the SPIN recipe is base → SFT-on-gold → SPIN, and in our results
+    # instruction-tuned starting checkpoints never beat their own baseline (0/2 runs)
+    # — their existing alignment fights the ultrachat distribution. Switch to
+    # "Qwen/Qwen3-0.6B" only to deliberately ablate an instruct/thinking start
+    # (its chat template emits <think> blocks; see chat_template_mode below).
+    model_name_or_path: str = "Qwen/Qwen3-0.6B-Base"
 
     # Path to a tokenizer directory or Hub ID. If None, the tokenizer is loaded from
     # model_name_or_path. Useful when the tokenizer lives in a different repo than the weights.
@@ -68,6 +76,12 @@ class SPINConfig:
     # "auto"                — use the tokenizer's built-in chat_template if present, else fall back to instruction_response mode.
     # "plain"               — pass the raw prompt string with no wrapping; suitable for base models.
     # "instruction_response"— manually prepend instruction_prefix and append response_prefix.
+    # Qwen3 caveat: the Qwen3 chat template supports thinking mode (enable_thinking,
+    # default True), so synthetic generations may open with a <think>...</think> block
+    # while the human ultrachat responses never do. That gives the SPIN discriminator a
+    # trivial surface feature to separate chosen from rejected on, weakening the training
+    # signal. If synthetic JSONL rows show <think> blocks, either strip them post-
+    # generation or pass enable_thinking=False where apply_chat_template is called.
     chat_template_mode: str = "auto"
 
     # String prepended to the prompt when chat_template_mode="instruction_response".
@@ -92,8 +106,13 @@ class SPINConfig:
     # Hard cap on total tokens (prompt + response) fed into the model during training.
     # Sequences longer than this are truncated. Activation memory scales as O(seq_len²)
     # for standard attention and O(seq_len) for Flash Attention.
+    # 1024 (vs the earlier 512) because ultrachat human answers are long: at 512 the
+    # chosen side was frequently left-truncated (sometimes into promptless fragments)
+    # while the ≤max_new_tokens rejected side never was — a systematic chosen/rejected
+    # asymmetry polluting the SPIN margin. If training OOMs at this length, enable
+    # gradient_checkpointing rather than shrinking this back.
     # Recommended range for 8 GB GPU: 512–1024.
-    max_length: int = 512
+    max_length: int = 1024
 
     # Which end of an overlong sequence to truncate.
     # "left"  — drops tokens from the beginning of the prompt (preserves the question tail).
@@ -103,16 +122,21 @@ class SPINConfig:
     # ── Generation (synthetic response production) ───────────────────────────
 
     # Number of prompts decoded in a single GPU batch during synthetic generation.
-    # KV-cache peak = batch × (max_prompt + max_new_tokens) × layers × KV-heads × head_dim × 2B.
-    # SmolLM2-135M: 2 × 3 KV-heads × 64 head_dim × 30 layers × 2B = 22.5 KB per token.
-    # batch=256, 512 tokens: KV cache ≈ 2.95 GB + model 0.27 GB = ~3.2 GB — fits on 8 GB.
-    # batch=128: ~1.7 GB — overly conservative; 256 is safe and 2× faster generation.
-    generation_batch_size: int = 64
+    # KV-cache peak = batch × (max_prompt + max_new_tokens) × layers × KV-heads × head_dim × 2 (K+V) × 2B.
+    # Qwen3-0.6B: 28 layers × 8 KV-heads × 128 head_dim × 2 × 2B = 112 KB per token —
+    # ~9× more than Qwen2.5-0.5B (24 layers × 2 KV-heads × 64 head_dim = 12 KB/token),
+    # so the batch size that was safe for Qwen2.5 is not safe here.
+    # batch=32, 640 tokens (256 prompt + 384 new): KV ≈ 2.3 GB + model ~1.2 GB (bf16)
+    # = ~3.5 GB — safe on 8 GB. batch=64 would need ~4.6 GB KV — too tight.
+    generation_batch_size: int = 32
 
     # Maximum number of new tokens the model may produce per response.
     # Longer responses create richer training signal but increase generation time linearly.
+    # 384 keeps rejected responses length-comparable to the (long) chosen ultrachat
+    # answers now that max_length=1024 gives them room; 256 made length itself a
+    # trivial chosen/rejected separator.
     # Range: 64–1024. Keep in mind: generation_max_new_tokens ≤ max_length − prompt_length.
-    generation_max_new_tokens: int = 256
+    generation_max_new_tokens: int = 384
 
     # Whether to use stochastic sampling during generation.
     # True  — sample from the distribution; produces diverse, varied responses.
@@ -148,23 +172,43 @@ class SPINConfig:
     # Number of rows scored in a single forward pass during compute_ref_logprobs().
     # Reduce if ref-logprob scoring causes OOM (each batch holds two padded sequences).
     # logits tensor = batch × seq_len × vocab_size × 2B.
-    # SmolLM2-135M (vocab=49152, max_length=512): batch=32 → 32×512×49152×2B ≈ 1.5 GB.
-    # Safe on 8 GB; 2× faster than batch=16.
-    ref_logprob_batch_size: int = 8
+    # Qwen3-0.6B (vocab=151,936, max_length=1024): batch=8 → 8×1024×151936×2B ≈ 2.5 GB
+    # worst-case per side — chosen and rejected are scored sequentially, so peak is one
+    # side at a time; safe on 8 GB alongside the bf16 model (~1.2 GB). Halve to 4 if
+    # scoring OOMs on long-sequence batches.
+    ref_logprob_batch_size: int = 4
 
     # ── SPIN training loop ───────────────────────────────────────────────────
 
     # Total number of SPIN outer iterations. Each iteration:
     #   1. Uses the current model to generate synthetic responses (the "opponent").
     #   2. Trains a new model to prefer human responses over those synthetic ones.
-    # More iterations = more self-improvement cycles. Diminishing returns after 3–5.
+    # 4 (down from 10): across all 7 completed runs the best checkpoint landed at
+    # iteration 0–3 and no run ever recovered past its own peak — iterations beyond
+    # ~4 only burned compute. Best-checkpoint selection from the eval table does the
+    # rest.
     # Range: 1–10. Typical: 3–5.
-    num_iterations: int = 5
+    num_iterations: int = 4
 
     # Number of full passes over the synthetic dataset inside a single SPIN iteration.
     # More epochs = stronger fitting to current synthetic data, but risks overfitting.
+    # 2 matches the SPIN paper's per-iteration schedule; watch train/win_rate — if it
+    # pins at 1.0 early in epoch 2, drop back to 1.
     # Range: 1–5. Typical: 1–3.
     num_epochs_per_iteration: int = 1
+
+    # Fresh prompts per iteration (Tier-3 experiment; default False = original
+    # behaviour where every iteration reuses the same rows). When True, the loaded
+    # dataset is partitioned into num_iterations disjoint slices and iteration N
+    # trains only on slice N — giving each iteration genuinely new supervision on the
+    # chosen side, which is the only lever that adds new information across iterations
+    # (the reused-rows default provides none, a leading cause of post-iteration-0
+    # decay). To use it meaningfully raise max_data_load so each slice is still large
+    # (e.g. max_data_load=200000 with num_iterations=4 → ~50k fresh rows per
+    # iteration) and cap the SFT warmup independently via sft_warmup_max_samples so
+    # the warmup does not train on all 200k. Slices are deterministic in the loaded
+    # (fixed) row order, so resume is unaffected. Start this in a FRESH output_dir.
+    resample_prompts_per_iteration: bool = True
 
     # Hard cap on the total number of records read from the dataset at load time.
     # Applied in load_base_dataset_fixed() before any per-iteration sampling.
@@ -172,7 +216,7 @@ class SPINConfig:
     # (e.g. ultrachat_200k has ~200 k rows; setting this to 50 000 loads only the first 50 k).
     # 0 = load the full dataset split.
     # Range: 0 (unlimited) or any positive integer ≤ dataset size.
-    max_data_load: int = 200000
+    max_data_load: int = 200000      
 
     # Number of dataset rows processed as one atomic checkpoint unit during
     # synthetic generation and ref-logprob scoring. Each batch is saved to
@@ -186,15 +230,25 @@ class SPINConfig:
     # λ (lambda) applied in all iterations except the last.
     # Scales the SPIN margin: margin = λ × [(π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))].
     # Larger λ = stronger gradient signal, but too large can destabilise training.
-    # NOTE: log-probs are per-token averages (~-0.5 to -2.0), so λ must be larger than
-    # the raw-sum regime (~-50 to -500) to produce the same effective margin scale.
-    # Range: 1–50 with per-token normalization. Typical: 10.
-    lambda_initial: float = 0.5
+    # NOTE: log-probs are per-token averages, so raw margins live in roughly ±(0.5–5)
+    # nats — and with rejected_adv_clip=5.0 the margin ceiling is λ × (chosen_adv + 5).
+    # λ must keep that ceiling inside the logistic loss's active region: at λ=1 the
+    # ceiling margin is ~5 (sigmoid(−5)≈0.007, gradient small but alive); at λ=10 it
+    # is ~50 (gradient identically zero — the old λ=10 value only ever "worked"
+    # because the pre-fix trainer clipped every update to unit norm, making λ
+    # irrelevant). Keep λ ≈ 1–2 with the clip enabled.
+    # Range: 0.5–5 with per-token normalization + clipping. Typical: 1.
+    lambda_initial: float = 1.0
 
     # λ used exclusively in the final SPIN iteration (if final_iteration_lambda_only=True).
-    # A much larger value here applies a strong final alignment push.
-    # Range: 10–100 with per-token normalization.
-    lambda_final_iteration: Optional[float] = 20.0
+    # A larger value here applies a stronger final alignment push.
+    # NOTE: previously defaulted to 20.0 (40x lambda_initial) — that jump was found to
+    # massively amplify likelihood-displacement collapse (see rejected_adv_clip below)
+    # on exactly the iteration meant to produce the most stable final checkpoint.
+    # Keep this within ~2-4x lambda_initial unless you have evidence the model needs
+    # a much stronger final push.
+    # Range: 1–10 with per-token normalization.
+    lambda_final_iteration: Optional[float] = 2.0
 
     # When True, lambda_final_iteration replaces lambda_initial only for the very last
     # iteration; all earlier iterations still use lambda_initial.
@@ -206,7 +260,69 @@ class SPINConfig:
     # "hinge"       — relu(1 − margin): zero loss once margin > 1; hard boundary.
     # "correlation" — (1 − margin): linear penalty; constant gradient, easiest to tune.
     # "exponential" — exp(−margin): very aggressive for negative margins; can cause instability.
-    loss_type: str = "hinge"
+    # logistic (was hinge): hinge's dead zone was observed directly in training logs —
+    # loss=0 / grad=0 on most steps once margins blew past 1, leaving a handful of
+    # unsaturated examples to steer every update while the rejected-side collapse ran
+    # silent. The one clearly successful run (Qwen2.5-1.5B, +1.90) also used logistic.
+    loss_type: str = "logistic"
+
+    # ── SPIN loss regularisation (anti likelihood-displacement) ────────────────
+    # The base SPIN/DPO-style margin loss only depends on
+    # (π_θ(chosen)−π_ref(chosen)) − (π_θ(rejected)−π_ref(rejected)). Because that
+    # difference can be driven up by either raising chosen or lowering rejected, and
+    # lowering rejected is usually the cheaper gradient path, unregularised training
+    # tends to crater π_θ(rejected) far more than it raises π_θ(chosen) — a failure
+    # mode known as "likelihood displacement". The three knobs below counteract it.
+
+    # Weight of an auxiliary NLL anchor term added directly on the chosen (human)
+    # response: loss += sft_alpha * (-mean(pi_chosen_logp)). This gives the optimiser
+    # an explicit reward for raising chosen likelihood on its own, independent of the
+    # margin, instead of letting it satisfy the margin purely by cratering rejected.
+    # 0.0 disables the term (original behaviour).
+    # 0.5 (was 0.25): the corrected Qwen3-0.6B run showed the margin was still won
+    # ~20x more by rejected-suppression (rejected_adv ~-2.0) than chosen-raising
+    # (chosen_adv ~+0.1), and iteration 1 declined on benchmarks despite healthy
+    # training loss. A stronger anchor forces more of the improvement onto the
+    # chosen side. Raise further (up to ~1.0) if chosen_adv stays near zero.
+    # Range: 0.0–1.0. Typical: 0.1–0.5.
+    sft_alpha: float = 0.5
+
+    # Maximum magnitude (in nats, per-token-average log-prob units) that the rejected
+    # advantage (π_θ(rejected) − π_ref(rejected)) is allowed to contribute to the
+    # margin. Values below -rejected_adv_clip are clamped before the margin is formed,
+    # so once the model has already moved this far away from the reference on the
+    # rejected side, further collapse earns no additional loss reduction.
+    # None disables clamping (original behaviour).
+    # 2.0 (was 5.0): tightening the clip caps how much margin the optimiser can earn
+    # by pushing rejected down, so it must rely on the chosen side once the rejected
+    # advantage passes -2.0 nats/token (which the corrected run reached within one
+    # iteration). Pairs with the higher sft_alpha above.
+    # Range: 2.0–10.0. Typical: 2.0–5.0.
+    rejected_adv_clip: Optional[float] = 2.0
+
+    # Weight of a penalty on negative kl_from_ref, i.e. loss += kl_penalty_alpha *
+    # relu(-kl_from_ref)**2. kl_from_ref = mean(chosen_adv + rejected_adv) / 2; a
+    # sustained negative value means the model is regressing overall relative to the
+    # reference rather than improving on both sides, which the rest of this file's
+    # docs already call "an alignment alarm". This only fires when kl_from_ref < 0,
+    # so it does not penalise the normal, expected direction of drift.
+    # 0.0 disables the term (original behaviour).
+    # Range: 0.0–1.0. Typical: 0.1.
+    kl_penalty_alpha: float = 0.1
+
+    # Fixed-opponent SPIN (Tier-3 experiment; default False = standard SPIN where
+    # iteration N's opponent is the iteration-(N-1) model). When True, the OPPONENT —
+    # the model that generates the synthetic "rejected" responses and provides the
+    # reference log-probs — is frozen at the iteration-0 seed (the SFT-warmed model,
+    # or the base model if no warmup) for every iteration, while the trainable policy
+    # still continues from the previous iteration's checkpoint. This keeps the
+    # negative distribution far from human so the chosen/rejected gap stays large and
+    # informative, and avoids the "disprefer your own best model" trap where standard
+    # SPIN trains iteration 1 to move away from the (better) iteration-0 model. It is
+    # an ALTERNATIVE to resample_prompts_per_iteration, not a complement — enabling
+    # both at once conflates two interventions, so run them as separate ablations.
+    # Start this in a FRESH output_dir.
+    fixed_opponent: bool = False
 
     # ── Training hyperparameters ─────────────────────────────────────────────
 
@@ -223,22 +339,35 @@ class SPINConfig:
     # Gradients are accumulated over this many forward passes before one optimizer step.
     # Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
     # Increase this to compensate when you lower per_device_train_batch_size to fit in memory.
+    # 64 × per_device=1 → effective batch 64, matching the SPIN paper, via the
+    # memory-cheapest route: raising per_device to 2 instead would double activation
+    # memory, which max_length=1024 already doubled (the two-graph SPIN backward holds
+    # chosen AND rejected activations simultaneously). Same total FLOPs either way.
     # Range: 1–512. Typical: 32–128.
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 16
 
     # Peak learning rate used during early SPIN iterations (iterations < late_lr_start_iteration).
-    # Very small values prevent catastrophic forgetting of pre-trained knowledge.
-    # Range: 1e-7–5e-6. Typical: 5e-7 for 7B models; ~1e-6 for 135M-scale models.
-    learning_rate: float = 1e-6
+    # This LR applies to LoRA adapter params only (fp32, effective scale ×α/r=2), not
+    # full weights — LoRA preference-tuning convention is 5e-6–5e-5. The previous 1e-6
+    # was calibrated against the pre-fix trainer (32×-inflated gradients clipped to
+    # unit norm every step); under correct gradient scaling it barely moves rank-16
+    # adapters within an iteration. Escalate to 2e-5 if train/margin_mean stays flat
+    # through iteration 0; back off if train/kl_from_ref trends strongly negative.
+    # Range: 1e-6–5e-5 (LoRA). Typical: 1e-5.
+    learning_rate: float = 1e-5
 
     # Learning rate used from late_lr_start_iteration onward.
     # Smaller than learning_rate to allow fine-grained alignment in later iterations.
-    # Range: 1e-8–1e-6. Typical: 1e-7.
-    learning_rate_late: float = 5e-7
+    # Range: 1e-6–1e-5 (LoRA). Typical: half the peak LR.
+    learning_rate_late: float = 5e-6
 
     # SPIN iteration index (0-based) at which the LR switches from learning_rate to learning_rate_late.
-    # E.g. 2 means iterations 0,1 use learning_rate and iterations 2+ use learning_rate_late.
-    late_lr_start_iteration: int = 4
+    # E.g. 1 means iteration 0 uses learning_rate and iterations 1+ use learning_rate_late.
+    # 1 (was 2): the self-play signal weakens sharply after iteration 0 (the opponent
+    # approaches human quality, so the chosen/rejected gap shrinks). A smaller step
+    # from iteration 1 onward reduces the drift that caused iteration 1 to fall below
+    # iteration 0's benchmark peak in the corrected run.
+    late_lr_start_iteration: int = 1
 
     # L2 regularisation coefficient applied to weight matrices (not biases or layer norms).
     # 0.0 is standard for supervised fine-tuning. Small values (1e-4) can help generalisation.
@@ -247,10 +376,12 @@ class SPINConfig:
 
     # Number of linear LR warmup steps at the beginning of each iteration.
     # Must be small relative to total optimizer steps per SPIN batch.
-    # With per_device=16, GA=32, data_batch=16384, epochs=2:
-    #   total optimizer steps per batch = (16384/16/32)*2 = 64
-    # So warmup_steps=5 → ~8% warmup, which is correct.
-    warmup_steps: int = 5
+    # With per_device=1, GA=64, data_batch=50000, epochs=2:
+    #   total optimizer steps per batch ≈ (50000/1/64)*2 ≈ 1562
+    # So warmup_steps=50 → ~3% warmup — a real ramp matters at the 10× higher peak LR
+    # so the first optimizer steps don't shock the zero-initialised lora_B adapters
+    # (the old value of 5 was 0.3%, effectively no warmup).
+    warmup_steps: int = 50
 
     # Learning rate scheduler shape after warmup.
     # "cosine"  — smooth decay to 0; best for fine-tuning.
@@ -364,10 +495,11 @@ class SPINConfig:
     compile_fullgraph: bool = True
 
     # Also compile the frozen reference model used for log-prob scoring and synthetic generation.
-    # Disabled: model.generate() uses a Python while-loop that always causes a graph break,
-    # so compile_fullgraph=True fails silently (caught by maybe_compile_model's try/except)
-    # and falls back to eager — paying max-autotune search time for zero runtime benefit.
-    compile_ref_model: bool = True
+    # Disabled: the ref model is moved CPU↔GPU around every batch's generation/scoring
+    # steps, and compiled artifacts are shape/device-specialised — each round-trip pays
+    # recompilation (with max-autotune, minutes of kernel search) for little
+    # steady-state benefit on a model that only runs forward passes.
+    compile_ref_model: bool = False
 
     # ── LoRA / PEFT ──────────────────────────────────────────────────────────
 
@@ -394,7 +526,7 @@ class SPINConfig:
     lora_dropout: float = 0.05
 
     # Comma-separated list of nn.Linear layer name suffixes that receive LoRA adapters.
-    # SmolLM2-135M-Instruct uses LLaMA-style attention: "q_proj,k_proj,v_proj,o_proj".
+    # Qwen3 / Qwen2.5 / SmolLM2 use LLaMA-style attention: "q_proj,k_proj,v_proj,o_proj".
     # GPT-2 / distilgpt2 family uses: "c_attn,c_proj".
     # make_trainable() will auto-detect the correct names if these aren't found in the model.
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
@@ -559,15 +691,20 @@ class SPINConfig:
 
     # Number of (context, continuation) rows per GPU forward pass during evaluation.
     # Logits per batch = batch × actual_seq_len × vocab_size × 2B.
-    # Real eval sequences (ARC, TruthfulQA, Winogrande) average 100–400 tokens, not 2048.
-    # SmolLM2-135M: batch=8 × 512 tokens × 49152 vocab × 2B ≈ 0.4 GB — safe on 8 GB.
+    # Worst case with eval_max_seq_len=2048 and Qwen-scale vocab:
+    #   4 × 2048 × 151936 × 2B ≈ 2.5 GB — safe on 8 GB alongside the bf16 model.
+    # (8 × 2048 would be ~5 GB — too tight.) Was 1: ~4× slower for no memory benefit.
     eval_batch_size: int = 1
 
     # Maximum total token length (context + continuation) fed to the model during evaluation.
-    # Sequences longer than this are truncated from the left. Lowering this is a direct way
-    # to cut eval GPU memory — the per-position vocab projection dominates, so 1024 roughly
-    # halves peak memory vs 2048 (few-shot prompts truncate slightly more).
-    eval_max_seq_len: int = 1024
+    # Sequences longer than this are truncated from the left.
+    # 2048 (was 1024) because ARC is scored 25-shot: the few-shot prefix alone runs
+    # ~1500–2000 tokens, so at 1024 most ARC exemplars (and some 10-shot HellaSwag
+    # context) were silently truncated away — systematically depressing those scores
+    # in every previous eval. NOTE: changing this invalidates comparison with all
+    # cached .parsed.json results — re-evaluate base_model and any checkpoints you
+    # intend to report under the new setting (delete the caches or use --no-cache).
+    eval_max_seq_len: int = 2048
 
     # Apply torch.compile() to each model before evaluation. Disabled by default:
     # eval feeds variable-length sequences, so torch.compile recompiles per shape and

@@ -8,6 +8,7 @@ from utils import *
 from transformers.trainer_utils import get_last_checkpoint
 from transformers import set_seed
 from dataclasses import asdict
+import copy
 import logging
 import gc
 import shutil
@@ -168,15 +169,17 @@ def _find_start_batch(cfg, iteration, total_batches):
 def _init_train_model(prev_model, cfg, iteration, start_batch):
     """Return the initial trainable model for this iteration.
 
-    - start_batch == 0: wrap prev_model with LoRA.
+    - start_batch == 0: deep-copy prev_model, then wrap the COPY with LoRA
+                        (prev_model itself must stay untouched — it is the frozen
+                        opponent used for generation/scoring all iteration long).
     - start_batch  > 0: load the merged model saved after batch start_batch-1,
                         then wrap with fresh LoRA adapters.
 
     Example (fresh iteration, no batches done yet):
         Input:  prev_model=<LlamaForCausalLM frozen, on CPU>,
                 cfg.use_lora=True, iteration=0, start_batch=0
-        Output: <PeftModel wrapping prev_model> with LoRA adapters attached,
-                in train mode, on CPU (caller moves to GPU before training)
+        Output: <PeftModel wrapping a deep copy of prev_model> with LoRA adapters
+                attached, in train mode, on CPU (caller moves to GPU before training)
 
     Example (resuming mid-iteration at batch 3):
         Input:  prev_model=<LlamaForCausalLM frozen>,
@@ -187,15 +190,28 @@ def _init_train_model(prev_model, cfg, iteration, start_batch):
                 (prev_model is NOT used — the newer merged checkpoint is loaded instead)
     """
     if start_batch == 0:
+        # Deep-copy before wrapping: get_peft_model() mutates the module tree of the
+        # model it is given (target Linear layers are replaced with LoRA wrappers) and
+        # merge_and_unload() later folds the trained deltas into those same weight
+        # tensors. Wrapping prev_model directly (the original behaviour) therefore
+        # corrupted the frozen opponent: from batch 1 onward, synthetic generation and
+        # "reference" log-probs silently ran on the partially-trained current model.
+        # The copy is made on CPU (prev_model lives there between GPU steps), so the
+        # transient cost is system RAM, not VRAM.
         logger.info(
-            "  init_train_model: batch 0 — converting prev_model to trainable.")
-        return make_trainable(prev_model, cfg)
+            "  init_train_model: batch 0 — deep-copying prev_model and converting the copy to trainable.")
+        base = prev_model._orig_mod if hasattr(prev_model, "_orig_mod") else prev_model
+        return make_trainable(copy.deepcopy(base), cfg)
 
     last_dir = batch_train_dir(cfg, iteration, start_batch - 1)
     logger.info(
         f"  init_train_model: resuming at batch {start_batch} — "
         f"loading base model from {last_dir}.")
-    base = load_causal_lm(last_dir, cfg, trainable=False).to(cfg.device)
+    # Load on CPU: the resumed batch runs generation/scoring with prev_model on the
+    # GPU first, and HF Trainer moves this model to the GPU itself when training
+    # starts — loading straight to cfg.device would hold both models in VRAM
+    # during steps 1–2.
+    base = load_causal_lm(last_dir, cfg, trainable=False)
     return make_trainable(base, cfg)
 
 
@@ -236,6 +252,11 @@ def _step_synth(prev_model, tokenizer, chunk, cfg, iteration, k):
         return rows
 
     logger.info(f"    [1/3 RUN ] synth: generating for {len(chunk)} rows...")
+    # Re-seed deterministically per (seed, iteration, batch) so the sampled synthetic
+    # data does not depend on how much training RNG consumption preceded this point —
+    # without this, a resume or cache hit anywhere upstream changes every later
+    # generation and two "identical" runs silently diverge.
+    set_seed(cfg.seed + 100_000 * iteration + k)
     prev_model.to(cfg.device)
     rows = generate_synthetic_responses(prev_model, tokenizer, chunk, cfg)
     prev_model.to("cpu")
@@ -340,8 +361,11 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
 
     if os.path.exists(done_path):
         logger.info(f"    [3/3 SKIP] train: .done found at {done_path}")
-        # Load merged model so the caller can continue with the next batch.
-        model = load_causal_lm(batch_dir, cfg, trainable=False).to(cfg.device)
+        # Load merged model (on CPU) so the caller can continue with the next batch.
+        # The caller re-wraps it with make_trainable and HF Trainer moves it to the
+        # GPU at the next training step; loading to cfg.device here would hold it in
+        # VRAM alongside prev_model during the next batch's generation/scoring.
+        model = load_causal_lm(batch_dir, cfg, trainable=False)
         return model
 
     logger.info(
@@ -378,10 +402,15 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
         callbacks.append(TorchProfilerCallback(cfg=cfg, spin_iteration=iteration, tb_writer=summary_callback.writer))
 
     trainer_cls = RMSPropSPINTrainer if cfg.optimizer.lower() == "rmsprop" else SPINTrainer
+    # Regularizer fields are read via getattr so older spin_config.py copies without
+    # them still run (defaults are the no-op values: term disabled / no clamping).
     trainer = trainer_cls(
         model=train_model,
         spin_lambda=spin_lambda,
         loss_type=cfg.loss_type,
+        sft_alpha=getattr(cfg, "sft_alpha", 0.0),
+        rejected_adv_clip=getattr(cfg, "rejected_adv_clip", None),
+        kl_penalty_alpha=getattr(cfg, "kl_penalty_alpha", 0.0),
         args=args,
         train_dataset=dataset,
         data_collator=collator,
@@ -435,15 +464,58 @@ def _step_train(train_model, synth_rows, ref_lps, tokenizer, cfg,
     return train_model
 
 
+# ── Fresh-prompt slicing (Tier-3 experiment) ──────────────────────────────────
+
+def select_iteration_rows(base_rows, cfg, iteration):
+    """Return the training rows for one iteration.
+
+    Default (resample_prompts_per_iteration=False): every iteration uses the full
+    loaded set — the original SPIN behaviour where the same prompts recur each round.
+
+    Enabled: the loaded set is partitioned into cfg.num_iterations disjoint slices and
+    iteration N gets slice N, giving each iteration genuinely new chosen-side
+    supervision. Slicing uses the fixed load order and depends only on the iteration
+    index, so a resumed run reconstructs the identical slice (the per-batch synthetic
+    caches, keyed by iteration/batch, therefore stay valid).
+
+    Example (resample on):
+        Input:  len(base_rows)=200000, cfg.num_iterations=4, iteration=2
+        Output: base_rows[100000:150000]  (50000 fresh rows)
+    """
+    if not getattr(cfg, "resample_prompts_per_iteration", False):
+        return base_rows
+    n = len(base_rows)
+    per_iter = n // max(1, cfg.num_iterations)
+    if per_iter == 0:
+        logger.warning(
+            "  resample_prompts_per_iteration=True but only %d rows for %d iterations "
+            "— too few to slice; using the full set for every iteration.",
+            n, cfg.num_iterations)
+        return base_rows
+    start = (iteration * per_iter) % n
+    sel = base_rows[start:start + per_iter]
+    logger.info(
+        f"  Fresh-prompt slice for iteration {iteration}: rows "
+        f"[{start}:{start + per_iter}] ({len(sel)} of {n}).")
+    return sel
+
+
 # ── Iteration orchestration ───────────────────────────────────────────────────
 
-def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, summary_callback):
-    """Run one SPIN iteration by processing the full dataset in data_batch_size chunks.
+def run_iteration(opponent_model, train_seed_model, tokenizer, base_rows, cfg,
+                  iteration, iter_dir, summary_callback):
+    """Run one SPIN iteration by processing the dataset rows in data_batch_size chunks.
+
+    Two model roles are passed separately so the fixed-opponent variant can decouple
+    them (they are the same object in standard SPIN):
+      - opponent_model   generates the rejected responses and provides the reference
+                         log-probs (steps 1–2).
+      - train_seed_model is the starting point for the trainable policy π_θ (step 3).
 
     Within each chunk (batch) the three steps run in order:
-      1. Synthetic generation  — prev_model generates rejected responses.
-      2. Ref logprob scoring   — prev_model scores chosen + rejected.
-      3. SPIN training         — train_model is updated on this batch's data.
+      1. Synthetic generation  — opponent_model generates rejected responses.
+      2. Ref logprob scoring   — opponent_model scores chosen + rejected.
+      3. SPIN training         — train_model (seeded from train_seed_model) is updated.
 
     Every step saves its output atomically before the next step begins, so a
     thermal shutdown can be recovered at the exact step boundary.
@@ -506,7 +578,7 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, su
             dataset_size=len(base_rows),
         )
         train_model = _init_train_model(
-            prev_model, cfg, iteration, start_batch)
+            train_seed_model, cfg, iteration, start_batch)
 
         for k in range(start_batch, total_batches):
             chunk = base_rows[k * B: (k + 1) * B]
@@ -516,9 +588,9 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, su
                 f"(dataset rows {lo}–{hi}, {len(chunk)} rows) ─────────────")
 
             synth_rows = _step_synth(
-                prev_model, tokenizer, chunk, cfg, iteration, k)
+                opponent_model, tokenizer, chunk, cfg, iteration, k)
             ref_lps = _step_logprobs(
-                prev_model, tokenizer, synth_rows, cfg, iteration, k)
+                opponent_model, tokenizer, synth_rows, cfg, iteration, k)
             train_model = _step_train(
                 train_model, synth_rows, ref_lps, tokenizer, cfg,
                 iteration, k, total_batches, summary_callback)
@@ -527,8 +599,16 @@ def run_iteration(prev_model, tokenizer, base_rows, cfg, iteration, iter_dir, su
 
             # After _step_train the model is the merged base (no LoRA adapters).
             # Re-wrap with fresh LoRA for the next batch, unless this was the last.
+            # Then park it on CPU: train_model and opponent_model are separate models,
+            # so leaving train_model on GPU while opponent_model comes back for the
+            # next batch's generation/scoring would hold BOTH models in VRAM
+            # simultaneously. HF Trainer moves train_model back to the GPU when
+            # _step_train constructs it (place_model_on_device).
             if k < total_batches - 1:
                 train_model = make_trainable(train_model, cfg)
+                train_model.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             gc.collect()
             if torch.cuda.is_available():
@@ -562,6 +642,7 @@ def main():
     logger.info(
         "╚══════════════════════════════════════════════════════════════╝")
 
+    pre_start_cleanup()
     cfg = parse_args()
     logger.info(
         f"  model={cfg.model_name_or_path}  dataset={cfg.data_path or cfg.dataset_name}"
@@ -583,6 +664,20 @@ def main():
     summary_callback = SPINIterationSummaryCallback(log_dir=global_tb_dir, cfg=cfg)
     logger.info(f"Global TensorBoard writer at: {global_tb_dir}")
 
+    # Fixed-opponent SPIN (see spin_config.py): the opponent that generates negatives
+    # and provides reference log-probs is frozen at the iteration-0 seed. On a fresh
+    # run this path is set when iteration 0 determines its seed below; on a resume
+    # (start_iteration > 0) it is reconstructed here from disk (sft_iter_0 if the
+    # warmup ran, else the base model).
+    fixed_opponent = getattr(cfg, "fixed_opponent", False)
+    fixed_opponent_path = None
+    if fixed_opponent:
+        _sft0 = os.path.join(cfg.checkpoints_dir, "sft_iter_0")
+        fixed_opponent_path = (
+            _sft0 if os.path.exists(os.path.join(_sft0, "config.json"))
+            else cfg.model_name_or_path
+        )
+
     for iteration in range(start_iteration, cfg.num_iterations):
         remaining = cfg.num_iterations - iteration
         logger.info("")
@@ -593,39 +688,74 @@ def main():
         iter_dir = os.path.join(cfg.checkpoints_dir, f"iter_{iteration}")
         ensure_dir(iter_dir)
 
-        prev_model_path = (
+        # train_seed_path is where the trainable policy π_θ starts/continues from:
+        # the base model for iteration 0, else the previous iteration's checkpoint.
+        train_seed_path = (
             cfg.model_name_or_path if iteration == 0
             else os.path.join(cfg.checkpoints_dir, f"iter_{iteration - 1}")
         )
 
-        # Interleaved SFT: on even iterations (0, 2, 4, …) re-fit the incoming model
-        # to the gold (prompt, response) data with one SFT pass, then run this
-        # iteration's SPIN self-play seeded from that SFT'd checkpoint (it becomes
-        # both π_prev and π_θ's starting point). Reproduces the paper's
-        # base → SFT-on-gold → SPIN recipe, refreshed every second iteration.
-        # run_sft_warmup is idempotent per out_dir, so a resumed run skips an
-        # already-completed SFT pass.
-        if cfg.sft_warmup_enabled and iteration % 2 == 0:
+        # SFT warmup. Default (sft_interleaved=False): one SFT pass before iteration 0
+        # only — the paper's base → SFT-on-gold → SPIN recipe. The warmed-up
+        # checkpoint becomes both π_prev and π_θ's starting point for iteration 0,
+        # and every later iteration chains purely through SPIN checkpoints.
+        # Opt-in (sft_interleaved=True): additionally re-fit the incoming model to
+        # the gold data at the start of every even iteration (the legacy behaviour —
+        # see the sft_interleaved comment in spin_config.py for why it confounds
+        # the experiment). run_sft_warmup is idempotent per out_dir, so a resumed
+        # run skips an already-completed SFT pass.
+        # sft_interleaved is read via getattr so configs without the field default to
+        # the paper recipe (single warmup); add `sft_interleaved: bool = True` to
+        # SPINConfig to re-enable the legacy every-even-iteration schedule.
+        sft_interleaved = getattr(cfg, "sft_interleaved", False)
+        run_sft_now = cfg.sft_warmup_enabled and (
+            iteration % 2 == 0 if sft_interleaved else iteration == 0
+        )
+        if run_sft_now:
             sft_out_dir = os.path.join(cfg.checkpoints_dir, f"sft_iter_{iteration}")
             logger.info(
-                f"  Interleaved SFT for iteration {iteration}: "
-                f"SFT {prev_model_path} → {sft_out_dir}")
-            prev_model_path = run_sft_warmup(
+                f"  SFT warmup for iteration {iteration}: "
+                f"SFT {train_seed_path} → {sft_out_dir}")
+            train_seed_path = run_sft_warmup(
                 cfg, tokenizer, base_rows,
-                base_model_path=prev_model_path,
+                base_model_path=train_seed_path,
                 out_dir=sft_out_dir,
             )
 
-        logger.info(f"  Loading π_prev from: {prev_model_path}")
+        # Record the iteration-0 seed as the fixed opponent (fresh-run path; the
+        # resume path set it before the loop).
+        if fixed_opponent and iteration == 0:
+            fixed_opponent_path = train_seed_path
+
+        # opponent_path is who generates the negatives and scores the reference
+        # log-probs: the frozen iteration-0 seed under fixed_opponent, else the same
+        # checkpoint the policy is seeded from (standard SPIN).
+        opponent_path = (
+            fixed_opponent_path if (fixed_opponent and iteration > 0)
+            else train_seed_path
+        )
+
+        logger.info(
+            f"  Loading train-seed from: {train_seed_path}"
+            + (f"  |  opponent (fixed) from: {opponent_path}"
+               if opponent_path != train_seed_path else "  (opponent = train-seed)"))
         log_memory(f"before_load_iter{iteration}")
-        prev_model = load_causal_lm(
-            prev_model_path, cfg, trainable=False).to("cpu")
+        train_seed_model = load_causal_lm(
+            train_seed_path, cfg, trainable=False).to("cpu")
+        if opponent_path == train_seed_path:
+            opponent_model = train_seed_model            # standard SPIN: one model, both roles
+        else:
+            opponent_model = load_causal_lm(
+                opponent_path, cfg, trainable=False).to("cpu")
         log_memory(f"after_load_iter{iteration}")
 
-        run_iteration(prev_model, tokenizer, base_rows, cfg,
+        iter_rows = select_iteration_rows(base_rows, cfg, iteration)
+        run_iteration(opponent_model, train_seed_model, tokenizer, iter_rows, cfg,
                       iteration, iter_dir, summary_callback)
 
-        free_model(prev_model)
+        free_model(train_seed_model)
+        if opponent_model is not train_seed_model:
+            free_model(opponent_model)
         logger.info(
             f"╚══ SPIN ITERATION {iteration} COMPLETE ══════════════════════════════════╝")
 

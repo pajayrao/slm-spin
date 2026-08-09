@@ -11,17 +11,112 @@ logger = logging.getLogger(__name__)
 
 
 class SPINTrainer(Trainer):
-    def __init__(self, spin_lambda=0.1, loss_type="logistic", **kwargs):
+    def __init__(
+        self,
+        spin_lambda=0.1,
+        loss_type="logistic",
+        sft_alpha=0.0,
+        rejected_adv_clip=None,
+        kl_penalty_alpha=0.0,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.spin_lambda = spin_lambda
         self.loss_type = loss_type
+        # Anti likelihood-displacement regularisation — see spin_config.py for the
+        # rationale behind each of these. All default to a no-op (0.0 / None) so
+        # existing callers that don't pass them get the original loss behaviour.
+        self.sft_alpha = sft_alpha
+        self.rejected_adv_clip = rejected_adv_clip
+        self.kl_penalty_alpha = kl_penalty_alpha
         # Counts optimizer steps taken by this trainer instance; used to throttle
         # verbose INFO logs so they appear on step 1 and every logging_steps thereafter.
         self._spin_step = 0
         logger.info(
-            f"SPINTrainer initialised — spin_lambda={spin_lambda}, loss_type='{loss_type}'. "
+            f"SPINTrainer initialised — spin_lambda={spin_lambda}, loss_type='{loss_type}', "
+            f"sft_alpha={sft_alpha}, rejected_adv_clip={rejected_adv_clip}, "
+            f"kl_penalty_alpha={kl_penalty_alpha}. "
             f"Margin = λ × [(π_θ(chosen)−π_ref(chosen)) − (π_θ(rejected)−π_ref(rejected))]."
         )
+
+    def _compute_spin_loss(self, pi_chosen_logp, pi_rejected_logp, ref_chosen_logp, ref_rejected_logp):
+        """Shared loss computation used by both compute_loss() and training_step().
+
+        Combines the base SPIN margin loss with three optional anti likelihood-
+        displacement regularisers (see spin_config.py):
+          1. sft_alpha        — NLL anchor pulling pi_chosen_logp up directly.
+          2. rejected_adv_clip — caps how much margin credit comes from cratering
+             the rejected side rather than raising the chosen side.
+          3. kl_penalty_alpha  — penalises a negative kl_from_ref (net regression
+             vs the reference model), which is otherwise only logged, not trained on.
+
+        All regularisers default to a no-op, so with sft_alpha=0, rejected_adv_clip=None,
+        kl_penalty_alpha=0 this reproduces the original SPIN loss exactly.
+
+        Example (loss_type="hinge", spin_lambda=0.5, sft_alpha=0.25,
+                 rejected_adv_clip=5.0, kl_penalty_alpha=0.1, batch_size=1):
+            Input:  pi_chosen_logp=[-1.85], pi_rejected_logp=[-24.61],
+                    ref_chosen_logp=[-1.82], ref_rejected_logp=[-6.54]
+
+            Processing:
+              chosen_adv   = [-1.85 - (-1.82)] = [-0.03]
+              rejected_adv = [-24.61 - (-6.54)] = [-18.07]
+              rejected_adv_capped = clamp([-18.07], min=-5.0) = [-5.0]
+              raw_margin   = chosen_adv - rejected_adv_capped = [-0.03 - (-5.0)] = [4.97]
+              margin       = 0.5 * [4.97] = [2.485]
+              base_loss    = relu(1 - 2.485).mean() = 0.0        # hinge already saturated
+              sft_term     = 0.25 * -mean([-1.85]) = 0.4625       # still pulls chosen up
+              kl_val       = mean(chosen_adv + rejected_adv) / 2 = (-0.03 + -18.07)/2 = -9.05
+              kl_penalty   = 0.1 * relu(9.05)**2 = 8.19            # fires: kl_val is negative
+              loss         = 0.0 + 0.4625 + 8.19 = 8.6525
+
+            Output: (loss=tensor(8.6525), margin=tensor([2.485]),
+                     chosen_adv=tensor([-0.03]), rejected_adv=tensor([-18.07]),
+                     kl_val=tensor(-9.05))
+
+        Compare to the unregularised loss (sft_alpha=0, rejected_adv_clip=None,
+        kl_penalty_alpha=0): without clipping, raw_margin = -0.03 - (-18.07) = 18.04,
+        margin = 0.5*18.04 = 9.02, base_loss = relu(1-9.02) = 0 — loss=0.0 with zero
+        gradient anywhere, silently rewarding the collapse. The regularised version
+        keeps a large, informative gradient via sft_term and kl_penalty even though
+        the base hinge loss has saturated.
+        """
+        chosen_adv = pi_chosen_logp - ref_chosen_logp
+        rejected_adv = pi_rejected_logp - ref_rejected_logp
+
+        # Cap how much margin credit comes from cratering the rejected side.
+        if self.rejected_adv_clip is not None:
+            rejected_adv_for_margin = rejected_adv.clamp(min=-self.rejected_adv_clip)
+        else:
+            rejected_adv_for_margin = rejected_adv
+
+        raw_margin = chosen_adv - rejected_adv_for_margin
+        margin = self.spin_lambda * raw_margin
+
+        if self.loss_type == "logistic":
+            base_loss = F.softplus(-margin).mean()
+        elif self.loss_type == "hinge":
+            base_loss = F.relu(1.0 - margin).mean()
+        elif self.loss_type == "correlation":
+            base_loss = (1.0 - margin).mean()
+        elif self.loss_type == "exponential":
+            base_loss = torch.exp(-margin).mean()
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        # 1. NLL anchor — reward raising pi_chosen_logp directly, not just via the margin.
+        sft_term = -pi_chosen_logp.mean() * self.sft_alpha if self.sft_alpha else torch.zeros_like(base_loss)
+
+        # 3. Penalise net regression vs the reference model (kl_from_ref < 0).
+        kl_val = (chosen_adv.mean() + rejected_adv.mean()) / 2.0
+        kl_penalty = (
+            self.kl_penalty_alpha * F.relu(-kl_val) ** 2
+            if self.kl_penalty_alpha else torch.zeros_like(base_loss)
+        )
+
+        loss = base_loss + sft_term + kl_penalty
+
+        return loss, margin, chosen_adv, rejected_adv, kl_val, base_loss, sft_term, kl_penalty
 
     def _should_log_verbose(self) -> bool:
         """Return True on the very first step and every logging_steps thereafter.
@@ -145,17 +240,14 @@ class SPINTrainer(Trainer):
             f"  π_ref(rejected): mean={ref_rejected_logp.mean().item():.4f} (pre-computed, no forward pass)"
         )
 
-        # Step 5: Compute scalar advantages — how far the current model has moved from π_ref.
-        # Reduced to Python floats here (not tensors) because they are only used for logging,
-        # not for backprop. The tensor version is computed inline in Step 6.
-        # chosen_adv > 0  → π_θ is now more likely on human responses than π_ref was (good).
-        # rejected_adv < 0 → π_θ is now less likely on synthetic responses than π_ref was (good).
-        # Example: pi_chosen=[-11.90,-9.50], ref_chosen=[-12.43,-9.82]
-        #          chosen_adv  = mean([-11.90-(-12.43), -9.50-(-9.82)]) = mean([+0.53,+0.32]) = +0.425
-        #          pi_rejected=[-17.20,-13.80], ref_rejected=[-18.07,-14.55]
-        #          rejected_adv= mean([-17.20-(-18.07), -13.80-(-14.55)]) = mean([+0.87,+0.75]) = +0.810
-        chosen_adv = (pi_chosen_logp - ref_chosen_logp).mean().item()
-        rejected_adv = (pi_rejected_logp - ref_rejected_logp).mean().item()
+        # Steps 5-7: advantages, margin, base loss, and anti likelihood-displacement
+        # regularisation (sft_alpha / rejected_adv_clip / kl_penalty_alpha) — see
+        # _compute_spin_loss() for the full breakdown. Mirrors training_step() below.
+        loss, margin, chosen_adv_t, rejected_adv_t, kl_val, base_loss, sft_term, kl_penalty = (
+            self._compute_spin_loss(pi_chosen_logp, pi_rejected_logp, ref_chosen_logp, ref_rejected_logp)
+        )
+        chosen_adv = chosen_adv_t.mean().item()
+        rejected_adv = rejected_adv_t.mean().item()
         logger.debug(
             f"  chosen advantage (π_θ − π_ref):   {chosen_adv:.4f}  "
             f"(positive = model improved on human responses)"
@@ -164,52 +256,15 @@ class SPINTrainer(Trainer):
             f"  rejected advantage (π_θ − π_ref): {rejected_adv:.4f}  "
             f"(negative = model moved away from synthetic responses ✓)"
         )
-
-        # Step 6: Compute the SPIN margin per example, then scale by λ.
-        # raw_margin = (π_θ(chosen) − π_ref(chosen)) − (π_θ(rejected) − π_ref(rejected))
-        #            = chosen_adv_tensor − rejected_adv_tensor  (per example, not reduced)
-        # A positive margin means the model improved MORE on chosen than on rejected.
-        # A negative margin means the opposite: drifted more toward synthetic than human.
-        # λ (spin_lambda) scales the margin — smaller λ softens the loss surface.
-        # Example: chosen_adv_tensor=[+0.53,+0.32], rejected_adv_tensor=[+0.87,+0.75]
-        #          raw_margin = [0.53-0.87, 0.32-0.75] = [-0.34, -0.43]  (both negative = bad)
-        #          margin = 0.1 * [-0.34, -0.43] = [-0.034, -0.043]
-        raw_margin = (pi_chosen_logp - ref_chosen_logp) - \
-            (pi_rejected_logp - ref_rejected_logp)
-        margin = self.spin_lambda * raw_margin
-        logger.debug(
-            f"  raw margin (before λ): mean={raw_margin.mean().item():.4f}, "
-            f"std={raw_margin.std().item():.4f}, "
-            f"min={raw_margin.min().item():.4f}, max={raw_margin.max().item():.4f}"
-        )
         logger.debug(
             f"  scaled margin (λ={self.spin_lambda}): mean={margin.mean().item():.4f}, "
             f"win_rate={(margin > 0).float().mean().item():.3f} "
             f"({int((margin > 0).sum().item())}/{bs} examples where margin > 0)"
         )
 
-        # Step 7: Apply the loss function to the per-example margins and average.
-        # All variants penalize negative margins and are minimized when margin >> 0.
-        # logistic  softplus(-m): smooth, always positive, numerically stable.
-        #   Example: margin=-0.034 → softplus(0.034) ≈ 0.7091
-        # hinge     relu(1-m):    zero once margin ≥ 1, sparse gradients beyond that.
-        #   Example: margin=-0.034 → relu(1.034) = 1.034
-        # correlation (1-m):      linear, constant gradient regardless of margin magnitude.
-        # exponential exp(-m):    very steep for strongly negative margins; can be unstable.
-        #   Example: margin=-0.034 → exp(0.034) ≈ 1.0346
-        if self.loss_type == "logistic":
-            loss = F.softplus(-margin).mean()
-        elif self.loss_type == "hinge":
-            loss = F.relu(1.0 - margin).mean()
-        elif self.loss_type == "correlation":
-            loss = (1.0 - margin).mean()
-        elif self.loss_type == "exponential":
-            loss = torch.exp(-margin).mean()
-        else:
-            raise ValueError(f"Unknown loss_type: {self.loss_type}")
-
         logger.info(
-            f"compute_loss (eval) — loss={loss.item():.4f} [{self.loss_type}], "
+            f"compute_loss (eval) — loss={loss.item():.4f} [{self.loss_type}] "
+            f"(base={base_loss.item():.4f}, sft={sft_term.item():.4f}, kl_pen={kl_penalty.item():.4f}), "
             f"margin_mean={margin.mean().item():.4f}, "
             f"win_rate={(margin > 0).float().mean().item():.3f}, "
             f"chosen_adv={chosen_adv:.4f}, rejected_adv={rejected_adv:.4f}, "
@@ -224,6 +279,9 @@ class SPINTrainer(Trainer):
         #          win_rate = mean((margin > 0).float()) = 0.0  (both examples had negative margin)
         metrics = {
             "loss":              loss.detach(),
+            "base_loss":         base_loss.detach(),
+            "sft_term":          sft_term.detach(),
+            "kl_penalty":        kl_penalty.detach(),
             "margin_mean":       margin.mean().detach(),
             "margin_std":        margin.std().detach() if margin.numel() > 1 else torch.tensor(0.0),
             "win_rate":          (margin > 0).float().mean().detach(),
@@ -231,10 +289,7 @@ class SPINTrainer(Trainer):
             "pi_rejected_logp":  pi_rejected_logp.mean().detach(),
             "ref_chosen_logp":   ref_chosen_logp.mean().detach(),
             "ref_rejected_logp": ref_rejected_logp.mean().detach(),
-            "kl_from_ref":       (
-                (pi_chosen_logp - ref_chosen_logp).mean() +
-                (pi_rejected_logp - ref_rejected_logp).mean()
-            ).detach() / 2.0,
+            "kl_from_ref":       kl_val.detach(),
         }
 
         return (loss, metrics) if return_outputs else loss
@@ -352,15 +407,16 @@ class SPINTrainer(Trainer):
             f"min={pi_rejected.min().item():.4f}, max={pi_rejected.max().item():.4f}"
         )
 
-        # Step 5: Compute per-example advantage for each side.
-        # Advantage = how much the current model π_θ has shifted vs the frozen reference π_ref.
-        # chosen_adv > 0  → π_θ now assigns MORE probability to human responses than π_ref did (good).
-        # rejected_adv < 0 → π_θ now assigns LESS probability to synthetic responses than π_ref (good).
-        # Both are per-example tensors of shape (batch,) — not yet reduced to scalars.
-        # Example: pi_chosen=[-11.8], ref_chosen=[-12.1] → chosen_adv = -11.8 - (-12.1) = +0.3
-        #          pi_rejected=[-16.9], ref_rejected=[-17.4] → rejected_adv = -16.9 - (-17.4) = +0.5
-        chosen_adv = (pi_chosen - ref_chosen_logp)
-        rejected_adv = (pi_rejected - ref_rejected_logp)
+        # Steps 5-7: advantages, margin, base loss, and anti likelihood-displacement
+        # regularisation (sft_alpha / rejected_adv_clip / kl_penalty_alpha). See
+        # _compute_spin_loss() for the full breakdown and worked example — this is the
+        # single most important change from the original SPIN loss: without it, the
+        # optimizer can satisfy the margin purely by cratering pi_rejected far below
+        # pi_ref(rejected) instead of raising pi_chosen, which was observed in practice
+        # (rejected_adv reaching -18 while chosen_adv stayed near 0). Mirrors compute_loss() above.
+        loss, margin, chosen_adv, rejected_adv, kl_val, base_loss, sft_term, kl_penalty = (
+            self._compute_spin_loss(pi_chosen, pi_rejected, ref_chosen_logp, ref_rejected_logp)
+        )
         logger.debug(
             f"  chosen advantage (π_θ−π_ref): mean={chosen_adv.mean().item():.4f} "
             f"(want > 0: model getting better at human responses)"
@@ -369,69 +425,43 @@ class SPINTrainer(Trainer):
             f"  rejected advantage (π_θ−π_ref): mean={rejected_adv.mean().item():.4f} "
             f"(want < 0: model moving away from its own old generations)"
         )
-
-        # Step 6: Compute the SPIN margin = chosen_adv − rejected_adv, then scale by λ.
-        # The margin captures whether the model is improving MORE on human responses than
-        # on its own synthetic outputs relative to the reference baseline.
-        # margin > 0 → correct direction: model prefers human over synthetic (win for this example).
-        # margin < 0 → wrong direction: model drifted more toward synthetic — loss fires hard.
-        # λ (spin_lambda) controls the margin scale; smaller λ makes the loss softer.
-        # Example: chosen_adv=+0.3, rejected_adv=+0.5 → raw_margin = 0.3 - 0.5 = -0.2
-        #          margin = 0.1 * -0.2 = -0.02  (negative → loss will penalize this example)
-        raw_margin = chosen_adv - rejected_adv
-        margin = self.spin_lambda * raw_margin
         logger.debug(
-            f"  raw margin (before λ): mean={raw_margin.mean().item():.4f}, "
-            f"std={raw_margin.std().item():.4f}, "
-            f"min={raw_margin.min().item():.4f}, max={raw_margin.max().item():.4f}"
+            f"  scaled margin (λ={self.spin_lambda}): mean={margin.mean().item():.4f}, "
+            f"base_loss={base_loss.item():.4f}, sft_term={sft_term.item():.4f}, "
+            f"kl_penalty={kl_penalty.item():.4f}"
         )
-
-        # Step 7: Apply the chosen loss function to the per-example margins, then average.
-        # All variants are minimized when margin is large and positive (model improving correctly).
-        # They differ in how aggressively they penalize negative or near-zero margins:
-        #
-        # logistic  (softplus(-m)):  smooth, always positive, never saturates → stable gradients.
-        #   Example: margin=-0.02 → softplus(+0.02) ≈ 0.710;  margin=+2.0 → softplus(-2.0) ≈ 0.127
-        # hinge     (relu(1-m)):     zero loss once margin ≥ 1; hard floor, sparse gradients.
-        #   Example: margin=0.5  → relu(0.5) = 0.5;  margin=1.2 → relu(-0.2) = 0.0 (no gradient)
-        # correlation (1-m):         linear, no saturation, gradient always -1 (constant signal).
-        #   Example: margin=0.3  → loss = 0.7;  margin=-0.5 → loss = 1.5
-        # exponential (exp(-m)):     grows very fast for negative margins → large gradient signal
-        #   but can explode; useful only when margins are known to be well-bounded.
-        #   Example: margin=-0.5 → exp(0.5) ≈ 1.65;  margin=-2.0 → exp(2.0) ≈ 7.39
-        if self.loss_type == "logistic":
-            loss = F.softplus(-margin).mean()
-        elif self.loss_type == "hinge":
-            loss = F.relu(1.0 - margin).mean()
-        elif self.loss_type == "correlation":
-            loss = (1.0 - margin).mean()
-        elif self.loss_type == "exponential":
-            loss = torch.exp(-margin).mean()
-        else:
-            raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
         # Step 8: Backward pass — differentiate the loss through both forward passes.
-        # loss.backward() computes ∂loss/∂θ for every parameter that required_grad=True.
-        # For LoRA this means only the low-rank adapter matrices, not the frozen base weights.
-        # Gradients accumulate in .grad attributes; the optimizer will consume them in its
-        # step() call (handled by HF Trainer after this method returns).
-        # Example: loss=0.710 (logistic), λ=0.1
-        #          ∂softplus(-λ·m)/∂θ propagates back through margin → chosen/rejected logprobs
-        #          → model logits → LoRA adapter weights  (base weights get no gradient)
+        # The loss is divided by gradient_accumulation_steps BEFORE backward so the
+        # accumulated gradient over GA micro-batches equals the mean-loss gradient,
+        # matching stock HF Trainer behaviour. Without this division (the original
+        # bug here) accumulated gradients were GA× too large, which made
+        # max_grad_norm=1.0 clip on essentially every optimizer step and destroyed
+        # the configured LR semantics.
+        # For LoRA the gradient lands only on the low-rank adapter matrices, not the
+        # frozen base weights; the optimizer consumes .grad in its step() call
+        # (handled by HF Trainer after this method returns).
+        ga_steps = max(1, self.args.gradient_accumulation_steps)
         logger.debug(
-            f"  loss ({self.loss_type}): {loss.item():.6f}. Running backward...")
-        loss.backward()
+            f"  loss ({self.loss_type}): {loss.item():.6f}. Running backward "
+            f"(scaled by 1/{ga_steps} for gradient accumulation)...")
+        (loss / ga_steps).backward()
         logger.debug("  Backward pass complete. Gradients accumulated.")
 
-        # Gradient global norm — computed HERE, immediately after backward(), while gradients
-        # are still alive on the parameters.  HF Trainer calls model.zero_grad() BEFORE
-        # firing on_step_end, so computing this in the callback would always yield 0/None.
-        # One fused GPU op (stack + sum) keeps the number of GPU syncs to 1.
-        grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
-        grad_global_norm = (
-            torch.stack([g.float().norm().pow(2) for g in grads]).sum().item() ** 0.5
-            if grads else 0.0
-        )
+        # Gradient global norm — computed immediately after backward(), while gradients
+        # are still alive on the parameters (HF Trainer calls model.zero_grad() BEFORE
+        # firing on_step_end, so a callback would always read 0/None). Only computed on
+        # optimizer-step boundaries (see Step 10) — mid-accumulation norms conflate
+        # partial sums, and the stack+norm op costs a GPU sync per call.
+        at_optim_boundary = (self._spin_step % ga_steps == 0)
+        if at_optim_boundary:
+            grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+            grad_global_norm = (
+                torch.stack([g.float().norm().pow(2) for g in grads]).sum().item() ** 0.5
+                if grads else 0.0
+            )
+        else:
+            grad_global_norm = None
 
         # Step 9: Detach all tensors to plain Python floats before building the metrics dict.
         # .detach() breaks the autograd graph so these scalars don't keep the computation
@@ -449,46 +479,57 @@ class SPINTrainer(Trainer):
         margin_mean = margin.mean().detach().item()
         margin_std = margin.std().detach().item() if margin.numel() > 1 else 0.0
         loss_val = loss.detach().item()
+        base_loss_val = base_loss.detach().item()
+        sft_term_val = sft_term.detach().item()
+        kl_penalty_val = kl_penalty.detach().item()
         pi_chosen_mean = pi_chosen.mean().detach().item()
         pi_rej_mean = pi_rejected.mean().detach().item()
         ref_ch_mean = ref_chosen_logp.mean().item()
         ref_rej_mean = ref_rejected_logp.mean().item()
         chosen_adv_mean = chosen_adv.mean().detach().item()
         rejected_adv_mean = rejected_adv.mean().detach().item()
-        kl_val = (chosen_adv_mean + rejected_adv_mean) / 2.0
+        kl_val_scalar = kl_val.detach().item()
 
         # Step 10: Build and emit the metrics dict for TensorBoard / WandB logging.
-        # self.log() is the HF Trainer hook — it buffers these values and flushes them
-        # at the configured logging_steps interval.
-        log_data = {
-            "loss":              loss_val,
-            "margin_mean":       margin_mean,
-            "margin_std":        margin_std,
-            "win_rate":          win_rate,
-            "pi_chosen_logp":    pi_chosen_mean,
-            "pi_rejected_logp":  pi_rej_mean,
-            "ref_chosen_logp":   ref_ch_mean,
-            "ref_rejected_logp": ref_rej_mean,
-            "kl_from_ref":       kl_val,
-            "spin_lambda":       self.spin_lambda,
-            "grad_global_norm":  grad_global_norm,
-        }
-        if self.optimizer is not None:
-            log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-        self.log(log_data)
+        # Emitted only on optimizer-step boundaries: Trainer.log() fires callbacks
+        # immediately on every call, so logging per micro-step (the original
+        # behaviour) wrote each TensorBoard tag 32× at the same global_step, spammed
+        # the console via ProgressCallback, and grew state.log_history by ~50k
+        # entries per iteration for no information gain.
+        if at_optim_boundary:
+            log_data = {
+                "loss":              loss_val,
+                "base_loss":         base_loss_val,
+                "sft_term":          sft_term_val,
+                "kl_penalty":        kl_penalty_val,
+                "margin_mean":       margin_mean,
+                "margin_std":        margin_std,
+                "win_rate":          win_rate,
+                "pi_chosen_logp":    pi_chosen_mean,
+                "pi_rejected_logp":  pi_rej_mean,
+                "ref_chosen_logp":   ref_ch_mean,
+                "ref_rejected_logp": ref_rej_mean,
+                "kl_from_ref":       kl_val_scalar,
+                "spin_lambda":       self.spin_lambda,
+                "grad_global_norm":  grad_global_norm,
+            }
+            if self.optimizer is not None:
+                log_data["learning_rate"] = self.optimizer.param_groups[0]["lr"]
+            self.log(log_data)
 
         # Throttled INFO log: step 1 + every logging_steps gives a human-readable summary.
         if self._should_log_verbose():
             lr_str = f", lr={self.optimizer.param_groups[0]['lr']:.2e}" if self.optimizer else ""
             logger.info(
                 f"training_step #{self._spin_step}{lr_str} — "
-                f"loss={loss_val:.4f}, margin={margin_mean:.4f}±{margin_std:.4f}, "
+                f"loss={loss_val:.4f} (base={base_loss_val:.4f}, sft={sft_term_val:.4f}, "
+                f"kl_pen={kl_penalty_val:.4f}), margin={margin_mean:.4f}±{margin_std:.4f}, "
                 f"win_rate={win_rate:.3f} ({n_wins}/{bs} positive), "
                 f"π_θ(chosen)={pi_chosen_mean:.4f}, π_θ(rejected)={pi_rej_mean:.4f}, "
                 f"π_ref(chosen)={ref_ch_mean:.4f}, π_ref(rejected)={ref_rej_mean:.4f}, "
                 f"chosen_adv={chosen_adv_mean:.4f}, "
                 f"rejected_adv={rejected_adv_mean:.4f}, "
-                f"kl_from_ref={kl_val:.4f}"
+                f"kl_from_ref={kl_val_scalar:.4f}"
             )
         else:
             logger.debug(

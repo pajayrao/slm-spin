@@ -1134,6 +1134,11 @@ def run_eval(
     if n_shots is None:
         n_shots = dict(DEFAULT_SHOTS)
 
+    # Wire the config field into the module constant the dataset loaders read —
+    # previously cfg.eval_trust_remote_code_datasets existed but was never consulted.
+    global _TRUST_REMOTE_CODE_DATASETS
+    _TRUST_REMOTE_CODE_DATASETS = cfg.eval_trust_remote_code_datasets
+
     logger.info("run_eval() starting")
     logger.info(f"  Checkpoints dir : {cfg.checkpoints_dir}")
     logger.info(f"  Output dir      : {cfg.eval_output_dir}")
@@ -1153,11 +1158,25 @@ def run_eval(
         iter_paths = [ckpt_dir / name for name in iters]
         logger.info(f"Evaluating specified iterations: {iters}")
     else:
+        # Discover both SPIN checkpoints (iter_N) and SFT warmup checkpoints
+        # (sft_iter_N). sft_iter_N sorts BEFORE its iter_N so the delta chain reads
+        # base_model → sft_iter_0 → iter_0 → iter_1 → … — separating the SFT
+        # warmup's effect from SPIN's. Only completed SFT checkpoints (with a model
+        # config.json) are included; a partially-written one is skipped.
+        def _row_sort_key(p: Path) -> tuple[int, int]:
+            is_sft = p.name.startswith("sft_")
+            return (iter_num(p.name), 0 if is_sft else 1)
+
         iter_paths = sorted(
-            [p for p in ckpt_dir.iterdir() if p.is_dir() and re.match(r"iter_\d+", p.name)],
-            key=lambda p: iter_num(p.name),
+            [
+                p for p in ckpt_dir.iterdir()
+                if p.is_dir()
+                and re.fullmatch(r"(sft_)?iter_\d+", p.name)
+                and (not p.name.startswith("sft_") or (p / "config.json").exists())
+            ],
+            key=_row_sort_key,
         )
-        logger.info(f"Auto-discovered {len(iter_paths)} iteration(s) in {ckpt_dir}")
+        logger.info(f"Auto-discovered {len(iter_paths)} checkpoint(s) in {ckpt_dir}")
 
     if not iter_paths:
         raise SystemExit(f"No iteration directories found in {ckpt_dir}")
@@ -1344,7 +1363,11 @@ def run_eval(
             "elapsed_seconds":       elapsed,
         }
         rows.append(row)
-        _tb_write_row(tb_writer, row)
+        # sft_iter_N rows appear in the table/summary/JSON but not in TensorBoard:
+        # iter_num("sft_iter_N") == iter_num("iter_N"), so writing both would stack
+        # two different scores on the same x-axis step and corrupt the charts.
+        if not iter_name.startswith("sft_"):
+            _tb_write_row(tb_writer, row)
         prev_metrics = metrics
 
         dprev_str   = fmt_delta(dprev.get("Average") if dprev else None)
@@ -1473,6 +1496,7 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+    pre_start_cleanup()
 
     if args.tasks and args.skip_tasks:
         raise SystemExit("--tasks and --skip-tasks are mutually exclusive.")

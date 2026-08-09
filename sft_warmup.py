@@ -195,8 +195,17 @@ def run_sft_warmup(cfg: SPINConfig, tokenizer, base_rows: List[Dict[str, str]],
         f"use_lora={cfg.use_lora}, base={base_model_path}")
 
     # Step 2: Build the tokenized dataset + collator (same formatting as SPIN).
-    cache_path = (os.path.join(cfg.synthetic_cache_dir, "sft_warmup_tokenized.pt")
-                  if cfg.sft_warmup_cache_tokenized else None)
+    # The cache filename embeds the tokenization fingerprint: this cache was
+    # previously keyed by a fixed name, so switching model family (different
+    # tokenizer!) or sequence settings silently reused stale tensors. The tokenized
+    # data depends only on tokenizer + formatting settings (all captured by the
+    # fingerprint), not on which checkpoint is being warmed, so repeated SFT passes
+    # within one run still share a single cache.
+    cache_path = None
+    if cfg.sft_warmup_cache_tokenized:
+        cache_path = os.path.join(
+            cfg.synthetic_cache_dir,
+            f"sft_warmup_tokenized_{tokenization_fingerprint(cfg)}.pt")
     dataset = SFTDataset(rows, tokenizer, cfg, cache_path=cache_path)
     collator = SFTDataCollator(tokenizer)
 
