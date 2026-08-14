@@ -20,7 +20,7 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
 7. [Resuming After a Crash](#resuming-after-a-crash)
 8. [TensorBoard](#tensorboard-training)
 9. [Project Structure](#project-structure)
-10. [Implementation Deep-Dive](#implementation-deep-dive)
+<!-- 10. [Implementation Deep-Dive](#implementation-deep-dive)
     - [Outer Loop — main.py](#outer-loop--mainpy)
     - [Configuration — spin_config.py](#configuration--spin_configpy)
     - [Dataset — spin_dataset.py](#dataset--spin_datasetpy)
@@ -52,7 +52,7 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
       - [Continued Pre-training (CPT)](#continued-pre-training-cpt)
       - [Supervised Fine-Tuning (SFT) and Instruction Tuning](#supervised-fine-tuning-sft-and-instruction-tuning)
       - [RLHF + PPO](#rlhf--ppo)
-      - [DPO — Direct Preference Optimization](#dpo--direct-preference-optimization)
+      - [DPO — Direct Preference Optimization](#dpo--direct-preference-optimization) -->
 
 ---
 
@@ -580,7 +580,7 @@ Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteratio
 
 
 ---
-
+<!-- 
 ## Implementation Deep-Dive
 
 ### Outer Loop — [main.py](main.py)
@@ -1922,4 +1922,4 @@ aligned models to date (GPT-4, Claude, Gemini all use variants).
 during RL, is notoriously unstable (sensitive to PPO clip ratio, KL penalty β, and
 reward model quality), and prone to reward hacking if the reward model is imperfect.
 
----
+--- -->
