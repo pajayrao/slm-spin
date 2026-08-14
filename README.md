@@ -13,13 +13,13 @@ Implementation of the SPIN (Self-Play Fine-Tuning) algorithm for Small Language 
    - [Results Summary](#results-summary)
    - [Local Dataset](#local-dataset)
    - [Running Evaluation](#running-evaluation)
-4. [Configuration Reference](#configuration-reference)
+<!-- 4. [Configuration Reference](#configuration-reference)
    - [SPIN Loss](#spin-loss)
 5. [Memory Tips for Small GPUs](#memory-tips-for-small-gpus--16-gb)
 6. [Output Structure](#output-structure)
 7. [Resuming After a Crash](#resuming-after-a-crash)
 8. [TensorBoard](#tensorboard-training)
-9. [Project Structure](#project-structure)
+9. [Project Structure](#project-structure) -->
 <!-- 10. [Implementation Deep-Dive](#implementation-deep-dive)
     - [Outer Loop — main.py](#outer-loop--mainpy)
     - [Configuration — spin_config.py](#configuration--spin_configpy)
@@ -226,7 +226,7 @@ python evaluate.py --no-cache
 
 ---
 
-## Configuration Reference
+<!-- ## Configuration Reference
 
 All options live in [spin_config.py](spin_config.py). The most important ones:
 
@@ -579,7 +579,7 @@ Logged by `SPINIterationSummaryCallback` at `on_train_end`, with **SPIN iteratio
 | [trainer_callback/](trainer_callback/) | TensorBoard, profiler, memory probe, and iteration summary callbacks |
 
 
----
+--- -->
 <!-- 
 ## Implementation Deep-Dive
 
