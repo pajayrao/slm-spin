@@ -1,0 +1,89 @@
+[
+  {
+    "iteration": "base_model",
+    "metrics": {
+      "Arc": 45.9044,
+      "TruthfulQA": 38.3753,
+      "Winogrande": 55.959,
+      "HellaSwag": 53.8837,
+      "MMLU": 50.5412,
+      "Average": 48.9327
+    },
+    "delta_prev": null,
+    "best_so_far_avg": 48.9327,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "sft_iter_0",
+    "metrics": {
+      "Arc": 46.2457,
+      "TruthfulQA": 38.2753,
+      "Winogrande": 56.1168,
+      "HellaSwag": 53.7044,
+      "MMLU": 49.8433,
+      "Average": 48.8371
+    },
+    "delta_prev": {
+      "Arc": 0.3413,
+      "TruthfulQA": -0.1,
+      "Winogrande": 0.1578,
+      "HellaSwag": -0.1793,
+      "MMLU": -0.6979,
+      "Average": -0.0956
+    },
+    "best_so_far_avg": 48.9327,
+    "best_iteration_so_far": "base_model",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_0",
+    "metrics": {
+      "Arc": 46.587,
+      "TruthfulQA": 44.0494,
+      "Winogrande": 53.4333,
+      "HellaSwag": 59.0221,
+      "MMLU": 48.4689,
+      "Average": 50.3121
+    },
+    "delta_prev": {
+      "Arc": 0.3413,
+      "TruthfulQA": 5.7741,
+      "Winogrande": -2.6835,
+      "HellaSwag": 5.3177,
+      "MMLU": -1.3744,
+      "Average": 1.475
+    },
+    "best_so_far_avg": 50.3121,
+    "best_iteration_so_far": "iter_0",
+    "elapsed_seconds": {}
+  },
+  {
+    "iteration": "iter_1",
+    "metrics": {
+      "Arc": 45.7338,
+      "TruthfulQA": 39.8262,
+      "Winogrande": 55.3275,
+      "HellaSwag": 56.3732,
+      "MMLU": 49.8077,
+      "Average": 49.4137
+    },
+    "delta_prev": {
+      "Arc": -0.8532,
+      "TruthfulQA": -4.2232,
+      "Winogrande": 1.8942,
+      "HellaSwag": -2.6489,
+      "MMLU": 1.3388,
+      "Average": -0.8984
+    },
+    "best_so_far_avg": 50.3121,
+    "best_iteration_so_far": "iter_0",
+    "elapsed_seconds": {
+      "Arc": 2194.7,
+      "TruthfulQA": 684.8,
+      "Winogrande": 296.1,
+      "HellaSwag": 7427.1,
+      "MMLU": 148874.0
+    }
+  }
+]
